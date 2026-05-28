@@ -9,9 +9,9 @@ This project is not affiliated with OpenAI.
 ## Features
 
 - Local-only dashboard served on `127.0.0.1`
-- Summary cards for sessions, total tokens, input tokens, output tokens, active days, streaks, peak day, and favorite model
-- Daily usage table with input, output, and total tokens
-- Model breakdown table
+- Summary cards for sessions, token usage, API-equivalent cost estimate, active days, streaks, peak day, and favorite model
+- Daily usage table with input, output, total tokens, and estimated cost
+- Model breakdown table with estimated cost by model
 - Daily heatmap with month labels and hover tooltips
 - Range filters: all time, 30 days, 7 days
 - macOS `.command` launcher
@@ -35,6 +35,26 @@ Output = output_tokens
 Total = Input + Output
 ```
 
+## Cost Estimates
+
+The dashboard estimates API-equivalent USD cost from token counts. It uses the current LiteLLM pricing database when the dashboard loads:
+
+```text
+https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json
+```
+
+If the pricing file cannot be fetched, the dashboard falls back to bundled prices for known Codex models.
+
+Cost accounting follows the same practical formula used by local usage tools:
+
+```text
+Cost = Input * input price + Cached input * cache-read price + Output * output price
+```
+
+These values are estimates only. They are not your actual OpenAI subscription bill.
+
+Because prices are fetched at dashboard load time, historical days are recalculated with the current price table. If a model's API price changes later, the estimated cost for older dates can change too.
+
 ## Privacy
 
 The app runs locally and binds only to `127.0.0.1`.
@@ -53,8 +73,8 @@ Do not run this bound to a public interface unless you have reviewed the code an
 ## Install
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/codex-usage-dashboard.git
-cd codex-usage-dashboard
+git clone https://github.com/Greenleaf77/Greenleaf-codex-dashboard.git
+cd Greenleaf-codex-dashboard
 npm install
 ```
 

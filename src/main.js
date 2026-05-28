@@ -10,6 +10,7 @@ let activeRange = new URLSearchParams(window.location.search).get("range") || "a
 if (!ranges.includes(activeRange)) activeRange = "all";
 
 const numberFormatter = new Intl.NumberFormat("en-US");
+const moneyFormatter = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" });
 const monthFormatter = new Intl.DateTimeFormat("ru-RU", { month: "short" });
 
 function compact(value) {
@@ -21,6 +22,10 @@ function compact(value) {
 
 function full(value) {
   return numberFormatter.format(Number(value || 0));
+}
+
+function money(value) {
+  return moneyFormatter.format(Number(value || 0));
 }
 
 function localDayKey(date) {
@@ -116,6 +121,7 @@ function render(data) {
       ${card("Input tokens", compact(totals.input_tokens))}
       ${card("Output tokens", compact(totals.output_tokens))}
       ${card("Active days", full(totals.active_days))}
+      ${card("API estimate", `${money(totals.cost_usd)}<span class="metric-note">${escapeHtml(data.pricing?.source || "pricing unavailable")}</span>`)}
       ${card("Favorite model", escapeHtml(data.favorite_model))}
       ${card("Current streak", `${full(data.current_streak)}d`)}
       ${card("Longest streak", `${full(data.longest_streak)}d`)}
@@ -142,11 +148,11 @@ function render(data) {
         <h2>Daily Usage</h2>
         <div class="table-scroll">
           <table>
-            <thead><tr><th>Date</th><th class="num">Input</th><th class="num">Output</th><th class="num">Total</th><th class="num">Sessions</th></tr></thead>
+            <thead><tr><th>Date</th><th class="num">Input</th><th class="num">Output</th><th class="num">Total</th><th class="num">Cost</th><th class="num">Sessions</th></tr></thead>
             <tbody>
-              ${daily.map((row) => `<tr><td>${escapeHtml(row.day)}</td><td class="num">${full(row.input_tokens)}</td><td class="num">${full(row.output_tokens)}</td><td class="num">${full(row.total_tokens)}</td><td class="num">${full(row.sessions)}</td></tr>`).join("") || '<tr><td colspan="5" class="empty">No usage in this range.</td></tr>'}
+              ${daily.map((row) => `<tr><td>${escapeHtml(row.day)}</td><td class="num">${full(row.input_tokens)}</td><td class="num">${full(row.output_tokens)}</td><td class="num">${full(row.total_tokens)}</td><td class="num">${money(row.cost_usd)}</td><td class="num">${full(row.sessions)}</td></tr>`).join("") || '<tr><td colspan="6" class="empty">No usage in this range.</td></tr>'}
             </tbody>
-            <tfoot><tr><td>Total</td><td class="num">${full(totals.input_tokens)}</td><td class="num">${full(totals.output_tokens)}</td><td class="num">${full(totals.total_tokens)}</td><td class="num">${full(totals.sessions)}</td></tr></tfoot>
+            <tfoot><tr><td>Total</td><td class="num">${full(totals.input_tokens)}</td><td class="num">${full(totals.output_tokens)}</td><td class="num">${full(totals.total_tokens)}</td><td class="num">${money(totals.cost_usd)}</td><td class="num">${full(totals.sessions)}</td></tr></tfoot>
           </table>
         </div>
       </section>
@@ -155,9 +161,9 @@ function render(data) {
         <h2>Models</h2>
         <div class="table-scroll">
           <table>
-            <thead><tr><th>Model</th><th class="num">Sessions</th><th class="num">Input</th><th class="num">Output</th><th class="num">Total</th><th class="num">Share</th></tr></thead>
+            <thead><tr><th>Model</th><th class="num">Sessions</th><th class="num">Input</th><th class="num">Output</th><th class="num">Total</th><th class="num">Cost</th><th class="num">Share</th></tr></thead>
             <tbody>
-              ${data.models.map((row) => `<tr><td>${escapeHtml(row.model)}</td><td class="num">${full(row.sessions)}</td><td class="num">${full(row.input_tokens)}</td><td class="num">${full(row.output_tokens)}</td><td class="num">${full(row.total_tokens)}</td><td class="num">${((row.total_tokens / Math.max(totals.total_tokens, 1)) * 100).toFixed(1)}%</td></tr>`).join("") || '<tr><td colspan="6" class="empty">No models in this range.</td></tr>'}
+              ${data.models.map((row) => `<tr><td>${escapeHtml(row.model)}</td><td class="num">${full(row.sessions)}</td><td class="num">${full(row.input_tokens)}</td><td class="num">${full(row.output_tokens)}</td><td class="num">${full(row.total_tokens)}</td><td class="num">${money(row.cost_usd)}</td><td class="num">${((row.total_tokens / Math.max(totals.total_tokens, 1)) * 100).toFixed(1)}%</td></tr>`).join("") || '<tr><td colspan="7" class="empty">No models in this range.</td></tr>'}
             </tbody>
           </table>
         </div>

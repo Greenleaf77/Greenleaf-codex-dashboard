@@ -12,10 +12,36 @@ import sqlite3
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
+from urllib.request import Request, urlopen
 
 
 DEFAULT_DB = Path.home() / ".codex" / "state_5.sqlite"
 RANGES = {"all", "30d", "7d"}
+PRICING_URL = "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
+PRICING_CACHE_SECONDS = 600
+PRICING_CACHE: dict[str, object] = {"loaded_at": 0.0, "pricing": None}
+FALLBACK_PRICING = {
+    "gpt-5.5": {
+        "input_cost_per_token": 0.000005,
+        "cache_read_input_token_cost": 0.0000005,
+        "output_cost_per_token": 0.00003,
+    },
+    "gpt-5.4": {
+        "input_cost_per_token": 0.0000025,
+        "cache_read_input_token_cost": 0.00000025,
+        "output_cost_per_token": 0.000015,
+    },
+    "gpt-5.3-codex": {
+        "input_cost_per_token": 0.00000175,
+        "cache_read_input_token_cost": 0.000000175,
+        "output_cost_per_token": 0.000014,
+    },
+    "gpt-5.2-codex": {
+        "input_cost_per_token": 0.00000175,
+        "cache_read_input_token_cost": 0.000000175,
+        "output_cost_per_token": 0.000014,
+    },
+}
 
 
 def connect(db_path: Path) -> sqlite3.Connection:
@@ -39,6 +65,10 @@ def fmt_short(value: int | float | None) -> str:
     return str(value)
 
 
+def fmt_usd(value: int | float | None) -> str:
+    return f"${float(value or 0):,.2f}"
+
+
 def iso_from_unix(value: int | None) -> str:
     if value is None:
         return "-"
@@ -51,6 +81,77 @@ def day_from_iso_timestamp(value: str) -> str:
 
 def normalize_range(range_name: str | None) -> str:
     return range_name if range_name in RANGES else "all"
+
+
+def load_pricing() -> dict:
+    now = dt.datetime.now().timestamp()
+    cached = PRICING_CACHE.get("pricing")
+    loaded_at = float(PRICING_CACHE.get("loaded_at") or 0)
+    if isinstance(cached, dict) and now - loaded_at < PRICING_CACHE_SECONDS:
+        return cached
+
+    try:
+        request = Request(PRICING_URL, headers={"User-Agent": "codex-usage-dashboard"})
+        with urlopen(request, timeout=2.5) as response:
+            live_pricing = json.loads(response.read().decode("utf-8"))
+        pricing = {
+            "source": "LiteLLM live",
+            "url": PRICING_URL,
+            "loaded_at": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "models": live_pricing,
+            "fallback": FALLBACK_PRICING,
+            "error": None,
+        }
+    except Exception as exc:  # noqa: BLE001
+        pricing = {
+            "source": "bundled fallback",
+            "url": PRICING_URL,
+            "loaded_at": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "models": FALLBACK_PRICING,
+            "fallback": FALLBACK_PRICING,
+            "error": exc.__class__.__name__,
+        }
+
+    PRICING_CACHE["loaded_at"] = now
+    PRICING_CACHE["pricing"] = pricing
+    return pricing
+
+
+def model_price_key(model: str, pricing_models: dict) -> str | None:
+    candidates = [
+        model,
+        model.replace("openai/", ""),
+        f"openai/{model}",
+    ]
+    for candidate in candidates:
+        if candidate in pricing_models:
+            return candidate
+    return None
+
+
+def token_cost_usd(event: dict, pricing: dict) -> tuple[float, str | None]:
+    models = pricing["models"]
+    fallback = pricing["fallback"]
+    price_key = model_price_key(event["model"], models)
+    price_source = models
+    if price_key is None:
+        price_key = model_price_key(event["model"], fallback)
+        price_source = fallback
+    if price_key is None:
+        return 0.0, event["model"]
+
+    model_price = price_source[price_key]
+    input_price = float(model_price.get("input_cost_per_token") or 0)
+    cache_price = model_price.get("cache_read_input_token_cost")
+    if cache_price is None:
+        cache_price = input_price
+    output_price = float(model_price.get("output_cost_per_token") or 0)
+    cost = (
+        event["input_tokens"] * input_price
+        + event["cached_input_tokens"] * float(cache_price)
+        + event["output_tokens"] * output_price
+    )
+    return cost, None
 
 
 def range_start(range_name: str) -> tuple[str | None, int | None]:
@@ -156,11 +257,17 @@ def token_events(db_path: Path, range_name: str) -> list[dict]:
 def load_usage(db_path: Path, range_name: str) -> dict:
     range_name = normalize_range(range_name)
     events = token_events(db_path, range_name)
+    pricing = load_pricing()
+    missing_price_models = set()
 
     daily_map: dict[str, dict] = {}
     model_map: dict[str, dict] = {}
     thread_ids = set()
     for event in events:
+        event_cost, missing_model = token_cost_usd(event, pricing)
+        if missing_model:
+            missing_price_models.add(missing_model)
+        event["cost_usd"] = event_cost
         thread_ids.add(event["thread_id"])
         day = event["day"]
         model = event["model"]
@@ -175,6 +282,7 @@ def load_usage(db_path: Path, range_name: str) -> dict:
                 "output_tokens": 0,
                 "reasoning_output_tokens": 0,
                 "total_tokens": 0,
+                "cost_usd": 0.0,
             },
         )
         daily["sessions"].add(event["thread_id"])
@@ -189,6 +297,7 @@ def load_usage(db_path: Path, range_name: str) -> dict:
                 "output_tokens": 0,
                 "reasoning_output_tokens": 0,
                 "total_tokens": 0,
+                "cost_usd": 0.0,
             },
         )
         model_row["sessions"].add(event["thread_id"])
@@ -199,6 +308,7 @@ def load_usage(db_path: Path, range_name: str) -> dict:
             "output_tokens",
             "reasoning_output_tokens",
             "total_tokens",
+            "cost_usd",
         ):
             daily[key] += event[key]
             model_row[key] += event[key]
@@ -219,6 +329,7 @@ def load_usage(db_path: Path, range_name: str) -> dict:
     total_output = sum(row["output_tokens"] for row in day_rows)
     total_reasoning = sum(row["reasoning_output_tokens"] for row in day_rows)
     total_tokens = sum(row["total_tokens"] for row in day_rows)
+    total_cost = sum(row["cost_usd"] for row in day_rows)
 
     return {
         "range": range_name,
@@ -231,9 +342,17 @@ def load_usage(db_path: Path, range_name: str) -> dict:
             "output_tokens": total_output,
             "reasoning_output_tokens": total_reasoning,
             "total_tokens": total_tokens,
+            "cost_usd": total_cost,
         },
         "daily": day_rows,
         "models": model_rows,
+        "pricing": {
+            "source": pricing["source"],
+            "url": pricing["url"],
+            "loaded_at": pricing["loaded_at"],
+            "error": pricing["error"],
+            "missing_models": sorted(missing_price_models),
+        },
         "favorite_model": favorite,
         "current_streak": current_streak(days),
         "longest_streak": longest_streak(days),
@@ -299,11 +418,12 @@ def render_dashboard(data: dict) -> str:
           <td class="num">{fmt_int(row["input_tokens"])}</td>
           <td class="num">{fmt_int(row["output_tokens"])}</td>
           <td class="num">{fmt_int(row["total_tokens"])}</td>
+          <td class="num">{fmt_usd(row["cost_usd"])}</td>
           <td class="num">{fmt_int(row["sessions"])}</td>
         </tr>
         """
         for row in daily_desc
-    ) or '<tr><td colspan="7" class="empty">No usage in this range.</td></tr>'
+    ) or '<tr><td colspan="8" class="empty">No usage in this range.</td></tr>'
 
     model_rows = "\n".join(
         f"""
@@ -313,11 +433,12 @@ def render_dashboard(data: dict) -> str:
           <td class="num">{fmt_int(row["input_tokens"])}</td>
           <td class="num">{fmt_int(row["output_tokens"])}</td>
           <td class="num">{fmt_int(row["total_tokens"])}</td>
+          <td class="num">{fmt_usd(row["cost_usd"])}</td>
           <td class="num">{(row["total_tokens"] / max(totals["total_tokens"], 1) * 100):.1f}%</td>
         </tr>
         """
         for row in data["models"]
-    ) or '<tr><td colspan="6" class="empty">No models in this range.</td></tr>'
+    ) or '<tr><td colspan="7" class="empty">No models in this range.</td></tr>'
 
     heatmap = "\n".join(
         f"""
@@ -551,6 +672,7 @@ def render_dashboard(data: dict) -> str:
       <div class="card"><div class="label">Input tokens</div><div class="value">{fmt_short(totals["input_tokens"])}</div></div>
       <div class="card"><div class="label">Output tokens</div><div class="value">{fmt_short(totals["output_tokens"])}</div></div>
       <div class="card"><div class="label">Active days</div><div class="value">{fmt_int(totals["active_days"])}</div></div>
+      <div class="card"><div class="label">API estimate</div><div class="value">{fmt_usd(totals["cost_usd"])}<span class="metric-note">{html.escape(data["pricing"]["source"])}</span></div></div>
       <div class="card"><div class="label">Favorite model</div><div class="value">{html.escape(data["favorite_model"])}</div></div>
       <div class="card"><div class="label">Current streak</div><div class="value">{fmt_int(data["current_streak"])}d</div></div>
       <div class="card"><div class="label">Longest streak</div><div class="value">{fmt_int(data["longest_streak"])}d</div></div>
@@ -568,9 +690,9 @@ def render_dashboard(data: dict) -> str:
         <h2>Daily Usage</h2>
         <div class="table-scroll">
           <table>
-            <thead><tr><th>Date</th><th>Scope</th><th>App</th><th class="num">Input</th><th class="num">Output</th><th class="num">Total</th><th class="num">Sessions</th></tr></thead>
+            <thead><tr><th>Date</th><th>Scope</th><th>App</th><th class="num">Input</th><th class="num">Output</th><th class="num">Total</th><th class="num">Cost</th><th class="num">Sessions</th></tr></thead>
             <tbody>{day_rows}</tbody>
-            <tfoot><tr><td>Total</td><td></td><td></td><td class="num">{fmt_int(totals["input_tokens"])}</td><td class="num">{fmt_int(totals["output_tokens"])}</td><td class="num">{fmt_int(totals["total_tokens"])}</td><td class="num">{fmt_int(totals["sessions"])}</td></tr></tfoot>
+            <tfoot><tr><td>Total</td><td></td><td></td><td class="num">{fmt_int(totals["input_tokens"])}</td><td class="num">{fmt_int(totals["output_tokens"])}</td><td class="num">{fmt_int(totals["total_tokens"])}</td><td class="num">{fmt_usd(totals["cost_usd"])}</td><td class="num">{fmt_int(totals["sessions"])}</td></tr></tfoot>
           </table>
         </div>
       </section>
@@ -579,7 +701,7 @@ def render_dashboard(data: dict) -> str:
         <h2>Models</h2>
         <div class="table-scroll">
           <table>
-            <thead><tr><th>Model</th><th class="num">Sessions</th><th class="num">Input</th><th class="num">Output</th><th class="num">Total</th><th class="num">Share</th></tr></thead>
+            <thead><tr><th>Model</th><th class="num">Sessions</th><th class="num">Input</th><th class="num">Output</th><th class="num">Total</th><th class="num">Cost</th><th class="num">Share</th></tr></thead>
             <tbody>{model_rows}</tbody>
           </table>
         </div>
@@ -701,6 +823,18 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
 
 def run_check(db_path: Path) -> None:
+    sample_cost, missing_model = token_cost_usd(
+        {
+            "model": "gpt-5.5",
+            "input_tokens": 2_429_884,
+            "cached_input_tokens": 40_193_280,
+            "output_tokens": 195_249,
+        },
+        {"models": FALLBACK_PRICING, "fallback": FALLBACK_PRICING},
+    )
+    if missing_model or round(sample_cost, 5) != 38.10353:
+        raise RuntimeError("Cost calculation check failed")
+
     for range_name in ("all", "30d", "7d", "bad-range"):
         data = load_usage(db_path, range_name)
         html_body = render_dashboard(data)
