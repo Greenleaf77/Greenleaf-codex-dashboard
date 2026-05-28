@@ -1,0 +1,289 @@
+:root {
+  color-scheme: dark;
+  --bg: #151515;
+  --panel: #232323;
+  --panel-2: #303030;
+  --line: #444;
+  --text: #f2f2f2;
+  --muted: #a8a8a8;
+  --accent-2: #d7df3f;
+  --heat-0: #303030;
+  --heat-1: #294761;
+  --heat-2: #2f67a2;
+  --heat-3: #3e87d6;
+  --heat-4: #7fb0f2;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  font-size: 16px;
+  line-height: 1.45;
+}
+
+#app {
+  width: min(1420px, calc(100vw - 32px));
+  margin: 28px auto 56px;
+}
+
+header {
+  display: flex;
+  justify-content: space-between;
+  gap: 20px;
+  align-items: flex-start;
+  margin-bottom: 18px;
+}
+
+h1 {
+  margin: 0 0 4px;
+  font-size: 30px;
+  font-weight: 760;
+  letter-spacing: 0;
+}
+
+h2 {
+  margin: 0 0 12px;
+  font-size: 18px;
+  letter-spacing: 0;
+}
+
+.subtle,
+.label,
+.metric-note {
+  color: var(--muted);
+}
+
+.segments {
+  display: flex;
+  gap: 8px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  padding: 6px;
+  border-radius: 8px;
+  white-space: nowrap;
+}
+
+.seg {
+  color: var(--muted);
+  background: transparent;
+  border: 0;
+  padding: 7px 13px;
+  border-radius: 6px;
+  min-height: 38px;
+  cursor: pointer;
+  font: inherit;
+}
+
+.seg.active {
+  background: var(--panel-2);
+  color: var(--text);
+}
+
+.cards {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 10px;
+  margin: 18px 0;
+}
+
+.card,
+section {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+.card {
+  padding: 14px 16px;
+  min-height: 92px;
+}
+
+.label {
+  font-size: 15px;
+  margin-bottom: 6px;
+}
+
+.value {
+  font-size: 27px;
+  font-weight: 760;
+  overflow-wrap: anywhere;
+}
+
+.metric-note {
+  display: block;
+  font-size: 14px;
+  font-weight: 500;
+  margin-top: 4px;
+}
+
+section {
+  margin-top: 18px;
+  padding: 16px;
+}
+
+.heat-wrap,
+.table-scroll {
+  overflow-x: auto;
+}
+
+.heatmap-shell {
+  width: max-content;
+  padding: 34px 4px 2px;
+}
+
+.heatmap {
+  display: grid;
+  grid-auto-flow: column;
+  grid-template-rows: repeat(7, 16px);
+  gap: 5px;
+  width: max-content;
+}
+
+.heat-cell {
+  width: 16px;
+  height: 16px;
+  border-radius: 4px;
+  background: var(--heat-0);
+  border: 1px solid rgba(255, 255, 255, 0.04);
+}
+
+.heat-tooltip {
+  position: fixed;
+  z-index: 100;
+  opacity: 0;
+  visibility: hidden;
+  width: max-content;
+  max-width: min(240px, calc(100vw - 16px));
+  background: #101010;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--text);
+  box-shadow: 0 10px 24px rgba(0, 0, 0, 0.35);
+  padding: 7px 9px;
+  font-size: 13px;
+  line-height: 1.35;
+  pointer-events: none;
+  transition: opacity 120ms ease;
+}
+
+.heat-tooltip.visible {
+  opacity: 1;
+  visibility: visible;
+}
+
+.month-labels {
+  display: grid;
+  column-gap: 5px;
+  width: max-content;
+  margin-top: 8px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.month-labels span {
+  min-width: 42px;
+}
+
+.level-1 { background: var(--heat-1); }
+.level-2 { background: var(--heat-2); }
+.level-3 { background: var(--heat-3); }
+.level-4 { background: var(--heat-4); }
+
+.tables {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.08fr);
+  gap: 18px;
+  align-items: start;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  min-width: 520px;
+}
+
+th,
+td {
+  border-bottom: 1px solid var(--line);
+  padding: 10px 10px;
+  text-align: left;
+  vertical-align: top;
+}
+
+th {
+  color: var(--muted);
+  font-size: 14px;
+  font-weight: 650;
+}
+
+td.num,
+th.num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+td.empty,
+.state {
+  color: var(--muted);
+  text-align: center;
+  padding: 26px 12px;
+}
+
+tfoot td {
+  color: var(--accent-2);
+  font-weight: 760;
+  border-bottom: 0;
+}
+
+.state {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  margin-top: 40px;
+}
+
+.state code {
+  display: block;
+  margin-top: 12px;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 980px) {
+  .cards {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .tables {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 520px) {
+  #app {
+    width: min(100vw - 20px, 1420px);
+    margin-top: 18px;
+  }
+
+  header {
+    flex-direction: column;
+  }
+
+  .cards {
+    grid-template-columns: 1fr;
+  }
+
+  h1 {
+    font-size: 25px;
+  }
+
+  .value {
+    font-size: 23px;
+  }
+}
