@@ -28,7 +28,7 @@ body {
 }
 
 #app {
-  width: min(1420px, calc(100vw - 32px));
+  width: min(1840px, calc(100vw - 32px));
   margin: 28px auto 56px;
 }
 
@@ -272,7 +272,7 @@ section {
 table {
   width: 100%;
   border-collapse: collapse;
-  min-width: 520px;
+  min-width: 680px;
 }
 
 th,
@@ -348,7 +348,7 @@ tfoot td {
 }
 
 .detail-table {
-  min-width: 480px;
+  min-width: 624px;
 }
 
 .detail-empty {
@@ -386,7 +386,7 @@ tfoot td {
 
 @media (max-width: 520px) {
   #app {
-    width: min(100vw - 20px, 1420px);
+    width: min(100vw - 20px, 1840px);
     margin-top: 18px;
   }
 

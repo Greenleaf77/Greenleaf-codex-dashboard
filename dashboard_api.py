@@ -299,7 +299,8 @@ def token_events(db_path: Path, filters: dict[str, str | int | bool | None]) -> 
                         "raw_input_tokens": input_tokens,
                         "output_tokens": output_tokens,
                         "reasoning_output_tokens": reasoning_output_tokens,
-                        "total_tokens": billable_input_tokens + cached_input_tokens + output_tokens,
+                        "total_tokens": billable_input_tokens + output_tokens,
+                        "total_with_cached_tokens": billable_input_tokens + cached_input_tokens + output_tokens,
                     }
                 )
     return events
@@ -339,6 +340,7 @@ def load_usage(
                 "output_tokens": 0,
                 "reasoning_output_tokens": 0,
                 "total_tokens": 0,
+                "total_with_cached_tokens": 0,
                 "cost_usd": 0.0,
             },
         )
@@ -354,6 +356,7 @@ def load_usage(
                 "output_tokens": 0,
                 "reasoning_output_tokens": 0,
                 "total_tokens": 0,
+                "total_with_cached_tokens": 0,
                 "cost_usd": 0.0,
                 "daily_map": {},
             },
@@ -370,6 +373,7 @@ def load_usage(
                 "output_tokens": 0,
                 "reasoning_output_tokens": 0,
                 "total_tokens": 0,
+                "total_with_cached_tokens": 0,
                 "cost_usd": 0.0,
             },
         )
@@ -381,6 +385,7 @@ def load_usage(
             "output_tokens",
             "reasoning_output_tokens",
             "total_tokens",
+            "total_with_cached_tokens",
             "cost_usd",
         ):
             daily[key] += event[key]
@@ -408,6 +413,7 @@ def load_usage(
     total_output = sum(row["output_tokens"] for row in day_rows)
     total_reasoning = sum(row["reasoning_output_tokens"] for row in day_rows)
     total_tokens = sum(row["total_tokens"] for row in day_rows)
+    total_with_cached = sum(row["total_with_cached_tokens"] for row in day_rows)
     total_cost = sum(row["cost_usd"] for row in day_rows)
 
     return {
@@ -424,6 +430,7 @@ def load_usage(
             "output_tokens": total_output,
             "reasoning_output_tokens": total_reasoning,
             "total_tokens": total_tokens,
+            "total_with_cached_tokens": total_with_cached,
             "cost_usd": total_cost,
         },
         "daily": day_rows,
@@ -515,15 +522,16 @@ def render_dashboard(data: dict) -> str:
           <td>All</td>
           <td>Codex</td>
           <td class="num">{fmt_int(row["input_tokens"])}</td>
-          <td class="num">{fmt_int(row["cached_input_tokens"])}</td>
           <td class="num">{fmt_int(row["output_tokens"])}</td>
           <td class="num">{fmt_int(row["total_tokens"])}</td>
+          <td class="num">{fmt_int(row["cached_input_tokens"])}</td>
+          <td class="num">{fmt_int(row["total_with_cached_tokens"])}</td>
           <td class="num">{fmt_usd(row["cost_usd"])}</td>
           <td class="num">{fmt_int(row["sessions"])}</td>
         </tr>
         """
         for row in daily_desc
-    ) or '<tr><td colspan="9" class="empty">No usage in this range.</td></tr>'
+    ) or '<tr><td colspan="10" class="empty">No usage in this range.</td></tr>'
 
     model_rows = "\n".join(
         f"""
@@ -531,15 +539,16 @@ def render_dashboard(data: dict) -> str:
           <td>{html.escape(row["model"])}</td>
           <td class="num">{fmt_int(row["sessions"])}</td>
           <td class="num">{fmt_int(row["input_tokens"])}</td>
-          <td class="num">{fmt_int(row["cached_input_tokens"])}</td>
           <td class="num">{fmt_int(row["output_tokens"])}</td>
           <td class="num">{fmt_int(row["total_tokens"])}</td>
+          <td class="num">{fmt_int(row["cached_input_tokens"])}</td>
+          <td class="num">{fmt_int(row["total_with_cached_tokens"])}</td>
           <td class="num">{fmt_usd(row["cost_usd"])}</td>
           <td class="num">{(row["total_tokens"] / max(totals["total_tokens"], 1) * 100):.1f}%</td>
         </tr>
         """
         for row in data["models"]
-    ) or '<tr><td colspan="8" class="empty">No models in this range.</td></tr>'
+    ) or '<tr><td colspan="9" class="empty">No models in this range.</td></tr>'
 
     heatmap = "\n".join(
         f"""
@@ -585,7 +594,7 @@ def render_dashboard(data: dict) -> str:
       line-height: 1.45;
     }}
     main {{
-      width: min(1180px, calc(100vw - 32px));
+      width: min(1534px, calc(100vw - 32px));
       margin: 28px auto 56px;
     }}
     header {{
@@ -699,7 +708,7 @@ def render_dashboard(data: dict) -> str:
     table {{
       width: 100%;
       border-collapse: collapse;
-      min-width: 720px;
+      min-width: 936px;
     }}
     th, td {{
       border-bottom: 1px solid var(--line);
@@ -746,7 +755,7 @@ def render_dashboard(data: dict) -> str:
       .tables {{ grid-template-columns: 1fr; }}
     }}
     @media (max-width: 520px) {{
-      main {{ width: min(100vw - 20px, 1180px); margin-top: 18px; }}
+      main {{ width: min(100vw - 20px, 1534px); margin-top: 18px; }}
       .cards {{ grid-template-columns: 1fr; }}
       h1 {{ font-size: 25px; }}
       .value {{ font-size: 23px; }}
@@ -772,10 +781,11 @@ def render_dashboard(data: dict) -> str:
 
     <div class="cards">
       <div class="card"><div class="label">Sessions</div><div class="value">{fmt_int(totals["sessions"])}</div></div>
-      <div class="card"><div class="label">Total tokens</div><div class="value">{fmt_short(totals["total_tokens"])}</div></div>
       <div class="card"><div class="label">Input tokens</div><div class="value">{fmt_short(totals["input_tokens"])}</div></div>
-      <div class="card"><div class="label">Cached input</div><div class="value">{fmt_short(totals["cached_input_tokens"])}</div></div>
       <div class="card"><div class="label">Output tokens</div><div class="value">{fmt_short(totals["output_tokens"])}</div></div>
+      <div class="card"><div class="label">Total w/o cached</div><div class="value">{fmt_short(totals["total_tokens"])}</div></div>
+      <div class="card"><div class="label">Cached input</div><div class="value">{fmt_short(totals["cached_input_tokens"])}</div></div>
+      <div class="card"><div class="label">Total tokens</div><div class="value">{fmt_short(totals["total_with_cached_tokens"])}</div></div>
       <div class="card"><div class="label">Active days</div><div class="value">{fmt_int(totals["active_days"])}</div></div>
       <div class="card"><div class="label">API estimate</div><div class="value">{fmt_usd(totals["cost_usd"])}<span class="metric-note">{html.escape(data["pricing"]["source"])}</span></div></div>
       <div class="card"><div class="label">Favorite model</div><div class="value">{html.escape(data["favorite_model"])}</div></div>
@@ -795,9 +805,9 @@ def render_dashboard(data: dict) -> str:
         <h2>Daily Usage</h2>
         <div class="table-scroll">
           <table>
-            <thead><tr><th>Date</th><th>Scope</th><th>App</th><th class="num">Input</th><th class="num">Cached</th><th class="num">Output</th><th class="num">Total</th><th class="num">Cost</th><th class="num">Sessions</th></tr></thead>
+            <thead><tr><th>Date</th><th>Scope</th><th>App</th><th class="num">Input</th><th class="num">Output</th><th class="num">Total w/o cached</th><th class="num">Cached</th><th class="num">Total</th><th class="num">Cost</th><th class="num">Sessions</th></tr></thead>
             <tbody>{day_rows}</tbody>
-            <tfoot><tr><td>Total</td><td></td><td></td><td class="num">{fmt_int(totals["input_tokens"])}</td><td class="num">{fmt_int(totals["cached_input_tokens"])}</td><td class="num">{fmt_int(totals["output_tokens"])}</td><td class="num">{fmt_int(totals["total_tokens"])}</td><td class="num">{fmt_usd(totals["cost_usd"])}</td><td class="num">{fmt_int(totals["sessions"])}</td></tr></tfoot>
+            <tfoot><tr><td>Total</td><td></td><td></td><td class="num">{fmt_int(totals["input_tokens"])}</td><td class="num">{fmt_int(totals["output_tokens"])}</td><td class="num">{fmt_int(totals["total_tokens"])}</td><td class="num">{fmt_int(totals["cached_input_tokens"])}</td><td class="num">{fmt_int(totals["total_with_cached_tokens"])}</td><td class="num">{fmt_usd(totals["cost_usd"])}</td><td class="num">{fmt_int(totals["sessions"])}</td></tr></tfoot>
           </table>
         </div>
       </section>
@@ -806,7 +816,7 @@ def render_dashboard(data: dict) -> str:
         <h2>Models</h2>
         <div class="table-scroll">
           <table>
-            <thead><tr><th>Model</th><th class="num">Sessions</th><th class="num">Input</th><th class="num">Cached</th><th class="num">Output</th><th class="num">Total</th><th class="num">Cost</th><th class="num">Share</th></tr></thead>
+            <thead><tr><th>Model</th><th class="num">Sessions</th><th class="num">Input</th><th class="num">Output</th><th class="num">Total w/o cached</th><th class="num">Cached</th><th class="num">Total</th><th class="num">Cost</th><th class="num">Share</th></tr></thead>
             <tbody>{model_rows}</tbody>
           </table>
         </div>
@@ -973,6 +983,21 @@ def run_check(db_path: Path) -> None:
         data = load_usage(db_path, range_name, start_day, end_day, ignore_auto_review)
         html_body = render_dashboard(data)
         json.dumps(data, ensure_ascii=False)
+        totals = data["totals"]
+        if totals["total_tokens"] != totals["input_tokens"] + totals["output_tokens"]:
+            raise RuntimeError(f"Total without cached invariant failed for range={range_name}")
+        if totals["total_with_cached_tokens"] != totals["total_tokens"] + totals["cached_input_tokens"]:
+            raise RuntimeError(f"Total with cached invariant failed for range={range_name}")
+        for row in data["daily"]:
+            if row["total_tokens"] != row["input_tokens"] + row["output_tokens"]:
+                raise RuntimeError(f"Daily total without cached invariant failed for range={range_name}")
+            if row["total_with_cached_tokens"] != row["total_tokens"] + row["cached_input_tokens"]:
+                raise RuntimeError(f"Daily total with cached invariant failed for range={range_name}")
+        for row in data["models"]:
+            if row["total_tokens"] != row["input_tokens"] + row["output_tokens"]:
+                raise RuntimeError(f"Model total without cached invariant failed for range={range_name}")
+            if row["total_with_cached_tokens"] != row["total_tokens"] + row["cached_input_tokens"]:
+                raise RuntimeError(f"Model total with cached invariant failed for range={range_name}")
         if "<!doctype html>" not in html_body:
             raise RuntimeError(f"Dashboard render failed for range={range_name}")
     print(f"Smoke check passed for {db_path}")
