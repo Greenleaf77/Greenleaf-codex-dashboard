@@ -9,11 +9,12 @@ This project is not affiliated with OpenAI.
 ## Features
 
 - Local-only dashboard served on `127.0.0.1`
-- Summary cards for sessions, token usage, API-equivalent cost estimate, active days, streaks, peak day, and favorite model
-- Daily usage table with input, output, total tokens, and estimated cost
-- Model breakdown table with estimated cost by model
+- Summary cards for sessions, token usage with and without cached input, API-equivalent cost estimate, active days, streaks, peak day, and favorite model
+- Daily usage table with input, output, total without cached input, cached input, total with cached input, and estimated cost
+- Model breakdown table with expandable daily model details and estimated cost by model
 - Daily heatmap with month labels and hover tooltips
-- Range filters: all time, 30 days, 7 days
+- Range filters: all time, 30 days, 7 days, 1 day, and custom dates
+- Optional filter to ignore the `codex-auto-review` model
 - macOS `.command` launcher
 
 ## Data Sources
@@ -32,8 +33,12 @@ Displayed token accounting follows the same practical convention used by local u
 ```text
 Input = input_tokens - cached_input_tokens
 Output = output_tokens
-Total = Input + Output
+Total w/o cached = Input + Output
+Cached = cached_input_tokens
+Total = Input + Cached + Output
 ```
+
+The historical dashboard total is preserved as `Total w/o cached`. The `Total` column includes cached input so you can see the full token volume represented in local Codex logs.
 
 ## Cost Estimates
 
@@ -70,6 +75,10 @@ Do not run this bound to a public interface unless you have reviewed the code an
 - Python 3.10+
 - Local Codex logs in `~/.codex`
 
+On Windows, `~/.codex` resolves to `%USERPROFILE%\.codex`.
+
+The launcher and smoke-check try `python` first, then `python3`. You can also override the interpreter with the `PYTHON` environment variable.
+
 ## Install
 
 ```bash
@@ -97,7 +106,7 @@ To install a specific release instead of the latest `main`, use a tag:
 
 ```bash
 git fetch --tags
-git checkout v1.0.1
+git checkout v1.0.2
 npm install
 ```
 

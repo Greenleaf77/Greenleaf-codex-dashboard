@@ -16,7 +16,8 @@ from urllib.request import Request, urlopen
 
 
 DEFAULT_DB = Path.home() / ".codex" / "state_5.sqlite"
-RANGES = {"all", "30d", "7d"}
+RANGES = {"all", "30d", "7d", "1d", "custom"}
+AUTO_REVIEW_MODEL = "codex-auto-review"
 PRICING_URL = "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
 PRICING_CACHE_SECONDS = 600
 PRICING_CACHE: dict[str, object] = {"loaded_at": 0.0, "pricing": None}
@@ -81,6 +82,25 @@ def day_from_iso_timestamp(value: str) -> str:
 
 def normalize_range(range_name: str | None) -> str:
     return range_name if range_name in RANGES else "all"
+
+
+def parse_iso_day(value: str | None) -> dt.date | None:
+    if not value:
+        return None
+    try:
+        return dt.date.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def day_start_timestamp(value: dt.date) -> int:
+    return int(dt.datetime.combine(value, dt.time.min).timestamp())
+
+
+def parse_bool_flag(value: str | None, default: bool = False) -> bool:
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def load_pricing() -> dict:
@@ -154,15 +174,39 @@ def token_cost_usd(event: dict, pricing: dict) -> tuple[float, str | None]:
     return cost, None
 
 
-def range_start(range_name: str) -> tuple[str | None, int | None]:
+def resolve_range(
+    range_name: str | None,
+    start_day: str | None = None,
+    end_day: str | None = None,
+    ignore_auto_review: bool = False,
+) -> dict[str, str | int | bool | None]:
     range_name = normalize_range(range_name)
-    if range_name == "7d":
-        start = (dt.datetime.now() - dt.timedelta(days=6)).replace(hour=0, minute=0, second=0, microsecond=0)
-        return start.date().isoformat(), int(start.timestamp())
-    if range_name == "30d":
-        start = (dt.datetime.now() - dt.timedelta(days=29)).replace(hour=0, minute=0, second=0, microsecond=0)
-        return start.date().isoformat(), int(start.timestamp())
-    return None, None
+    today = dt.date.today()
+    start_date: dt.date | None = None
+    end_date: dt.date | None = None
+
+    if range_name == "1d":
+        start_date = today
+        end_date = today
+    elif range_name == "7d":
+        start_date = today - dt.timedelta(days=6)
+        end_date = today
+    elif range_name == "30d":
+        start_date = today - dt.timedelta(days=29)
+        end_date = today
+    elif range_name == "custom":
+        start_date = parse_iso_day(start_day) or today
+        end_date = parse_iso_day(end_day) or start_date
+        if start_date > end_date:
+            start_date, end_date = end_date, start_date
+
+    return {
+        "range": range_name,
+        "start_day": start_date.isoformat() if start_date else None,
+        "end_day": end_date.isoformat() if end_date else None,
+        "start_ts": day_start_timestamp(start_date) if start_date else None,
+        "ignore_auto_review": ignore_auto_review,
+    }
 
 
 def longest_streak(days: set[str]) -> int:
@@ -189,8 +233,11 @@ def current_streak(days: set[str]) -> int:
     return current
 
 
-def token_events(db_path: Path, range_name: str) -> list[dict]:
-    start_day, start_ts = range_start(range_name)
+def token_events(db_path: Path, filters: dict[str, str | int | bool | None]) -> list[dict]:
+    start_day = filters["start_day"]
+    end_day = filters["end_day"]
+    start_ts = filters["start_ts"]
+    ignore_auto_review = bool(filters.get("ignore_auto_review"))
     events: list[dict] = []
     with connect(db_path) as conn:
         where_sql = "where rollout_path != ''"
@@ -208,6 +255,8 @@ def token_events(db_path: Path, range_name: str) -> list[dict]:
         ).fetchall()
 
     for thread in threads:
+        if ignore_auto_review and thread["model"] == AUTO_REVIEW_MODEL:
+            continue
         rollout_path = Path(thread["rollout_path"])
         if not rollout_path.exists():
             continue
@@ -227,6 +276,8 @@ def token_events(db_path: Path, range_name: str) -> list[dict]:
                     continue
                 day = day_from_iso_timestamp(timestamp)
                 if start_day and day < start_day:
+                    continue
+                if end_day and day > end_day:
                     continue
 
                 usage = ((payload.get("info") or {}).get("last_token_usage") or {})
@@ -249,14 +300,21 @@ def token_events(db_path: Path, range_name: str) -> list[dict]:
                         "output_tokens": output_tokens,
                         "reasoning_output_tokens": reasoning_output_tokens,
                         "total_tokens": billable_input_tokens + output_tokens,
+                        "total_with_cached_tokens": billable_input_tokens + cached_input_tokens + output_tokens,
                     }
                 )
     return events
 
 
-def load_usage(db_path: Path, range_name: str) -> dict:
-    range_name = normalize_range(range_name)
-    events = token_events(db_path, range_name)
+def load_usage(
+    db_path: Path,
+    range_name: str,
+    start_day: str | None = None,
+    end_day: str | None = None,
+    ignore_auto_review: bool = False,
+) -> dict:
+    filters = resolve_range(range_name, start_day, end_day, ignore_auto_review)
+    events = token_events(db_path, filters)
     pricing = load_pricing()
     missing_price_models = set()
 
@@ -282,6 +340,7 @@ def load_usage(db_path: Path, range_name: str) -> dict:
                 "output_tokens": 0,
                 "reasoning_output_tokens": 0,
                 "total_tokens": 0,
+                "total_with_cached_tokens": 0,
                 "cost_usd": 0.0,
             },
         )
@@ -297,10 +356,28 @@ def load_usage(db_path: Path, range_name: str) -> dict:
                 "output_tokens": 0,
                 "reasoning_output_tokens": 0,
                 "total_tokens": 0,
+                "total_with_cached_tokens": 0,
                 "cost_usd": 0.0,
+                "daily_map": {},
             },
         )
         model_row["sessions"].add(event["thread_id"])
+        model_daily = model_row["daily_map"].setdefault(
+            day,
+            {
+                "day": day,
+                "sessions": set(),
+                "input_tokens": 0,
+                "cached_input_tokens": 0,
+                "raw_input_tokens": 0,
+                "output_tokens": 0,
+                "reasoning_output_tokens": 0,
+                "total_tokens": 0,
+                "total_with_cached_tokens": 0,
+                "cost_usd": 0.0,
+            },
+        )
+        model_daily["sessions"].add(event["thread_id"])
         for key in (
             "input_tokens",
             "cached_input_tokens",
@@ -308,18 +385,25 @@ def load_usage(db_path: Path, range_name: str) -> dict:
             "output_tokens",
             "reasoning_output_tokens",
             "total_tokens",
+            "total_with_cached_tokens",
             "cost_usd",
         ):
             daily[key] += event[key]
             model_row[key] += event[key]
+            model_daily[key] += event[key]
 
     day_rows = sorted(daily_map.values(), key=lambda row: row["day"])
     for row in day_rows:
         row["sessions"] = len(row["sessions"])
 
-    model_rows = sorted(model_map.values(), key=lambda row: (row["total_tokens"], row["sessions"]), reverse=True)
+    model_rows = sorted(model_map.values(), key=lambda row: (row["total_tokens"], len(row["sessions"])), reverse=True)
     for row in model_rows:
         row["sessions"] = len(row["sessions"])
+        daily_rows = sorted(row.pop("daily_map").values(), key=lambda item: item["day"], reverse=True)
+        for item in daily_rows:
+            item["sessions"] = len(item["sessions"])
+        row["active_days"] = len(daily_rows)
+        row["daily"] = daily_rows
 
     days = {row["day"] for row in day_rows}
     favorite = model_rows[0]["model"] if model_rows else "-"
@@ -329,10 +413,14 @@ def load_usage(db_path: Path, range_name: str) -> dict:
     total_output = sum(row["output_tokens"] for row in day_rows)
     total_reasoning = sum(row["reasoning_output_tokens"] for row in day_rows)
     total_tokens = sum(row["total_tokens"] for row in day_rows)
+    total_with_cached = sum(row["total_with_cached_tokens"] for row in day_rows)
     total_cost = sum(row["cost_usd"] for row in day_rows)
 
     return {
-        "range": range_name,
+        "range": filters["range"],
+        "range_start": filters["start_day"],
+        "range_end": filters["end_day"],
+        "ignore_auto_review": bool(filters["ignore_auto_review"]),
         "generated_at": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "totals": {
             "sessions": len(thread_ids),
@@ -342,6 +430,7 @@ def load_usage(db_path: Path, range_name: str) -> dict:
             "output_tokens": total_output,
             "reasoning_output_tokens": total_reasoning,
             "total_tokens": total_tokens,
+            "total_with_cached_tokens": total_with_cached,
             "cost_usd": total_cost,
         },
         "daily": day_rows,
@@ -361,19 +450,25 @@ def load_usage(db_path: Path, range_name: str) -> dict:
     }
 
 
-def heatmap_days(daily: list[dict], range_name: str) -> list[dict]:
+def heatmap_days(
+    daily: list[dict],
+    range_name: str,
+    start_day: str | None = None,
+    end_day: str | None = None,
+) -> list[dict]:
     by_day = {row["day"]: row for row in daily}
-    if daily:
-        first = dt.date.fromisoformat(daily[0]["day"])
-        last = max(dt.date.today(), dt.date.fromisoformat(daily[-1]["day"]))
+    selected_start = parse_iso_day(start_day)
+    selected_end = parse_iso_day(end_day)
+    if range_name == "all":
+        if daily:
+            first = dt.date.fromisoformat(daily[0]["day"])
+            last = max(dt.date.today(), dt.date.fromisoformat(daily[-1]["day"]))
+        else:
+            first = dt.date.today()
+            last = dt.date.today()
     else:
-        first = dt.date.today()
-        last = dt.date.today()
-
-    if range_name == "7d":
-        first = dt.date.today() - dt.timedelta(days=6)
-    elif range_name == "30d":
-        first = dt.date.today() - dt.timedelta(days=29)
+        first = selected_start or (dt.date.fromisoformat(daily[0]["day"]) if daily else dt.date.today())
+        last = selected_end or first
 
     # Align to Monday for a stable contribution-grid shape.
     first -= dt.timedelta(days=first.weekday())
@@ -402,8 +497,19 @@ def heatmap_days(daily: list[dict], range_name: str) -> list[dict]:
 def render_dashboard(data: dict) -> str:
     totals = data["totals"]
     daily_desc = list(reversed(data["daily"]))
-    heat_cells = heatmap_days(data["daily"], data["range"])
+    heat_cells = heatmap_days(data["daily"], data["range"], data.get("range_start"), data.get("range_end"))
     heat_columns = max(1, (len(heat_cells) + 6) // 7)
+
+    if data["range"] == "custom" and data.get("range_start") and data.get("range_end"):
+        range_summary = f'{data["range_start"]} to {data["range_end"]}'
+    elif data["range"] == "1d" and data.get("range_start"):
+        range_summary = data["range_start"]
+    elif data["range"] == "7d":
+        range_summary = "Last 7 days"
+    elif data["range"] == "30d":
+        range_summary = "Last 30 days"
+    else:
+        range_summary = "All time"
 
     def range_link(label: str, value: str) -> str:
         active = " active" if data["range"] == value else ""
@@ -418,12 +524,14 @@ def render_dashboard(data: dict) -> str:
           <td class="num">{fmt_int(row["input_tokens"])}</td>
           <td class="num">{fmt_int(row["output_tokens"])}</td>
           <td class="num">{fmt_int(row["total_tokens"])}</td>
+          <td class="num">{fmt_int(row["cached_input_tokens"])}</td>
+          <td class="num">{fmt_int(row["total_with_cached_tokens"])}</td>
           <td class="num">{fmt_usd(row["cost_usd"])}</td>
           <td class="num">{fmt_int(row["sessions"])}</td>
         </tr>
         """
         for row in daily_desc
-    ) or '<tr><td colspan="8" class="empty">No usage in this range.</td></tr>'
+    ) or '<tr><td colspan="10" class="empty">No usage in this range.</td></tr>'
 
     model_rows = "\n".join(
         f"""
@@ -433,12 +541,14 @@ def render_dashboard(data: dict) -> str:
           <td class="num">{fmt_int(row["input_tokens"])}</td>
           <td class="num">{fmt_int(row["output_tokens"])}</td>
           <td class="num">{fmt_int(row["total_tokens"])}</td>
+          <td class="num">{fmt_int(row["cached_input_tokens"])}</td>
+          <td class="num">{fmt_int(row["total_with_cached_tokens"])}</td>
           <td class="num">{fmt_usd(row["cost_usd"])}</td>
           <td class="num">{(row["total_tokens"] / max(totals["total_tokens"], 1) * 100):.1f}%</td>
         </tr>
         """
         for row in data["models"]
-    ) or '<tr><td colspan="7" class="empty">No models in this range.</td></tr>'
+    ) or '<tr><td colspan="9" class="empty">No models in this range.</td></tr>'
 
     heatmap = "\n".join(
         f"""
@@ -484,7 +594,7 @@ def render_dashboard(data: dict) -> str:
       line-height: 1.45;
     }}
     main {{
-      width: min(1180px, calc(100vw - 32px));
+      width: min(1534px, calc(100vw - 32px));
       margin: 28px auto 56px;
     }}
     header {{
@@ -598,7 +708,7 @@ def render_dashboard(data: dict) -> str:
     table {{
       width: 100%;
       border-collapse: collapse;
-      min-width: 720px;
+      min-width: 936px;
     }}
     th, td {{
       border-bottom: 1px solid var(--line);
@@ -645,7 +755,7 @@ def render_dashboard(data: dict) -> str:
       .tables {{ grid-template-columns: 1fr; }}
     }}
     @media (max-width: 520px) {{
-      main {{ width: min(100vw - 20px, 1180px); margin-top: 18px; }}
+      main {{ width: min(100vw - 20px, 1534px); margin-top: 18px; }}
       .cards {{ grid-template-columns: 1fr; }}
       h1 {{ font-size: 25px; }}
       .value {{ font-size: 23px; }}
@@ -658,19 +768,24 @@ def render_dashboard(data: dict) -> str:
       <div>
         <h1>Codex Usage</h1>
         <div class="subtle">Generated {html.escape(data["generated_at"])} from ~/.codex/state_5.sqlite · <a href="/data.json?range={html.escape(data["range"])}">aggregate JSON</a></div>
+        <div class="subtle">Showing {html.escape(range_summary)}</div>
       </div>
       <nav class="segments" aria-label="Range">
         {range_link("All", "all")}
         {range_link("30d", "30d")}
         {range_link("7d", "7d")}
+        {range_link("1d", "1d")}
+        {range_link("Custom", "custom")}
       </nav>
     </header>
 
     <div class="cards">
       <div class="card"><div class="label">Sessions</div><div class="value">{fmt_int(totals["sessions"])}</div></div>
-      <div class="card"><div class="label">Total tokens</div><div class="value">{fmt_short(totals["total_tokens"])}</div></div>
       <div class="card"><div class="label">Input tokens</div><div class="value">{fmt_short(totals["input_tokens"])}</div></div>
       <div class="card"><div class="label">Output tokens</div><div class="value">{fmt_short(totals["output_tokens"])}</div></div>
+      <div class="card"><div class="label">Total w/o cached</div><div class="value">{fmt_short(totals["total_tokens"])}</div></div>
+      <div class="card"><div class="label">Cached input</div><div class="value">{fmt_short(totals["cached_input_tokens"])}</div></div>
+      <div class="card"><div class="label">Total tokens</div><div class="value">{fmt_short(totals["total_with_cached_tokens"])}</div></div>
       <div class="card"><div class="label">Active days</div><div class="value">{fmt_int(totals["active_days"])}</div></div>
       <div class="card"><div class="label">API estimate</div><div class="value">{fmt_usd(totals["cost_usd"])}<span class="metric-note">{html.escape(data["pricing"]["source"])}</span></div></div>
       <div class="card"><div class="label">Favorite model</div><div class="value">{html.escape(data["favorite_model"])}</div></div>
@@ -690,9 +805,9 @@ def render_dashboard(data: dict) -> str:
         <h2>Daily Usage</h2>
         <div class="table-scroll">
           <table>
-            <thead><tr><th>Date</th><th>Scope</th><th>App</th><th class="num">Input</th><th class="num">Output</th><th class="num">Total</th><th class="num">Cost</th><th class="num">Sessions</th></tr></thead>
+            <thead><tr><th>Date</th><th>Scope</th><th>App</th><th class="num">Input</th><th class="num">Output</th><th class="num">Total w/o cached</th><th class="num">Cached</th><th class="num">Total</th><th class="num">Cost</th><th class="num">Sessions</th></tr></thead>
             <tbody>{day_rows}</tbody>
-            <tfoot><tr><td>Total</td><td></td><td></td><td class="num">{fmt_int(totals["input_tokens"])}</td><td class="num">{fmt_int(totals["output_tokens"])}</td><td class="num">{fmt_int(totals["total_tokens"])}</td><td class="num">{fmt_usd(totals["cost_usd"])}</td><td class="num">{fmt_int(totals["sessions"])}</td></tr></tfoot>
+            <tfoot><tr><td>Total</td><td></td><td></td><td class="num">{fmt_int(totals["input_tokens"])}</td><td class="num">{fmt_int(totals["output_tokens"])}</td><td class="num">{fmt_int(totals["total_tokens"])}</td><td class="num">{fmt_int(totals["cached_input_tokens"])}</td><td class="num">{fmt_int(totals["total_with_cached_tokens"])}</td><td class="num">{fmt_usd(totals["cost_usd"])}</td><td class="num">{fmt_int(totals["sessions"])}</td></tr></tfoot>
           </table>
         </div>
       </section>
@@ -701,7 +816,7 @@ def render_dashboard(data: dict) -> str:
         <h2>Models</h2>
         <div class="table-scroll">
           <table>
-            <thead><tr><th>Model</th><th class="num">Sessions</th><th class="num">Input</th><th class="num">Output</th><th class="num">Total</th><th class="num">Cost</th><th class="num">Share</th></tr></thead>
+            <thead><tr><th>Model</th><th class="num">Sessions</th><th class="num">Input</th><th class="num">Output</th><th class="num">Total w/o cached</th><th class="num">Cached</th><th class="num">Total</th><th class="num">Cost</th><th class="num">Share</th></tr></thead>
             <tbody>{model_rows}</tbody>
           </table>
         </div>
@@ -781,9 +896,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return
         self.send_error(404)
 
-    def range_from_query(self, query_string: str) -> str:
+    def filters_from_query(self, query_string: str) -> dict[str, str | int | bool | None]:
         query = parse_qs(query_string)
-        return normalize_range(query.get("range", ["all"])[0])
+        return resolve_range(
+            query.get("range", ["all"])[0],
+            query.get("start", [None])[0],
+            query.get("end", [None])[0],
+            parse_bool_flag(query.get("ignore_auto_review", [None])[0], default=False),
+        )
 
     def send_body(self, status: int, content_type: str, body: bytes) -> None:
         self.send_response(status)
@@ -794,9 +914,15 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def serve_dashboard(self, query_string: str) -> None:
-        range_name = self.range_from_query(query_string)
+        filters = self.filters_from_query(query_string)
         try:
-            data = load_usage(self.db_path, range_name)
+            data = load_usage(
+                self.db_path,
+                str(filters["range"]),
+                filters["start_day"],
+                filters["end_day"],
+                bool(filters["ignore_auto_review"]),
+            )
             body = render_dashboard(data).encode("utf-8")
             self.send_body(200, "text/html; charset=utf-8", body)
         except Exception as exc:  # noqa: BLE001
@@ -804,14 +930,23 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.send_body(503, "text/html; charset=utf-8", body)
 
     def serve_json(self, query_string: str) -> None:
-        range_name = self.range_from_query(query_string)
+        filters = self.filters_from_query(query_string)
         try:
-            payload = load_usage(self.db_path, range_name)
+            payload = load_usage(
+                self.db_path,
+                str(filters["range"]),
+                filters["start_day"],
+                filters["end_day"],
+                bool(filters["ignore_auto_review"]),
+            )
             status = 200
         except Exception as exc:  # noqa: BLE001
             payload = {
                 "error": "Could not read Codex usage data.",
-                "range": range_name,
+                "range": filters["range"],
+                "range_start": filters["start_day"],
+                "range_end": filters["end_day"],
+                "ignore_auto_review": bool(filters["ignore_auto_review"]),
                 "generated_at": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             }
             status = 503
@@ -835,10 +970,34 @@ def run_check(db_path: Path) -> None:
     if missing_model or round(sample_cost, 5) != 38.10353:
         raise RuntimeError("Cost calculation check failed")
 
-    for range_name in ("all", "30d", "7d", "bad-range"):
-        data = load_usage(db_path, range_name)
+    checks = [
+        ("all", None, None, False),
+        ("30d", None, None, False),
+        ("7d", None, None, False),
+        ("1d", None, None, False),
+        ("custom", "2026-01-01", "2026-01-03", False),
+        ("bad-range", None, None, False),
+        ("all", None, None, True),
+    ]
+    for range_name, start_day, end_day, ignore_auto_review in checks:
+        data = load_usage(db_path, range_name, start_day, end_day, ignore_auto_review)
         html_body = render_dashboard(data)
         json.dumps(data, ensure_ascii=False)
+        totals = data["totals"]
+        if totals["total_tokens"] != totals["input_tokens"] + totals["output_tokens"]:
+            raise RuntimeError(f"Total without cached invariant failed for range={range_name}")
+        if totals["total_with_cached_tokens"] != totals["total_tokens"] + totals["cached_input_tokens"]:
+            raise RuntimeError(f"Total with cached invariant failed for range={range_name}")
+        for row in data["daily"]:
+            if row["total_tokens"] != row["input_tokens"] + row["output_tokens"]:
+                raise RuntimeError(f"Daily total without cached invariant failed for range={range_name}")
+            if row["total_with_cached_tokens"] != row["total_tokens"] + row["cached_input_tokens"]:
+                raise RuntimeError(f"Daily total with cached invariant failed for range={range_name}")
+        for row in data["models"]:
+            if row["total_tokens"] != row["input_tokens"] + row["output_tokens"]:
+                raise RuntimeError(f"Model total without cached invariant failed for range={range_name}")
+            if row["total_with_cached_tokens"] != row["total_tokens"] + row["cached_input_tokens"]:
+                raise RuntimeError(f"Model total with cached invariant failed for range={range_name}")
         if "<!doctype html>" not in html_body:
             raise RuntimeError(f"Dashboard render failed for range={range_name}")
     print(f"Smoke check passed for {db_path}")

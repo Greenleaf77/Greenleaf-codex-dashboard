@@ -1,12 +1,16 @@
 import { spawn } from "node:child_process";
 import net from "node:net";
 import process from "node:process";
+import { resolvePythonCommand } from "./scripts/python-command.mjs";
 
 const children = [];
 let shuttingDown = false;
 const host = "127.0.0.1";
 const vitePort = 8765;
 const apiPort = 8766;
+const isWindows = process.platform === "win32";
+const npmCommand = isWindows ? "npm.cmd" : "npm";
+const pythonCommand = resolvePythonCommand();
 
 function isPortFree(port) {
   return new Promise((resolve) => {
@@ -51,6 +55,14 @@ function start(name, command, args) {
   return child;
 }
 
+function startNpm(name, args) {
+  if (isWindows) {
+    const comspec = process.env.ComSpec || "cmd.exe";
+    return start(name, comspec, ["/d", "/s", "/c", npmCommand, ...args]);
+  }
+  return start(name, npmCommand, args);
+}
+
 function openDefaultBrowser() {
   if (process.platform !== "darwin") return;
   const child = spawn("open", [`http://${host}:${vitePort}/`], {
@@ -74,6 +86,6 @@ process.on("SIGTERM", () => shutdown(0));
 process.on("SIGHUP", () => shutdown(0));
 
 await assertPortsFree();
-start("Python API", "python3", ["dashboard_api.py", "--host", host, "--port", String(apiPort)]);
-start("Vite", "npm", ["run", "dev"]);
+start("Python API", pythonCommand, ["dashboard_api.py", "--host", host, "--port", String(apiPort)]);
+startNpm("Vite", ["run", "dev"]);
 setTimeout(openDefaultBrowser, 700);
