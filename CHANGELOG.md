@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.0.3 - 2026-06-28
+
+- Added visualization tabs for `Daily heatmap` and `Tokens over time`.
+- Added a stacked tokens-over-time bar chart split by model.
+- Added independent chart date filters: all time, 1 year, 6 months, 90 days, 30 days, and custom dates.
+- Added adaptive chart buckets: daily through 60 days, weekly through 6 months, and monthly for longer ranges.
+- Updated the README screenshot for the new chart view.
+
 ## 1.0.2 - 2026-06-07
 
 - Added Windows-friendly Python command resolution for the launcher and smoke-check.

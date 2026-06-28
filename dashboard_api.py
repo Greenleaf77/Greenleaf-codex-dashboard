@@ -17,6 +17,7 @@ from urllib.request import Request, urlopen
 
 DEFAULT_DB = Path.home() / ".codex" / "state_5.sqlite"
 RANGES = {"all", "30d", "7d", "1d", "custom"}
+CHART_RANGES = {"all", "1y", "6m", "90d", "30d", "custom"}
 AUTO_REVIEW_MODEL = "codex-auto-review"
 PRICING_URL = "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
 PRICING_CACHE_SECONDS = 600
@@ -84,6 +85,10 @@ def normalize_range(range_name: str | None) -> str:
     return range_name if range_name in RANGES else "all"
 
 
+def normalize_chart_range(range_name: str | None) -> str:
+    return range_name if range_name in CHART_RANGES else "30d"
+
+
 def parse_iso_day(value: str | None) -> dt.date | None:
     if not value:
         return None
@@ -95,6 +100,22 @@ def parse_iso_day(value: str | None) -> dt.date | None:
 
 def day_start_timestamp(value: dt.date) -> int:
     return int(dt.datetime.combine(value, dt.time.min).timestamp())
+
+
+def days_in_month(year: int, month: int) -> int:
+    if month == 12:
+        next_month = dt.date(year + 1, 1, 1)
+    else:
+        next_month = dt.date(year, month + 1, 1)
+    return (next_month - dt.timedelta(days=1)).day
+
+
+def add_months(value: dt.date, months: int) -> dt.date:
+    month_index = value.month - 1 + months
+    year = value.year + month_index // 12
+    month = month_index % 12 + 1
+    day = min(value.day, days_in_month(year, month))
+    return dt.date(year, month, day)
 
 
 def parse_bool_flag(value: str | None, default: bool = False) -> bool:
@@ -209,6 +230,44 @@ def resolve_range(
     }
 
 
+def resolve_chart_range(
+    range_name: str | None,
+    start_day: str | None = None,
+    end_day: str | None = None,
+    ignore_auto_review: bool = False,
+) -> dict[str, str | int | bool | None]:
+    range_name = normalize_chart_range(range_name)
+    today = dt.date.today()
+    start_date: dt.date | None = None
+    end_date: dt.date | None = None
+
+    if range_name == "30d":
+        start_date = today - dt.timedelta(days=29)
+        end_date = today
+    elif range_name == "90d":
+        start_date = today - dt.timedelta(days=89)
+        end_date = today
+    elif range_name == "6m":
+        start_date = add_months(today, -6) + dt.timedelta(days=1)
+        end_date = today
+    elif range_name == "1y":
+        start_date = today - dt.timedelta(days=364)
+        end_date = today
+    elif range_name == "custom":
+        start_date = parse_iso_day(start_day) or (today - dt.timedelta(days=29))
+        end_date = parse_iso_day(end_day) or today
+        if start_date > end_date:
+            start_date, end_date = end_date, start_date
+
+    return {
+        "range": range_name,
+        "start_day": start_date.isoformat() if start_date else None,
+        "end_day": end_date.isoformat() if end_date else None,
+        "start_ts": day_start_timestamp(start_date) if start_date else None,
+        "ignore_auto_review": ignore_auto_review,
+    }
+
+
 def longest_streak(days: set[str]) -> int:
     if not days:
         return 0
@@ -306,15 +365,113 @@ def token_events(db_path: Path, filters: dict[str, str | int | bool | None]) -> 
     return events
 
 
+def chart_granularity(start_day: dt.date, end_day: dt.date) -> str:
+    span_days = (end_day - start_day).days + 1
+    if span_days <= 60:
+        return "day"
+    if span_days <= 183:
+        return "week"
+    return "month"
+
+
+def chart_bucket_for_day(day: dt.date, granularity: str) -> tuple[dt.date, dt.date, str]:
+    if granularity == "week":
+        start = day - dt.timedelta(days=day.weekday())
+        end = start + dt.timedelta(days=6)
+        label = f"{start.strftime('%b')} {start.day}"
+        return start, end, label
+    if granularity == "month":
+        start = day.replace(day=1)
+        end = dt.date(day.year, day.month, days_in_month(day.year, day.month))
+        label = start.strftime("%b %Y")
+        return start, end, label
+    return day, day, f"{day.strftime('%b')} {day.day}"
+
+
+def chart_days_from_events(events: list[dict], filters: dict[str, str | int | bool | None]) -> dict:
+    bucket_model_map: dict[str, dict[str, int]] = {}
+    model_totals: dict[str, int] = {}
+    start_day = parse_iso_day(str(filters["start_day"])) if filters.get("start_day") else None
+    end_day = parse_iso_day(str(filters["end_day"])) if filters.get("end_day") else None
+
+    event_days = [dt.date.fromisoformat(event["day"]) for event in events]
+    if start_day is None and event_days:
+        start_day = min(event_days)
+    if end_day is None:
+        if event_days:
+            end_day = max(dt.date.today(), max(event_days))
+        else:
+            end_day = dt.date.today()
+    if start_day is None:
+        start_day = end_day
+
+    granularity = chart_granularity(start_day, end_day)
+    for event in events:
+        event_day = dt.date.fromisoformat(event["day"])
+        bucket_start, _, _ = chart_bucket_for_day(event_day, granularity)
+        bucket_key = bucket_start.isoformat()
+        model = event["model"]
+        tokens = int(event["total_tokens"])
+        bucket_models = bucket_model_map.setdefault(bucket_key, {})
+        bucket_models[model] = bucket_models.get(model, 0) + tokens
+        model_totals[model] = model_totals.get(model, 0) + tokens
+
+    days = []
+    cursor, _, _ = chart_bucket_for_day(start_day, granularity)
+    while cursor <= end_day:
+        bucket_start, bucket_end, label = chart_bucket_for_day(cursor, granularity)
+        day_key = bucket_start.isoformat()
+        models = [
+            {"model": model, "total_tokens": tokens}
+            for model, tokens in sorted(bucket_model_map.get(day_key, {}).items(), key=lambda item: item[1], reverse=True)
+            if tokens
+        ]
+        days.append(
+            {
+                "day": day_key,
+                "bucket_start": bucket_start.isoformat(),
+                "bucket_end": bucket_end.isoformat(),
+                "label": label,
+                "total_tokens": sum(item["total_tokens"] for item in models),
+                "models": models,
+            }
+        )
+        if granularity == "month":
+            cursor = add_months(bucket_start, 1)
+        elif granularity == "week":
+            cursor = bucket_start + dt.timedelta(days=7)
+        else:
+            cursor = bucket_start + dt.timedelta(days=1)
+
+    models = [
+        {"model": model, "total_tokens": total}
+        for model, total in sorted(model_totals.items(), key=lambda item: item[1], reverse=True)
+        if total
+    ]
+    return {
+        "range": filters["range"],
+        "granularity": granularity,
+        "range_start": start_day.isoformat() if start_day else None,
+        "range_end": end_day.isoformat() if end_day else None,
+        "days": days,
+        "models": models,
+    }
+
+
 def load_usage(
     db_path: Path,
     range_name: str,
     start_day: str | None = None,
     end_day: str | None = None,
     ignore_auto_review: bool = False,
+    chart_range: str | None = "30d",
+    chart_start_day: str | None = None,
+    chart_end_day: str | None = None,
 ) -> dict:
     filters = resolve_range(range_name, start_day, end_day, ignore_auto_review)
     events = token_events(db_path, filters)
+    chart_filters = resolve_chart_range(chart_range, chart_start_day, chart_end_day, ignore_auto_review)
+    chart_events = token_events(db_path, chart_filters)
     pricing = load_pricing()
     missing_price_models = set()
 
@@ -435,6 +592,7 @@ def load_usage(
         },
         "daily": day_rows,
         "models": model_rows,
+        "chart": chart_days_from_events(chart_events, chart_filters),
         "pricing": {
             "source": pricing["source"],
             "url": pricing["url"],
@@ -898,12 +1056,22 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def filters_from_query(self, query_string: str) -> dict[str, str | int | bool | None]:
         query = parse_qs(query_string)
-        return resolve_range(
+        filters = resolve_range(
             query.get("range", ["all"])[0],
             query.get("start", [None])[0],
             query.get("end", [None])[0],
             parse_bool_flag(query.get("ignore_auto_review", [None])[0], default=False),
         )
+        chart_filters = resolve_chart_range(
+            query.get("chart_range", ["30d"])[0],
+            query.get("chart_start", [None])[0],
+            query.get("chart_end", [None])[0],
+            bool(filters["ignore_auto_review"]),
+        )
+        filters["chart_range"] = chart_filters["range"]
+        filters["chart_start_day"] = chart_filters["start_day"]
+        filters["chart_end_day"] = chart_filters["end_day"]
+        return filters
 
     def send_body(self, status: int, content_type: str, body: bytes) -> None:
         self.send_response(status)
@@ -922,6 +1090,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 filters["start_day"],
                 filters["end_day"],
                 bool(filters["ignore_auto_review"]),
+                str(filters["chart_range"]),
+                filters["chart_start_day"],
+                filters["chart_end_day"],
             )
             body = render_dashboard(data).encode("utf-8")
             self.send_body(200, "text/html; charset=utf-8", body)
@@ -938,6 +1109,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 filters["start_day"],
                 filters["end_day"],
                 bool(filters["ignore_auto_review"]),
+                str(filters["chart_range"]),
+                filters["chart_start_day"],
+                filters["chart_end_day"],
             )
             status = 200
         except Exception as exc:  # noqa: BLE001
@@ -947,6 +1121,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 "range_start": filters["start_day"],
                 "range_end": filters["end_day"],
                 "ignore_auto_review": bool(filters["ignore_auto_review"]),
+                "chart_range": filters["chart_range"],
+                "chart_start": filters["chart_start_day"],
+                "chart_end": filters["chart_end_day"],
                 "generated_at": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             }
             status = 503
@@ -971,18 +1148,44 @@ def run_check(db_path: Path) -> None:
         raise RuntimeError("Cost calculation check failed")
 
     checks = [
-        ("all", None, None, False),
-        ("30d", None, None, False),
-        ("7d", None, None, False),
-        ("1d", None, None, False),
-        ("custom", "2026-01-01", "2026-01-03", False),
-        ("bad-range", None, None, False),
-        ("all", None, None, True),
+        ("all", None, None, False, "30d", None, None, "day"),
+        ("30d", None, None, False, "90d", None, None, "week"),
+        ("30d", None, None, False, "6m", None, None, "week"),
+        ("30d", None, None, False, "1y", None, None, "month"),
+        ("7d", None, None, False, "all", None, None, None),
+        ("1d", None, None, False, "custom", "2026-01-01", "2026-01-03", "day"),
+        ("1d", None, None, False, "custom", "2026-01-01", "2026-03-01", "day"),
+        ("1d", None, None, False, "custom", "2026-01-01", "2026-03-02", "week"),
+        ("1d", None, None, False, "custom", "2026-01-01", "2026-05-01", "week"),
+        ("1d", None, None, False, "custom", "2026-01-01", "2026-12-31", "month"),
+        ("custom", "2026-01-01", "2026-01-03", False, "30d", None, None, "day"),
+        ("bad-range", None, None, False, "bad-range", None, None, "day"),
+        ("all", None, None, True, "30d", None, None, "day"),
     ]
-    for range_name, start_day, end_day, ignore_auto_review in checks:
-        data = load_usage(db_path, range_name, start_day, end_day, ignore_auto_review)
+    for range_name, start_day, end_day, ignore_auto_review, chart_range, chart_start, chart_end, expected_granularity in checks:
+        data = load_usage(db_path, range_name, start_day, end_day, ignore_auto_review, chart_range, chart_start, chart_end)
         html_body = render_dashboard(data)
         json.dumps(data, ensure_ascii=False)
+        chart = data["chart"]
+        if chart["range"] not in {"all", "1y", "6m", "90d", "30d", "custom"}:
+            raise RuntimeError(f"Chart range failed for range={range_name}")
+        if chart["granularity"] not in {"day", "week", "month"}:
+            raise RuntimeError(f"Chart granularity failed for range={range_name}")
+        if expected_granularity and chart["granularity"] != expected_granularity:
+            raise RuntimeError(
+                f"Expected {expected_granularity} chart granularity for chart_range={chart_range}, got {chart['granularity']}"
+            )
+        for day_row in chart["days"]:
+            model_total = sum(item["total_tokens"] for item in day_row["models"])
+            if day_row["total_tokens"] != model_total:
+                raise RuntimeError(f"Chart day model sum failed for range={range_name}")
+        chart_model_totals = {}
+        for day_row in chart["days"]:
+            for item in day_row["models"]:
+                chart_model_totals[item["model"]] = chart_model_totals.get(item["model"], 0) + item["total_tokens"]
+        for model_row in chart["models"]:
+            if model_row["total_tokens"] != chart_model_totals.get(model_row["model"], 0):
+                raise RuntimeError(f"Chart model sum failed for range={range_name}")
         totals = data["totals"]
         if totals["total_tokens"] != totals["input_tokens"] + totals["output_tokens"]:
             raise RuntimeError(f"Total without cached invariant failed for range={range_name}")

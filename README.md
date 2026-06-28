@@ -1,6 +1,6 @@
 # Codex Usage Dashboard
 
-Local web dashboard for Codex usage statistics. It reads your local Codex state and rollout logs, then renders sessions, token usage, model breakdowns, and a daily heatmap.
+Local web dashboard for Codex usage statistics. It reads your local Codex state and rollout logs, then renders sessions, token usage, model breakdowns, a daily heatmap, and a stacked token chart by model.
 
 This project is not affiliated with OpenAI.
 
@@ -12,7 +12,9 @@ This project is not affiliated with OpenAI.
 - Summary cards for sessions, token usage with and without cached input, API-equivalent cost estimate, active days, streaks, peak day, and favorite model
 - Daily usage table with input, output, total without cached input, cached input, total with cached input, and estimated cost
 - Model breakdown table with expandable daily model details and estimated cost by model
-- Daily heatmap with month labels and hover tooltips
+- Visualization tabs for daily heatmap and stacked tokens-over-time bar chart
+- Tokens-over-time chart split by model, with independent all-time, 1-year, 6-month, 90-day, 30-day, and custom date filters
+- Adaptive chart buckets: daily through 60 days, weekly through 6 months, and monthly for longer ranges
 - Range filters: all time, 30 days, 7 days, 1 day, and custom dates
 - Optional filter to ignore the `codex-auto-review` model
 - macOS `.command` launcher
@@ -106,7 +108,7 @@ To install a specific release instead of the latest `main`, use a tag:
 
 ```bash
 git fetch --tags
-git checkout v1.0.2
+git checkout v1.0.3
 npm install
 ```
 

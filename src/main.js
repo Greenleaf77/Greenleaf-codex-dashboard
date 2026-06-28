@@ -12,6 +12,19 @@ const rangeOptions = [
   { value: "1d", label: "1d" },
   { value: "custom", label: "Custom" }
 ];
+const visualizationOptions = [
+  { value: "heatmap", label: "Daily heatmap" },
+  { value: "tokens", label: "Tokens over time" }
+];
+const chartRangeOptions = [
+  { value: "all", label: "All" },
+  { value: "1y", label: "1y" },
+  { value: "6m", label: "6m" },
+  { value: "90d", label: "90d" },
+  { value: "30d", label: "30d" },
+  { value: "custom", label: "Custom" }
+];
+const chartColors = ["#4f8fc1", "#45d1c4", "#9bd72b", "#ff674f", "#168df2", "#b98cff", "#f2bf4a", "#ea6aa6"];
 const autoReviewModel = "codex-auto-review";
 const ignoreAutoReviewCookie = "ignore_codex_auto_review";
 
@@ -19,6 +32,10 @@ const initialState = readUrlState();
 let activeRange = initialState.range;
 let customStartDate = initialState.start;
 let customEndDate = initialState.end;
+let activeVisualization = initialState.visualization;
+let chartRange = initialState.chartRange;
+let chartStartDate = initialState.chartStart;
+let chartEndDate = initialState.chartEnd;
 let ignoreAutoReview = readIgnoreAutoReviewCookie();
 const expandedModels = new Set();
 
@@ -70,13 +87,27 @@ function normalizeCustomRange() {
   }
 }
 
+function normalizeChartCustomRange() {
+  if (!isIsoDate(chartStartDate)) chartStartDate = todayKey();
+  if (!isIsoDate(chartEndDate)) chartEndDate = chartStartDate;
+  if (chartStartDate > chartEndDate) {
+    [chartStartDate, chartEndDate] = [chartEndDate, chartStartDate];
+  }
+}
+
 function readUrlState() {
   const params = new URLSearchParams(window.location.search);
   const range = params.get("range") || "all";
+  const visualization = params.get("visualization") || "heatmap";
+  const selectedChartRange = params.get("chart_range") || "30d";
   return {
     range: rangeOptions.some((option) => option.value === range) ? range : "all",
     start: params.get("start") || "",
-    end: params.get("end") || ""
+    end: params.get("end") || "",
+    visualization: visualizationOptions.some((option) => option.value === visualization) ? visualization : "heatmap",
+    chartRange: chartRangeOptions.some((option) => option.value === selectedChartRange) ? selectedChartRange : "30d",
+    chartStart: params.get("chart_start") || "",
+    chartEnd: params.get("chart_end") || ""
   };
 }
 
@@ -115,10 +146,17 @@ function buildQuery(rangeName) {
   const params = new URLSearchParams();
   params.set("range", rangeName);
   params.set("ignore_auto_review", ignoreAutoReview ? "1" : "0");
+  params.set("visualization", activeVisualization);
+  params.set("chart_range", chartRange);
   if (rangeName === "custom") {
     normalizeCustomRange();
     params.set("start", customStartDate);
     params.set("end", customEndDate);
+  }
+  if (chartRange === "custom") {
+    normalizeChartCustomRange();
+    params.set("chart_start", chartStartDate);
+    params.set("chart_end", chartEndDate);
   }
   return params.toString();
 }
@@ -137,6 +175,29 @@ function describeRange(data) {
   if (data.range === "7d") return "Last 7 days";
   if (data.range === "30d") return "Last 30 days";
   return "All time";
+}
+
+function describeChartRange(chart) {
+  if (chart.range === "custom" && chart.range_start && chart.range_end) {
+    return `${chart.range_start} - ${chart.range_end}`;
+  }
+  if (chart.range === "1y") return "Last 1 year";
+  if (chart.range === "6m") return "Last 6 months";
+  if (chart.range === "90d") return "Last 90 days";
+  if (chart.range === "30d") return "Last 30 days";
+  return "All time";
+}
+
+function dayLabel(day, fallbackDay, rangeName) {
+  if (day) return day;
+  const date = parseDay(fallbackDay);
+  if (!date) return fallbackDay;
+  return new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric" }).format(date);
+}
+
+function modelColor(model, models) {
+  const index = Math.max(0, models.findIndex((row) => row.model === model));
+  return chartColors[index % chartColors.length];
 }
 
 function heatmapCells(daily, rangeName, rangeStart, rangeEnd) {
@@ -169,6 +230,144 @@ function heatmapCells(daily, rangeName, rangeStart, rangeEnd) {
     cells.push({ day: key, sessions: row.sessions || 0, tokens, level });
   }
   return cells;
+}
+
+function renderVisualizationPanel(data, heat, months, heatColumns) {
+  return `
+    <section>
+      <div class="viz-header">
+        <div>
+          <h2>${activeVisualization === "tokens" ? "Tokens over time" : "Daily Heatmap"}</h2>
+          <div class="viz-note">${activeVisualization === "tokens" ? `Showing ${escapeHtml(describeChartRange(data.chart))}` : "Usage intensity by day"}</div>
+        </div>
+        <div class="viz-controls">
+          <nav class="segments viz-tabs" aria-label="Visualization">
+            ${visualizationOptions.map((option) => `<button class="seg ${activeVisualization === option.value ? "active" : ""}" data-visualization="${option.value}">${option.label}</button>`).join("")}
+          </nav>
+          ${activeVisualization === "tokens" ? renderChartRangeControls(data.chart) : ""}
+        </div>
+      </div>
+      ${activeVisualization === "tokens" ? renderTokensOverTime(data.chart) : renderHeatmap(heat, months, heatColumns)}
+    </section>
+  `;
+}
+
+function renderHeatmap(heat, months, heatColumns) {
+  return `
+    <div class="heat-wrap">
+      <div class="heatmap-shell">
+        <div class="heatmap" style="grid-template-columns: repeat(${heatColumns}, 16px)">
+          ${heat.map((cell) => `<div class="heat-cell level-${cell.level}" aria-label="${cell.day}: ${full(cell.tokens)} total tokens" data-tooltip-date="${cell.day}" data-tooltip-tokens="${full(cell.tokens)} total tokens"></div>`).join("")}
+        </div>
+        <div class="month-labels" style="grid-template-columns: repeat(${heatColumns}, 16px)">
+          ${months.map((month) => `<span style="grid-column: ${month.column}">${escapeHtml(month.label)}</span>`).join("")}
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function renderChartRangeControls(chart) {
+  return `
+    <div class="chart-filter">
+      <nav class="segments" aria-label="Chart range">
+        ${chartRangeOptions.map((option) => `<button class="seg ${chart.range === option.value ? "active" : ""}" data-chart-range="${option.value}">${option.label}</button>`).join("")}
+      </nav>
+      ${chart.range === "custom" ? `
+        <form class="custom-range chart-custom-range" id="chart-range-form">
+          <label>
+            <span>From</span>
+            <input id="chart-start" type="date" value="${escapeHtml(chart.range_start || chartStartDate)}">
+          </label>
+          <label>
+            <span>To</span>
+            <input id="chart-end" type="date" value="${escapeHtml(chart.range_end || chartEndDate)}">
+          </label>
+          <button class="custom-apply" type="submit">Apply</button>
+        </form>
+      ` : ""}
+    </div>
+  `;
+}
+
+function renderTokensOverTime(chart) {
+  const days = chart.days || [];
+  const models = chart.models || [];
+  const maxTokens = Math.max(1, ...days.map((day) => day.total_tokens || 0));
+  const ticks = [1, 0.75, 0.5, 0.25, 0].map((ratio) => Math.round(maxTokens * ratio));
+  const labelEvery = Math.max(1, Math.ceil(days.length / 10));
+  const { barWidth, barGap, barFill, barMax } = chartBarSizing(chart.granularity, days.length);
+
+  if (!days.length) {
+    return '<div class="chart-empty">No usage in this chart range.</div>';
+  }
+
+  return `
+    <div class="chart-shell">
+      <div class="chart-y-axis">
+        ${ticks.map((tick) => `<span>${compact(tick)}</span>`).join("")}
+      </div>
+      <div class="chart-scroll">
+        <div class="bar-chart" style="--bar-count: ${days.length}; --bar-width: ${barWidth}px; --bar-gap: ${barGap}px; --bar-fill: ${barFill}%; --bar-max: ${barMax}px">
+          <div class="chart-grid">
+            ${ticks.map(() => '<span></span>').join("")}
+          </div>
+          <div class="chart-v-grid">
+            ${days.map(() => "<span></span>").join("")}
+          </div>
+          <div class="chart-bars">
+            ${days.map((day, index) => renderChartBar(day, models, maxTokens, index, labelEvery, days.length)).join("")}
+          </div>
+        </div>
+      </div>
+    </div>
+    ${renderChartLegend(models)}
+  `;
+}
+
+function chartBarSizing(granularity, count) {
+  if (granularity === "month") {
+    return { barWidth: count <= 14 ? 96 : 64, barGap: 10, barFill: 72, barMax: 88 };
+  }
+  if (granularity === "week") {
+    return { barWidth: count <= 16 ? 82 : 52, barGap: 8, barFill: 76, barMax: 72 };
+  }
+  if (count <= 32) {
+    return { barWidth: 44, barGap: 6, barFill: 82, barMax: 38 };
+  }
+  return { barWidth: 28, barGap: 4, barFill: 76, barMax: 24 };
+}
+
+function renderChartBar(day, models, maxTokens, index, labelEvery, dayCount) {
+  const tokens = Number(day.total_tokens || 0);
+  const height = tokens ? Math.max(2, (tokens / maxTokens) * 100) : 0;
+  const label = index % labelEvery === 0 || index === dayCount - 1 ? dayLabel(day.label, day.day, chartRange) : "";
+  const title = day.bucket_start && day.bucket_end && day.bucket_start !== day.bucket_end ? `${day.bucket_start} - ${day.bucket_end}` : day.day;
+  return `
+    <div class="bar-slot">
+      <div class="stacked-bar ${tokens ? "" : "empty"}" style="height: ${height}%" data-tooltip-title="${escapeHtml(title)}" data-tooltip-body="${full(day.total_tokens)} total tokens">
+        ${(day.models || []).map((item) => {
+          const segmentHeight = day.total_tokens ? (item.total_tokens / day.total_tokens) * 100 : 0;
+          return `<div class="bar-segment" style="height: ${segmentHeight}%; background: ${modelColor(item.model, models)}" data-tooltip-title="${escapeHtml(item.model)}" data-tooltip-body="${escapeHtml(title)}<br>${full(item.total_tokens)} tokens"></div>`;
+        }).join("")}
+      </div>
+      <div class="bar-label">${escapeHtml(label)}</div>
+    </div>
+  `;
+}
+
+function renderChartLegend(models) {
+  if (!models.length) return "";
+  return `
+    <div class="chart-legend">
+      ${models.map((row) => `
+        <span class="legend-item">
+          <span class="legend-swatch" style="background: ${modelColor(row.model, models)}"></span>
+          <span>${escapeHtml(row.model)}</span>
+        </span>
+      `).join("")}
+    </div>
+  `;
 }
 
 function monthLabels(cells) {
@@ -267,19 +466,7 @@ function render(data) {
       ${card("Data source", "SQLite + JSONL")}
     </div>
 
-    <section>
-      <h2>Daily Heatmap</h2>
-      <div class="heat-wrap">
-        <div class="heatmap-shell">
-          <div class="heatmap" style="grid-template-columns: repeat(${heatColumns}, 16px)">
-            ${heat.map((cell) => `<div class="heat-cell level-${cell.level}" aria-label="${cell.day}: ${full(cell.tokens)} total tokens" data-tooltip-date="${cell.day}" data-tooltip-tokens="${full(cell.tokens)} total tokens"></div>`).join("")}
-          </div>
-          <div class="month-labels" style="grid-template-columns: repeat(${heatColumns}, 16px)">
-            ${months.map((month) => `<span style="grid-column: ${month.column}">${escapeHtml(month.label)}</span>`).join("")}
-          </div>
-        </div>
-      </div>
-    </section>
+    ${renderVisualizationPanel(data, heat, months, heatColumns)}
 
     <div class="tables">
       <section>
@@ -342,6 +529,40 @@ function render(data) {
     });
   });
 
+  document.querySelectorAll("[data-visualization]").forEach((button) => {
+    button.addEventListener("click", () => {
+      activeVisualization = button.dataset.visualization;
+      syncUrl();
+      render(data);
+    });
+  });
+
+  document.querySelectorAll("[data-chart-range]").forEach((button) => {
+    button.addEventListener("click", () => {
+      chartRange = button.dataset.chartRange;
+      if (chartRange === "custom") {
+        normalizeChartCustomRange();
+      }
+      activeVisualization = "tokens";
+      syncUrl();
+      refresh();
+    });
+  });
+
+  const chartRangeForm = document.querySelector("#chart-range-form");
+  if (chartRangeForm) {
+    chartRangeForm.addEventListener("submit", (event) => {
+      event.preventDefault();
+      chartStartDate = document.querySelector("#chart-start")?.value || chartStartDate;
+      chartEndDate = document.querySelector("#chart-end")?.value || chartEndDate;
+      normalizeChartCustomRange();
+      chartRange = "custom";
+      activeVisualization = "tokens";
+      syncUrl();
+      refresh();
+    });
+  }
+
   const customRangeForm = document.querySelector("#custom-range-form");
   if (customRangeForm) {
     customRangeForm.addEventListener("submit", (event) => {
@@ -379,6 +600,12 @@ function render(data) {
     cell.addEventListener("mousemove", positionHeatTooltip);
     cell.addEventListener("mouseleave", hideHeatTooltip);
   });
+
+  document.querySelectorAll(".stacked-bar, .bar-segment").forEach((item) => {
+    item.addEventListener("mouseenter", showChartTooltip);
+    item.addEventListener("mousemove", positionHeatTooltip);
+    item.addEventListener("mouseleave", hideHeatTooltip);
+  });
 }
 
 function card(label, value) {
@@ -388,6 +615,13 @@ function card(label, value) {
 function showHeatTooltip(event) {
   const target = event.currentTarget;
   tooltip.innerHTML = `${escapeHtml(target.dataset.tooltipDate)}<br><strong>${escapeHtml(target.dataset.tooltipTokens)}</strong>`;
+  tooltip.classList.add("visible");
+  positionHeatTooltip(event);
+}
+
+function showChartTooltip(event) {
+  const target = event.currentTarget;
+  tooltip.innerHTML = `${escapeHtml(target.dataset.tooltipTitle)}<br><strong>${target.dataset.tooltipBody}</strong>`;
   tooltip.classList.add("visible");
   positionHeatTooltip(event);
 }
@@ -422,6 +656,11 @@ async function refresh() {
       customStartDate = data.range_start || customStartDate;
       customEndDate = data.range_end || customEndDate;
     }
+    chartRange = data.chart?.range || chartRange;
+    if (data.chart?.range === "custom") {
+      chartStartDate = data.chart.range_start || chartStartDate;
+      chartEndDate = data.chart.range_end || chartEndDate;
+    }
     render(data);
   } catch (error) {
     app.innerHTML = `<section class="state error"><h1>Codex Usage</h1><p>Could not load usage data.</p><code>${escapeHtml(error.message)}</code></section>`;
@@ -430,6 +669,11 @@ async function refresh() {
 
 if (activeRange === "custom") {
   normalizeCustomRange();
+  syncUrl();
+}
+
+if (chartRange === "custom") {
+  normalizeChartCustomRange();
   syncUrl();
 }
 
