@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.0.4 - 2026-07-13
+
+- Redesigned the dashboard with a compact graphite visual system.
+- Added distinct multicolor inline SVG icons for every summary metric.
+- Improved responsive controls, keyboard focus, and reduced-motion support without changing dashboard behavior.
+
 ## 1.0.3 - 2026-06-28
 
 - Added visualization tabs for `Daily heatmap` and `Tokens over time`.

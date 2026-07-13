@@ -25,6 +25,24 @@ const chartRangeOptions = [
   { value: "custom", label: "Custom" }
 ];
 const chartColors = ["#4f8fc1", "#45d1c4", "#9bd72b", "#ff674f", "#168df2", "#b98cff", "#f2bf4a", "#ea6aa6"];
+const iconPaths = {
+  brand: '<path d="m12 3.5 7 4v9l-7 4-7-4v-9l7-4Z"/><polyline points="8.2 12 10.7 14.5 15.8 9.4"/>',
+  sessions: '<circle cx="12" cy="8" r="3.2"/><path d="M5 20c.6-3.2 3.2-5 7-5s6.4 1.8 7 5"/>',
+  input: '<path d="M12 3v11"/><polyline points="8 10 12 14 16 10"/><path d="M5 17v3h14v-3"/>',
+  output: '<path d="M12 21V10"/><polyline points="8 14 12 10 16 14"/><path d="M5 7V4h14v3"/>',
+  calculator: '<rect x="5" y="3" width="14" height="18" rx="2"/><line x1="8" y1="7" x2="16" y2="7"/><circle cx="9" cy="11" r=".7"/><circle cx="15" cy="11" r=".7"/><circle cx="9" cy="16" r=".7"/><circle cx="15" cy="16" r=".7"/>',
+  cache: '<path d="M5 6c0-1.7 3.1-3 7-3s7 1.3 7 3-3 3-7 3-7-1.3-7-3Z"/><path d="M5 6v6c0 1.7 3.1 3 7 3s7-1.3 7-3V6"/><path d="M5 12v6c0 1.7 3.1 3 7 3s7-1.3 7-3v-6"/>',
+  layers: '<path d="m12 3 8 4-8 4-8-4 8-4Z"/><path d="m4 12 8 4 8-4"/><path d="m4 17 8 4 8-4"/>',
+  calendar: '<rect x="4" y="5" width="16" height="15" rx="2"/><line x1="8" y1="3" x2="8" y2="7"/><line x1="16" y1="3" x2="16" y2="7"/><line x1="4" y1="10" x2="20" y2="10"/><line x1="8" y1="14" x2="8" y2="14"/><line x1="12" y1="14" x2="12" y2="14"/><line x1="16" y1="14" x2="16" y2="14"/>',
+  coin: '<circle cx="12" cy="12" r="8"/><path d="M12 7v10"/><path d="M15 9.5c-.7-.7-1.6-1-2.8-1-1.6 0-2.7.8-2.7 2s1.1 1.8 2.7 2.2c1.7.4 2.7 1.1 2.7 2.3s-1.1 2-2.8 2c-1.2 0-2.3-.4-3-1.1"/>',
+  star: '<path d="m12 3 2.8 5.7 6.2.9-4.5 4.4 1.1 6.2-5.6-2.9-5.6 2.9 1.1-6.2L3 9.6l6.2-.9L12 3Z"/>',
+  flame: '<path d="M12.5 3.5c.8 3.3-1.7 4.8-3.1 6.8-1.1 1.5-1.4 3.1-.6 4.6.2-1.8 1.2-3 2.5-3.9-.2 2.9 2.8 3.3 2.1 6.1 1.7-.9 3-2.6 3-4.6 0-2.5-1.7-4.8-3.9-9Z"/><path d="M8.8 20.2c-2.4-.8-4-2.7-4-5 0-2.1 1.1-3.8 2.5-5.2"/>',
+  trophy: '<path d="M8 4h8v4.5a4 4 0 0 1-8 0V4Z"/><path d="M8 6H4v1a4 4 0 0 0 4 4"/><path d="M16 6h4v1a4 4 0 0 1-4 4"/><path d="M12 12.5V17"/><path d="M8 21h8"/><path d="M9 17h6v4H9z"/>',
+  chart: '<line x1="4" y1="20" x2="20" y2="20"/><line x1="6" y1="20" x2="6" y2="12"/><line x1="11" y1="20" x2="11" y2="7"/><line x1="16" y1="20" x2="16" y2="4"/><polyline points="4 8 9 5 13 7 20 3"/>',
+  database: '<rect x="4" y="4" width="16" height="16" rx="2"/><line x1="4" y1="9" x2="20" y2="9"/><line x1="4" y1="15" x2="20" y2="15"/><circle cx="8" cy="6.5" r=".8"/><circle cx="8" cy="12" r=".8"/><circle cx="8" cy="18" r=".8"/><line x1="11" y1="6.5" x2="17" y2="6.5"/><line x1="11" y1="12" x2="17" y2="12"/><line x1="11" y1="18" x2="17" y2="18"/>',
+  usage: '<polyline points="3 13 7 13 9.5 6 14 18 16.5 11 21 11"/>',
+  models: '<rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/><line x1="10" y1="7" x2="14" y2="7"/><line x1="7" y1="10" x2="7" y2="14"/><line x1="17" y1="10" x2="17" y2="14"/>'
+};
 const autoReviewModel = "codex-auto-review";
 const ignoreAutoReviewCookie = "ignore_codex_auto_review";
 
@@ -237,8 +255,13 @@ function renderVisualizationPanel(data, heat, months, heatColumns) {
     <section>
       <div class="viz-header">
         <div>
-          <h2>${activeVisualization === "tokens" ? "Tokens over time" : "Daily Heatmap"}</h2>
-          <div class="viz-note">${activeVisualization === "tokens" ? `Showing ${escapeHtml(describeChartRange(data.chart))}` : "Usage intensity by day"}</div>
+          <div class="section-title">
+            <span class="section-icon tone-cyan">${icon("usage")}</span>
+            <div>
+              <h2>${activeVisualization === "tokens" ? "Tokens over time" : "Daily Heatmap"}</h2>
+              <div class="viz-note">${activeVisualization === "tokens" ? `Showing ${escapeHtml(describeChartRange(data.chart))}` : "Usage intensity by day"}</div>
+            </div>
+          </div>
         </div>
         <div class="viz-controls">
           <nav class="segments viz-tabs" aria-label="Visualization">
@@ -421,10 +444,13 @@ function render(data) {
 
   app.innerHTML = `
     <header>
-      <div>
-        <h1>Codex Usage</h1>
-        <div class="subtle">Generated ${escapeHtml(data.generated_at)} from local Codex logs</div>
-        <div class="segment-note">Showing ${escapeHtml(describeRange(data))}</div>
+      <div class="brand-block">
+        <span class="brand-mark">${icon("brand")}</span>
+        <div>
+          <h1>Codex Usage</h1>
+          <div class="subtle">Generated ${escapeHtml(data.generated_at)} from local Codex logs</div>
+          <div class="segment-note">Showing ${escapeHtml(describeRange(data))}</div>
+        </div>
       </div>
       <div class="header-tools">
         <label class="toggle-option">
@@ -451,26 +477,26 @@ function render(data) {
     </header>
 
     <div class="cards">
-      ${card("Sessions", full(totals.sessions))}
-      ${card("Input tokens", compact(totals.input_tokens))}
-      ${card("Output tokens", compact(totals.output_tokens))}
-      ${card("Total w/o cached", compact(totals.total_tokens))}
-      ${card("Cached input", compact(totals.cached_input_tokens))}
-      ${card("Total tokens", compact(totals.total_with_cached_tokens))}
-      ${card("Active days", full(totals.active_days))}
-      ${card("API estimate", `${money(totals.cost_usd)}<span class="metric-note">${escapeHtml(data.pricing?.source || "pricing unavailable")}</span>`)}
-      ${card("Favorite model", escapeHtml(data.favorite_model))}
-      ${card("Current streak", `${full(data.current_streak)}d`)}
-      ${card("Longest streak", `${full(data.longest_streak)}d`)}
-      ${card("Peak day", `${escapeHtml(data.peak_day)}${data.peak_day_tokens ? `<span class="metric-note">${compact(data.peak_day_tokens)}</span>` : ""}`)}
-      ${card("Data source", "SQLite + JSONL")}
+      ${card("Sessions", full(totals.sessions), "sessions", "violet")}
+      ${card("Input tokens", compact(totals.input_tokens), "input", "blue")}
+      ${card("Output tokens", compact(totals.output_tokens), "output", "cyan")}
+      ${card("Total w/o cached", compact(totals.total_tokens), "calculator", "slate")}
+      ${card("Cached input", compact(totals.cached_input_tokens), "cache", "violet")}
+      ${card("Total tokens", compact(totals.total_with_cached_tokens), "layers", "cyan")}
+      ${card("Active days", full(totals.active_days), "calendar", "slate")}
+      ${card("API estimate", `${money(totals.cost_usd)}<span class="metric-note">${escapeHtml(data.pricing?.source || "pricing unavailable")}</span>`, "coin", "lime")}
+      ${card("Favorite model", escapeHtml(data.favorite_model), "star", "amber")}
+      ${card("Current streak", `${full(data.current_streak)}d`, "flame", "coral")}
+      ${card("Longest streak", `${full(data.longest_streak)}d`, "trophy", "amber")}
+      ${card("Peak day", `${escapeHtml(data.peak_day)}${data.peak_day_tokens ? `<span class="metric-note">${compact(data.peak_day_tokens)}</span>` : ""}`, "chart", "blue")}
+      ${card("Data source", "SQLite + JSONL", "database", "violet")}
     </div>
 
     ${renderVisualizationPanel(data, heat, months, heatColumns)}
 
     <div class="tables">
       <section>
-        <h2>Daily Usage</h2>
+        <h2 class="section-title"><span class="section-icon tone-lime">${icon("usage")}</span><span>Daily Usage</span></h2>
         <div class="table-scroll">
           <table>
             <thead><tr><th>Date</th><th class="num">Input</th><th class="num">Output</th><th class="num">Total w/o cached</th><th class="num">Cached</th><th class="num">Total</th><th class="num">Cost</th><th class="num">Sessions</th></tr></thead>
@@ -483,7 +509,7 @@ function render(data) {
       </section>
 
       <section>
-        <h2>Models</h2>
+        <h2 class="section-title"><span class="section-icon tone-violet">${icon("models")}</span><span>Models</span></h2>
         <div class="table-scroll">
           <table>
             <thead><tr><th>Model</th><th class="num">Days</th><th class="num">Sessions</th><th class="num">Input</th><th class="num">Output</th><th class="num">Total w/o cached</th><th class="num">Cached</th><th class="num">Total</th><th class="num">Cost</th><th class="num">Share</th></tr></thead>
@@ -608,8 +634,13 @@ function render(data) {
   });
 }
 
-function card(label, value) {
-  return `<div class="card"><div class="label">${label}</div><div class="value">${value}</div></div>`;
+function icon(name, className = "") {
+  const paths = iconPaths[name] || iconPaths.layers;
+  return `<svg class="icon ${className}" aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">${paths}</svg>`;
+}
+
+function card(label, value, iconName, tone) {
+  return `<div class="card metric-${tone}"><span class="metric-icon">${icon(iconName)}</span><div class="metric-copy"><div class="label">${label}</div><div class="value">${value}</div></div></div>`;
 }
 
 function showHeatTooltip(event) {

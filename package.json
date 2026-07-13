@@ -2,7 +2,7 @@
   "name": "codex-usage-dashboard",
   "description": "Local dashboard for Codex usage statistics from ~/.codex logs.",
   "private": false,
-  "version": "1.0.3",
+  "version": "1.0.4",
   "license": "MIT",
   "type": "module",
   "scripts": {
