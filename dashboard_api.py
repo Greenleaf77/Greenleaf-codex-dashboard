@@ -292,12 +292,228 @@ def current_streak(days: set[str]) -> int:
     return current
 
 
-def token_events(db_path: Path, filters: dict[str, str | int | bool | None]) -> list[dict]:
-    start_day = filters["start_day"]
-    end_day = filters["end_day"]
-    start_ts = filters["start_ts"]
-    ignore_auto_review = bool(filters.get("ignore_auto_review"))
-    events: list[dict] = []
+USAGE_COMPONENTS = ("input_tokens", "cached_input_tokens", "output_tokens", "reasoning_output_tokens")
+
+
+def parse_usage_components(value: object, *, cumulative: bool = False) -> dict[str, int] | None:
+    if not isinstance(value, dict):
+        return None
+    if cumulative and any(key not in value for key in USAGE_COMPONENTS[:3]):
+        return None
+    try:
+        usage = {key: int(value.get(key) or 0) for key in USAGE_COMPONENTS}
+    except (TypeError, ValueError):
+        return None
+    if any(component < 0 for component in usage.values()):
+        return None
+    return usage
+
+
+def usage_has_tokens(usage: dict[str, int] | None) -> bool:
+    return bool(usage and any(usage[key] > 0 for key in USAGE_COMPONENTS))
+
+
+def local_hour_from_iso_timestamp(value: str) -> str:
+    parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone()
+    return parsed.strftime("%Y-%m-%d %H:00")
+
+
+def usage_event(
+    thread_id: str,
+    model: str,
+    timestamp: str,
+    usage: dict[str, int],
+    source: str,
+    classification: str,
+    response_id: str | None = None,
+) -> dict:
+    raw_input_tokens = usage["input_tokens"]
+    cached_input_tokens = usage["cached_input_tokens"]
+    output_tokens = usage["output_tokens"]
+    billable_input_tokens = max(raw_input_tokens - cached_input_tokens, 0)
+    return {
+        "thread_id": thread_id,
+        "timestamp": timestamp,
+        "hour": local_hour_from_iso_timestamp(timestamp),
+        "day": day_from_iso_timestamp(timestamp),
+        "model": model,
+        "source": source,
+        "classification": classification,
+        "response_id": response_id,
+        "input_tokens": billable_input_tokens,
+        "cached_input_tokens": cached_input_tokens,
+        "raw_input_tokens": raw_input_tokens,
+        "output_tokens": output_tokens,
+        "reasoning_output_tokens": usage["reasoning_output_tokens"],
+        "total_tokens": billable_input_tokens + output_tokens,
+        "total_with_cached_tokens": raw_input_tokens + output_tokens,
+    }
+
+
+def is_model_output_item(item_type: str | None, payload: dict) -> bool:
+    if item_type == "event_msg" and payload.get("type") in {"agent_message", "agent_reasoning"}:
+        return True
+    if item_type != "response_item":
+        return False
+    payload_type = payload.get("type")
+    if payload_type == "reasoning":
+        return True
+    if payload_type == "message":
+        return payload.get("role") == "assistant"
+    return isinstance(payload_type, str) and payload_type.endswith("_call") and not payload_type.endswith("_call_output")
+
+
+def scan_rollout_telemetry(rollout_path: Path, thread_id: str, model: str) -> dict[str, list[dict]]:
+    token_records: list[dict] = []
+    exact_records: list[dict] = []
+    model_output_since_token = False
+
+    with rollout_path.open(encoding="utf-8", errors="ignore") as handle:
+        for line_number, line in enumerate(handle, 1):
+            if not any(
+                marker in line
+                for marker in ('"token_count"', '"raw_response_completed"', '"response_item"', '"agent_message"', '"agent_reasoning"')
+            ):
+                continue
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            payload = item.get("payload") or {}
+            if not isinstance(payload, dict):
+                continue
+            item_type = item.get("type")
+            payload_type = payload.get("type")
+            if is_model_output_item(item_type, payload):
+                model_output_since_token = True
+                continue
+            if payload_type == "raw_response_completed":
+                timestamp = item.get("timestamp")
+                parsed_usage = parse_usage_components(payload.get("token_usage"))
+                if timestamp and parsed_usage and usage_has_tokens(parsed_usage):
+                    exact_records.append(
+                        {
+                            "line_number": line_number,
+                            "timestamp": timestamp,
+                            "response_id": str(payload.get("response_id") or ""),
+                            "usage": parsed_usage,
+                        }
+                    )
+                model_output_since_token = True
+                continue
+            if payload_type != "token_count":
+                continue
+            timestamp = item.get("timestamp")
+            if not timestamp:
+                model_output_since_token = False
+                continue
+            info = payload.get("info") or {}
+            token_records.append(
+                {
+                    "line_number": line_number,
+                    "timestamp": timestamp,
+                    "last": parse_usage_components(info.get("last_token_usage")),
+                    "cumulative": parse_usage_components(info.get("total_token_usage"), cumulative=True),
+                    "model_output": model_output_since_token,
+                }
+            )
+            model_output_since_token = False
+
+    unique_exact_records: list[dict] = []
+    seen_response_ids: set[str] = set()
+    for record in exact_records:
+        response_id = record["response_id"]
+        if response_id and response_id in seen_response_ids:
+            continue
+        if response_id:
+            seen_response_ids.add(response_id)
+        unique_exact_records.append(record)
+
+    covered_token_lines: set[int] = set()
+    token_index = 0
+    for record in unique_exact_records:
+        while token_index < len(token_records) and token_records[token_index]["line_number"] < record["line_number"]:
+            token_index += 1
+        if token_index < len(token_records):
+            covered_token_lines.add(token_records[token_index]["line_number"])
+            token_index += 1
+
+    previous_cumulative: dict[str, int] | None = None
+    token_events: list[dict] = []
+    fallback_usage_events: list[dict] = []
+
+    for record in token_records:
+        current = record["cumulative"]
+        last = record["last"]
+        contribution: dict[str, int] | None = None
+        if current is None:
+            classification = "unverifiable_event"
+            if record["model_output"] and usage_has_tokens(last):
+                contribution = last
+        elif previous_cumulative is None:
+            if record["model_output"] and usage_has_tokens(last):
+                classification = "usage_update"
+                contribution = last
+            else:
+                classification = "baseline_event"
+            previous_cumulative = current
+        elif all(current[key] == previous_cumulative[key] for key in USAGE_COMPONENTS):
+            classification = "replayed_event"
+        elif all(current[key] >= previous_cumulative[key] for key in USAGE_COMPONENTS):
+            classification = "usage_update"
+            contribution = {key: current[key] - previous_cumulative[key] for key in USAGE_COMPONENTS}
+            previous_cumulative = current
+        else:
+            classification = "counter_reset"
+            if record["model_output"] and usage_has_tokens(last):
+                contribution = last
+            previous_cumulative = current
+
+        raw_usage = last or {key: 0 for key in USAGE_COMPONENTS}
+        token_events.append(
+            usage_event(thread_id, model, record["timestamp"], raw_usage, "reported", classification)
+        )
+        if (
+            contribution
+            and usage_has_tokens(contribution)
+            and record["line_number"] not in covered_token_lines
+        ):
+            fallback_usage_events.append(
+                usage_event(thread_id, model, record["timestamp"], contribution, "fallback", classification)
+            )
+
+    exact_usage_events: list[dict] = []
+    for record in unique_exact_records:
+        response_id = record["response_id"]
+        exact_usage_events.append(
+            usage_event(
+                thread_id,
+                model,
+                record["timestamp"],
+                record["usage"],
+                "exact",
+                "usage_update",
+                response_id or None,
+            )
+        )
+
+    return {
+        "usage_events": sorted(fallback_usage_events + exact_usage_events, key=lambda event: event["timestamp"]),
+        "token_events": token_events,
+    }
+
+
+def filter_telemetry_events(events: list[dict], filters: dict[str, str | int | bool | None]) -> list[dict]:
+    start_day = filters.get("start_day")
+    end_day = filters.get("end_day")
+    return [
+        event
+        for event in events
+        if (not start_day or event["day"] >= start_day) and (not end_day or event["day"] <= end_day)
+    ]
+
+
+def scan_token_telemetry(db_path: Path, start_ts: int | None, ignore_auto_review: bool) -> dict[str, list[dict]]:
     with connect(db_path) as conn:
         where_sql = "where rollout_path != ''"
         params: list[int] = []
@@ -313,56 +529,30 @@ def token_events(db_path: Path, filters: dict[str, str | int | bool | None]) -> 
             params,
         ).fetchall()
 
+    usage_events: list[dict] = []
+    token_records: list[dict] = []
+    seen_response_ids: set[str] = set()
     for thread in threads:
         if ignore_auto_review and thread["model"] == AUTO_REVIEW_MODEL:
             continue
         rollout_path = Path(thread["rollout_path"])
         if not rollout_path.exists():
             continue
-        with rollout_path.open(encoding="utf-8", errors="ignore") as handle:
-            for line in handle:
-                if '"token_count"' not in line:
-                    continue
-                try:
-                    item = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                payload = item.get("payload") or {}
-                if payload.get("type") != "token_count":
-                    continue
-                timestamp = item.get("timestamp")
-                if not timestamp:
-                    continue
-                day = day_from_iso_timestamp(timestamp)
-                if start_day and day < start_day:
-                    continue
-                if end_day and day > end_day:
-                    continue
+        result = scan_rollout_telemetry(rollout_path, thread["id"], thread["model"])
+        token_records.extend(result["token_events"])
+        for event in result["usage_events"]:
+            response_id = event.get("response_id")
+            if response_id and response_id in seen_response_ids:
+                continue
+            if response_id:
+                seen_response_ids.add(response_id)
+            usage_events.append(event)
+    return {"usage_events": usage_events, "token_events": token_records}
 
-                usage = ((payload.get("info") or {}).get("last_token_usage") or {})
-                input_tokens = int(usage.get("input_tokens") or 0)
-                cached_input_tokens = int(usage.get("cached_input_tokens") or 0)
-                output_tokens = int(usage.get("output_tokens") or 0)
-                reasoning_output_tokens = int(usage.get("reasoning_output_tokens") or 0)
-                billable_input_tokens = max(input_tokens - cached_input_tokens, 0)
-                # Keep every token_count usage event. This matches ccusage-style
-                # accounting for Codex logs; deduping repeated cumulative totals
-                # undercounts days such as 2026-05-22 in the local data.
-                events.append(
-                    {
-                        "thread_id": thread["id"],
-                        "day": day,
-                        "model": thread["model"],
-                        "input_tokens": billable_input_tokens,
-                        "cached_input_tokens": cached_input_tokens,
-                        "raw_input_tokens": input_tokens,
-                        "output_tokens": output_tokens,
-                        "reasoning_output_tokens": reasoning_output_tokens,
-                        "total_tokens": billable_input_tokens + output_tokens,
-                        "total_with_cached_tokens": billable_input_tokens + cached_input_tokens + output_tokens,
-                    }
-                )
-    return events
+
+def token_events(db_path: Path, filters: dict[str, str | int | bool | None]) -> list[dict]:
+    telemetry = scan_token_telemetry(db_path, filters.get("start_ts"), bool(filters.get("ignore_auto_review")))
+    return filter_telemetry_events(telemetry["usage_events"], filters)
 
 
 def chart_granularity(start_day: dt.date, end_day: dt.date) -> str:
@@ -458,6 +648,74 @@ def chart_days_from_events(events: list[dict], filters: dict[str, str | int | bo
     }
 
 
+def diagnostics_from_events(usage_events: list[dict], token_records: list[dict]) -> dict:
+    rows: dict[tuple[str, str], dict] = {}
+
+    def row_for(event: dict) -> dict:
+        key = (event["hour"], event["model"])
+        return rows.setdefault(
+            key,
+            {
+                "hour": event["hour"],
+                "model": event["model"],
+                "raw_token_events": 0,
+                "deduplicated_usage_updates": 0,
+                "replayed_events": 0,
+                "baseline_events": 0,
+                "counter_resets": 0,
+                "unverifiable_events": 0,
+                "exact_usage_events": 0,
+                "fallback_usage_events": 0,
+                "reported_tokens": 0,
+                "deduplicated_tokens": 0,
+            },
+        )
+
+    classification_keys = {
+        "replayed_event": "replayed_events",
+        "baseline_event": "baseline_events",
+        "counter_reset": "counter_resets",
+        "unverifiable_event": "unverifiable_events",
+    }
+    for event in token_records:
+        row = row_for(event)
+        row["raw_token_events"] += 1
+        classification_key = classification_keys.get(event["classification"])
+        if classification_key:
+            row[classification_key] += 1
+        row["reported_tokens"] += event["total_with_cached_tokens"]
+
+    for event in usage_events:
+        row = row_for(event)
+        row["deduplicated_usage_updates"] += 1
+        row[f'{event["source"]}_usage_events'] += 1
+        row["deduplicated_tokens"] += event["total_with_cached_tokens"]
+
+    result_rows = sorted(rows.values(), key=lambda row: (row["hour"], row["model"]), reverse=True)
+    for row in result_rows:
+        row["replay_rate"] = row["replayed_events"] / max(row["raw_token_events"], 1)
+        row["estimated_local_overcount_tokens"] = max(row["reported_tokens"] - row["deduplicated_tokens"], 0)
+
+    summary_keys = (
+        "raw_token_events",
+        "deduplicated_usage_updates",
+        "replayed_events",
+        "baseline_events",
+        "counter_resets",
+        "unverifiable_events",
+        "exact_usage_events",
+        "fallback_usage_events",
+        "reported_tokens",
+        "deduplicated_tokens",
+    )
+    summary = {key: sum(row[key] for row in result_rows) for key in summary_keys}
+    summary["replay_rate"] = summary["replayed_events"] / max(summary["raw_token_events"], 1)
+    summary["estimated_local_overcount_tokens"] = max(
+        summary["reported_tokens"] - summary["deduplicated_tokens"], 0
+    )
+    return {"summary": summary, "rows": result_rows}
+
+
 def load_usage(
     db_path: Path,
     range_name: str,
@@ -467,11 +725,16 @@ def load_usage(
     chart_range: str | None = "30d",
     chart_start_day: str | None = None,
     chart_end_day: str | None = None,
+    include_diagnostics: bool = False,
 ) -> dict:
     filters = resolve_range(range_name, start_day, end_day, ignore_auto_review)
-    events = token_events(db_path, filters)
     chart_filters = resolve_chart_range(chart_range, chart_start_day, chart_end_day, ignore_auto_review)
-    chart_events = token_events(db_path, chart_filters)
+    start_timestamps = [filters["start_ts"], chart_filters["start_ts"]]
+    scan_start_ts = None if any(value is None for value in start_timestamps) else min(int(value) for value in start_timestamps)
+    telemetry = scan_token_telemetry(db_path, scan_start_ts, ignore_auto_review)
+    events = filter_telemetry_events(telemetry["usage_events"], filters)
+    chart_events = filter_telemetry_events(telemetry["usage_events"], chart_filters)
+    diagnostic_token_records = filter_telemetry_events(telemetry["token_events"], filters)
     pricing = load_pricing()
     missing_price_models = set()
 
@@ -573,7 +836,7 @@ def load_usage(
     total_with_cached = sum(row["total_with_cached_tokens"] for row in day_rows)
     total_cost = sum(row["cost_usd"] for row in day_rows)
 
-    return {
+    result = {
         "range": filters["range"],
         "range_start": filters["start_day"],
         "range_end": filters["end_day"],
@@ -606,6 +869,9 @@ def load_usage(
         "peak_day": peak["day"] if peak else "-",
         "peak_day_tokens": peak["total_tokens"] if peak else 0,
     }
+    if include_diagnostics:
+        result["diagnostics"] = diagnostics_from_events(events, diagnostic_token_records)
+    return result
 
 
 def heatmap_days(
@@ -1071,6 +1337,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         filters["chart_range"] = chart_filters["range"]
         filters["chart_start_day"] = chart_filters["start_day"]
         filters["chart_end_day"] = chart_filters["end_day"]
+        filters["include_diagnostics"] = parse_bool_flag(query.get("include_diagnostics", [None])[0], default=False)
         return filters
 
     def send_body(self, status: int, content_type: str, body: bytes) -> None:
@@ -1093,6 +1360,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 str(filters["chart_range"]),
                 filters["chart_start_day"],
                 filters["chart_end_day"],
+                bool(filters["include_diagnostics"]),
             )
             body = render_dashboard(data).encode("utf-8")
             self.send_body(200, "text/html; charset=utf-8", body)
@@ -1112,6 +1380,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 str(filters["chart_range"]),
                 filters["chart_start_day"],
                 filters["chart_end_day"],
+                bool(filters["include_diagnostics"]),
             )
             status = 200
         except Exception as exc:  # noqa: BLE001
