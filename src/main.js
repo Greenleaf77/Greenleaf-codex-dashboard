@@ -55,6 +55,15 @@ let chartRange = initialState.chartRange;
 let chartStartDate = initialState.chartStart;
 let chartEndDate = initialState.chartEnd;
 let ignoreAutoReview = readIgnoreAutoReviewCookie();
+let activeTableView = "usage";
+let currentData = null;
+let diagnosticsController = null;
+let diagnosticsRequestKey = null;
+let diagnosticsTimer = null;
+let usageLoadTimer = null;
+let usageController = null;
+const diagnosticsCache = new Map();
+const diagnosticsErrors = new Map();
 const expandedModels = new Set();
 
 const numberFormatter = new Intl.NumberFormat("en-US");
@@ -160,7 +169,7 @@ function escapeHtml(value) {
     .replaceAll("'", "&#039;");
 }
 
-function buildQuery(rangeName) {
+function buildQuery(rangeName, includeDiagnostics = false) {
   const params = new URLSearchParams();
   params.set("range", rangeName);
   params.set("ignore_auto_review", ignoreAutoReview ? "1" : "0");
@@ -176,6 +185,7 @@ function buildQuery(rangeName) {
     params.set("chart_start", chartStartDate);
     params.set("chart_end", chartEndDate);
   }
+  if (includeDiagnostics) params.set("include_diagnostics", "1");
   return params.toString();
 }
 
@@ -410,10 +420,29 @@ function monthLabels(cells) {
 }
 
 async function load(rangeName) {
-  app.innerHTML = '<section class="state">Loading usage data...</section>';
-  const response = await fetch(`/data.json?${buildQuery(rangeName)}`, { cache: "no-store" });
-  if (!response.ok) throw new Error(`Usage API returned HTTP ${response.status}`);
-  return response.json();
+  if (usageController) usageController.abort();
+  if (usageLoadTimer) window.clearInterval(usageLoadTimer);
+  usageController = new AbortController();
+  const controller = usageController;
+  const startedAt = Date.now();
+  const renderLoading = () => {
+    const elapsedSeconds = Math.floor((Date.now() - startedAt) / 1000);
+    const elapsed = elapsedSeconds >= 2 ? `<span>${full(elapsedSeconds)}s elapsed</span>` : "";
+    app.innerHTML = `<section class="state usage-loading" aria-live="polite"><span class="diagnostics-spinner" aria-hidden="true"></span><strong>Loading usage data…</strong>${elapsed}</section>`;
+  };
+  renderLoading();
+  usageLoadTimer = window.setInterval(renderLoading, 1000);
+  try {
+    const response = await fetch(`/data.json?${buildQuery(rangeName)}`, { cache: "no-store", signal: controller.signal });
+    if (!response.ok) throw new Error(`Usage API returned HTTP ${response.status}`);
+    return response.json();
+  } finally {
+    if (usageController === controller) {
+      if (usageLoadTimer) window.clearInterval(usageLoadTimer);
+      usageLoadTimer = null;
+      usageController = null;
+    }
+  }
 }
 
 function renderModelDetails(row) {
@@ -435,9 +464,220 @@ function renderModelDetails(row) {
   `;
 }
 
-function render(data) {
+function diagnosticsKey(data) {
+  return [data.range, data.range_start || "", data.range_end || "", data.ignore_auto_review ? "1" : "0"].join("|");
+}
+
+function renderUsageTables(data) {
   const totals = data.totals;
   const daily = [...data.daily].reverse();
+  return `
+    <div class="tables">
+      <section>
+        <h2 class="section-title"><span class="section-icon tone-lime">${icon("usage")}</span><span>Daily Usage</span></h2>
+        <div class="table-scroll">
+          <table>
+            <thead><tr><th>Date</th><th class="num">Input</th><th class="num">Output</th><th class="num">Total w/o cached</th><th class="num">Cached</th><th class="num">Total</th><th class="num">Cost</th><th class="num">Sessions</th></tr></thead>
+            <tbody>
+              ${daily.map((row) => `<tr><td>${escapeHtml(row.day)}</td><td class="num">${full(row.input_tokens)}</td><td class="num">${full(row.output_tokens)}</td><td class="num">${full(row.total_tokens)}</td><td class="num">${full(row.cached_input_tokens)}</td><td class="num">${full(row.total_with_cached_tokens)}</td><td class="num">${money(row.cost_usd)}</td><td class="num">${full(row.sessions)}</td></tr>`).join("") || '<tr><td colspan="8" class="empty">No usage in this range.</td></tr>'}
+            </tbody>
+            <tfoot><tr><td>Total</td><td class="num">${full(totals.input_tokens)}</td><td class="num">${full(totals.output_tokens)}</td><td class="num">${full(totals.total_tokens)}</td><td class="num">${full(totals.cached_input_tokens)}</td><td class="num">${full(totals.total_with_cached_tokens)}</td><td class="num">${money(totals.cost_usd)}</td><td class="num">${full(totals.sessions)}</td></tr></tfoot>
+          </table>
+        </div>
+      </section>
+
+      <section>
+        <h2 class="section-title"><span class="section-icon tone-violet">${icon("models")}</span><span>Models</span></h2>
+        <div class="table-scroll">
+          <table>
+            <thead><tr><th>Model</th><th class="num">Days</th><th class="num">Sessions</th><th class="num">Input</th><th class="num">Output</th><th class="num">Total w/o cached</th><th class="num">Cached</th><th class="num">Total</th><th class="num">Cost</th><th class="num">Share</th></tr></thead>
+            <tbody>
+              ${data.models.map((row) => {
+                const expanded = expandedModels.has(row.model);
+                return `
+                  <tr class="model-row ${expanded ? "expanded" : ""}">
+                    <td>
+                      <button class="model-toggle" type="button" data-model="${escapeHtml(row.model)}" aria-expanded="${expanded}">
+                        <span class="model-chevron">${expanded ? "▾" : "▸"}</span>
+                        <span>${escapeHtml(row.model)}</span>
+                      </button>
+                    </td>
+                    <td class="num">${full(row.active_days)}</td>
+                    <td class="num">${full(row.sessions)}</td>
+                    <td class="num">${full(row.input_tokens)}</td>
+                    <td class="num">${full(row.output_tokens)}</td>
+                    <td class="num">${full(row.total_tokens)}</td>
+                    <td class="num">${full(row.cached_input_tokens)}</td>
+                    <td class="num">${full(row.total_with_cached_tokens)}</td>
+                    <td class="num">${money(row.cost_usd)}</td>
+                    <td class="num">${((row.total_tokens / Math.max(totals.total_tokens, 1)) * 100).toFixed(1)}%</td>
+                  </tr>
+                  ${expanded ? `<tr class="model-detail-row"><td colspan="10">${renderModelDetails(row)}</td></tr>` : ""}
+                `;
+              }).join("") || '<tr><td colspan="10" class="empty">No models in this range.</td></tr>'}
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </div>
+  `;
+}
+
+function renderDiagnostics(diagnostics) {
+  const summary = diagnostics.summary;
+  return `
+    <section class="diagnostics-panel">
+      <div class="diagnostics-heading">
+        <div>
+          <h2 class="section-title"><span class="section-icon tone-cyan">${icon("usage")}</span><span>Telemetry Diagnostics</span></h2>
+          <p>Local replay analysis, not server billing. Deduplicated usage can be closer to upstream usage but is not proof that a request was accepted.</p>
+        </div>
+        <div class="diagnostics-source">${full(summary.exact_usage_events)} exact · ${full(summary.fallback_usage_events)} cumulative fallback</div>
+      </div>
+      <div class="diagnostics-summary">
+        <div><span>Raw token events</span><strong>${full(summary.raw_token_events)}</strong></div>
+        <div><span>Deduplicated updates</span><strong>${full(summary.deduplicated_usage_updates)}</strong></div>
+        <div><span>Replayed events</span><strong>${full(summary.replayed_events)} <small>${(summary.replay_rate * 100).toFixed(1)}%</small></strong></div>
+        <div><span>Estimated local overcount</span><strong>${compact(summary.estimated_local_overcount_tokens)}</strong></div>
+      </div>
+      <div class="diagnostics-integrity">
+        Baselines ${full(summary.baseline_events)} · Resets ${full(summary.counter_resets)} · Unverifiable ${full(summary.unverifiable_events)}
+      </div>
+      <div class="table-scroll">
+        <table class="diagnostics-table">
+          <thead><tr><th>Hour</th><th>Model</th><th class="num">Raw events</th><th class="num">Updates</th><th class="num">Replayed</th><th class="num">Replay rate</th><th class="num">Reported total</th><th class="num">Deduplicated total</th><th class="num">Est. overcount</th></tr></thead>
+          <tbody>
+            ${diagnostics.rows.map((row) => `<tr><td>${escapeHtml(row.hour)}</td><td>${escapeHtml(row.model)}</td><td class="num">${full(row.raw_token_events)}</td><td class="num">${full(row.deduplicated_usage_updates)}</td><td class="num">${full(row.replayed_events)}</td><td class="num">${(row.replay_rate * 100).toFixed(1)}%</td><td class="num">${full(row.reported_tokens)}</td><td class="num">${full(row.deduplicated_tokens)}</td><td class="num diagnostic-overcount">${full(row.estimated_local_overcount_tokens)}</td></tr>`).join("") || '<tr><td colspan="9" class="empty">No token telemetry in this range.</td></tr>'}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  `;
+}
+
+function renderDiagnosticsLoading(elapsedSeconds = 0) {
+  const elapsed = elapsedSeconds >= 2 ? `<span>${full(elapsedSeconds)}s elapsed</span>` : "";
+  return `<section class="diagnostics-state" aria-live="polite"><span class="diagnostics-spinner" aria-hidden="true"></span><strong>Analyzing rollout telemetry…</strong>${elapsed}</section>`;
+}
+
+function renderDiagnosticsError(message) {
+  return `<section class="diagnostics-state error"><strong>Could not analyze rollout telemetry.</strong><code>${escapeHtml(message)}</code><button class="diagnostics-retry" type="button">Retry</button></section>`;
+}
+
+function renderTableView(data) {
+  const key = diagnosticsKey(data);
+  let workspace = renderUsageTables(data);
+  if (activeTableView === "diagnostics") {
+    if (diagnosticsCache.has(key)) workspace = renderDiagnostics(diagnosticsCache.get(key));
+    else if (diagnosticsErrors.has(key)) workspace = renderDiagnosticsError(diagnosticsErrors.get(key));
+    else workspace = renderDiagnosticsLoading();
+  }
+  return `
+    <div class="table-view-toolbar">
+      <nav class="segments" aria-label="Table view">
+        <button class="seg ${activeTableView === "usage" ? "active" : ""}" type="button" data-table-view="usage" aria-pressed="${activeTableView === "usage"}">Usage</button>
+        <button class="seg ${activeTableView === "diagnostics" ? "active" : ""}" type="button" data-table-view="diagnostics" aria-pressed="${activeTableView === "diagnostics"}">Diagnostics</button>
+      </nav>
+    </div>
+    <div id="table-workspace">${workspace}</div>
+  `;
+}
+
+function clearDiagnosticsTimer() {
+  if (diagnosticsTimer) window.clearInterval(diagnosticsTimer);
+  diagnosticsTimer = null;
+}
+
+function cancelDiagnosticsRequest() {
+  clearDiagnosticsTimer();
+  if (diagnosticsController) diagnosticsController.abort();
+  diagnosticsController = null;
+  diagnosticsRequestKey = null;
+}
+
+function updateTableView(data) {
+  const container = document.querySelector("#table-view-container");
+  if (!container) return;
+  container.innerHTML = renderTableView(data);
+  bindTableView(data);
+}
+
+function bindTableView(data) {
+  document.querySelectorAll("[data-table-view]").forEach((button) => {
+    button.addEventListener("click", () => {
+      activeTableView = button.dataset.tableView;
+      updateTableView(data);
+      if (activeTableView === "diagnostics") ensureDiagnostics(data);
+    });
+  });
+
+  document.querySelectorAll(".model-toggle").forEach((button) => {
+    button.addEventListener("click", () => {
+      const model = button.dataset.model;
+      if (!model) return;
+      if (expandedModels.has(model)) expandedModels.delete(model);
+      else expandedModels.add(model);
+      updateTableView(data);
+    });
+  });
+
+  const retry = document.querySelector(".diagnostics-retry");
+  if (retry) {
+    retry.addEventListener("click", () => {
+      diagnosticsErrors.delete(diagnosticsKey(data));
+      updateTableView(data);
+      ensureDiagnostics(data, true);
+    });
+  }
+}
+
+async function ensureDiagnostics(data, force = false) {
+  const key = diagnosticsKey(data);
+  if (!force && diagnosticsCache.has(key)) {
+    if (activeTableView === "diagnostics") updateTableView(data);
+    return;
+  }
+  if (!force && diagnosticsController && diagnosticsRequestKey === key) return;
+
+  cancelDiagnosticsRequest();
+  diagnosticsErrors.delete(key);
+  diagnosticsController = new AbortController();
+  diagnosticsRequestKey = key;
+  const controller = diagnosticsController;
+  const startedAt = Date.now();
+  if (activeTableView === "diagnostics") updateTableView(data);
+  diagnosticsTimer = window.setInterval(() => {
+    if (activeTableView !== "diagnostics" || diagnosticsKey(currentData || data) !== key) return;
+    const workspace = document.querySelector("#table-workspace");
+    if (workspace) workspace.innerHTML = renderDiagnosticsLoading(Math.floor((Date.now() - startedAt) / 1000));
+  }, 1000);
+
+  try {
+    const response = await fetch(`/data.json?${buildQuery(activeRange, true)}`, {
+      cache: "no-store",
+      signal: controller.signal
+    });
+    if (!response.ok) throw new Error(`Diagnostics API returned HTTP ${response.status}`);
+    const payload = await response.json();
+    if (!payload.diagnostics) throw new Error("Diagnostics payload is missing");
+    diagnosticsCache.set(key, payload.diagnostics);
+    if (activeTableView === "diagnostics" && diagnosticsKey(currentData || data) === key) updateTableView(data);
+  } catch (error) {
+    if (error.name === "AbortError") return;
+    diagnosticsErrors.set(key, error.message);
+    if (activeTableView === "diagnostics" && diagnosticsKey(currentData || data) === key) updateTableView(data);
+  } finally {
+    if (diagnosticsController === controller) {
+      clearDiagnosticsTimer();
+      diagnosticsController = null;
+      diagnosticsRequestKey = null;
+    }
+  }
+}
+
+function render(data) {
+  currentData = data;
+  const totals = data.totals;
   const heat = heatmapCells(data.daily, data.range, data.range_start, data.range_end);
   const months = monthLabels(heat);
   const heatColumns = Math.max(1, Math.ceil(heat.length / 7));
@@ -493,56 +733,11 @@ function render(data) {
     </div>
 
     ${renderVisualizationPanel(data, heat, months, heatColumns)}
-
-    <div class="tables">
-      <section>
-        <h2 class="section-title"><span class="section-icon tone-lime">${icon("usage")}</span><span>Daily Usage</span></h2>
-        <div class="table-scroll">
-          <table>
-            <thead><tr><th>Date</th><th class="num">Input</th><th class="num">Output</th><th class="num">Total w/o cached</th><th class="num">Cached</th><th class="num">Total</th><th class="num">Cost</th><th class="num">Sessions</th></tr></thead>
-            <tbody>
-              ${daily.map((row) => `<tr><td>${escapeHtml(row.day)}</td><td class="num">${full(row.input_tokens)}</td><td class="num">${full(row.output_tokens)}</td><td class="num">${full(row.total_tokens)}</td><td class="num">${full(row.cached_input_tokens)}</td><td class="num">${full(row.total_with_cached_tokens)}</td><td class="num">${money(row.cost_usd)}</td><td class="num">${full(row.sessions)}</td></tr>`).join("") || '<tr><td colspan="8" class="empty">No usage in this range.</td></tr>'}
-            </tbody>
-            <tfoot><tr><td>Total</td><td class="num">${full(totals.input_tokens)}</td><td class="num">${full(totals.output_tokens)}</td><td class="num">${full(totals.total_tokens)}</td><td class="num">${full(totals.cached_input_tokens)}</td><td class="num">${full(totals.total_with_cached_tokens)}</td><td class="num">${money(totals.cost_usd)}</td><td class="num">${full(totals.sessions)}</td></tr></tfoot>
-          </table>
-        </div>
-      </section>
-
-      <section>
-        <h2 class="section-title"><span class="section-icon tone-violet">${icon("models")}</span><span>Models</span></h2>
-        <div class="table-scroll">
-          <table>
-            <thead><tr><th>Model</th><th class="num">Days</th><th class="num">Sessions</th><th class="num">Input</th><th class="num">Output</th><th class="num">Total w/o cached</th><th class="num">Cached</th><th class="num">Total</th><th class="num">Cost</th><th class="num">Share</th></tr></thead>
-            <tbody>
-              ${data.models.map((row) => {
-                const expanded = expandedModels.has(row.model);
-                return `
-                  <tr class="model-row ${expanded ? "expanded" : ""}">
-                    <td>
-                      <button class="model-toggle" type="button" data-model="${escapeHtml(row.model)}" aria-expanded="${expanded}">
-                        <span class="model-chevron">${expanded ? "▾" : "▸"}</span>
-                        <span>${escapeHtml(row.model)}</span>
-                      </button>
-                    </td>
-                    <td class="num">${full(row.active_days)}</td>
-                    <td class="num">${full(row.sessions)}</td>
-                    <td class="num">${full(row.input_tokens)}</td>
-                    <td class="num">${full(row.output_tokens)}</td>
-                    <td class="num">${full(row.total_tokens)}</td>
-                    <td class="num">${full(row.cached_input_tokens)}</td>
-                    <td class="num">${full(row.total_with_cached_tokens)}</td>
-                    <td class="num">${money(row.cost_usd)}</td>
-                    <td class="num">${((row.total_tokens / Math.max(totals.total_tokens, 1)) * 100).toFixed(1)}%</td>
-                  </tr>
-                  ${expanded ? `<tr class="model-detail-row"><td colspan="10">${renderModelDetails(row)}</td></tr>` : ""}
-                `;
-              }).join("") || '<tr><td colspan="10" class="empty">No models in this range.</td></tr>'}
-            </tbody>
-          </table>
-        </div>
-      </section>
-    </div>
+    <div id="table-view-container">${renderTableView(data)}</div>
   `;
+
+  bindTableView(data);
+  if (activeTableView === "diagnostics") ensureDiagnostics(data);
 
   document.querySelectorAll("[data-range]").forEach((button) => {
     button.addEventListener("click", () => {
@@ -611,16 +806,6 @@ function render(data) {
     });
   }
 
-  document.querySelectorAll(".model-toggle").forEach((button) => {
-    button.addEventListener("click", () => {
-      const model = button.dataset.model;
-      if (!model) return;
-      if (expandedModels.has(model)) expandedModels.delete(model);
-      else expandedModels.add(model);
-      render(data);
-    });
-  });
-
   document.querySelectorAll(".heat-cell").forEach((cell) => {
     cell.addEventListener("mouseenter", showHeatTooltip);
     cell.addEventListener("mousemove", positionHeatTooltip);
@@ -680,8 +865,11 @@ function hideHeatTooltip() {
 }
 
 async function refresh() {
+  cancelDiagnosticsRequest();
   try {
     const data = await load(activeRange);
+    diagnosticsCache.delete(diagnosticsKey(data));
+    diagnosticsErrors.delete(diagnosticsKey(data));
     ignoreAutoReview = Boolean(data.ignore_auto_review);
     if (data.range === "custom") {
       customStartDate = data.range_start || customStartDate;
@@ -694,6 +882,7 @@ async function refresh() {
     }
     render(data);
   } catch (error) {
+    if (error.name === "AbortError") return;
     app.innerHTML = `<section class="state error"><h1>Codex Usage</h1><p>Could not load usage data.</p><code>${escapeHtml(error.message)}</code></section>`;
   }
 }

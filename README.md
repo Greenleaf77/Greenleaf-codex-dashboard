@@ -17,6 +17,9 @@ This project is not affiliated with OpenAI.
 - Adaptive chart buckets: daily through 60 days, weekly through 6 months, and monthly for longer ranges
 - Range filters: all time, 30 days, 7 days, 1 day, and custom dates
 - Optional filter to ignore the `codex-auto-review` model
+- Deduplicated rollout telemetry that avoids counting unchanged cumulative snapshots as new model usage
+- Optional `Diagnostics` workspace for inspecting replay rates and estimated local overcount without adding columns to the main Usage tables
+- Loading indicators with elapsed time for longer local-history scans
 - macOS `.command` launcher
 
 ## Data Sources
@@ -28,7 +31,12 @@ The dashboard reads:
 ~/.codex/sessions/**/rollout-*.jsonl
 ```
 
-It uses `state_5.sqlite` to discover Codex threads and rollout paths. Token counts are computed from `token_count` events in rollout JSONL files.
+It uses `state_5.sqlite` to discover Codex threads and rollout paths. Token counts are reconstructed from rollout telemetry in chronological order:
+
+1. Exact `raw_response_completed.token_usage` records are preferred when present and deduplicated by response ID.
+2. Otherwise, the dashboard uses component deltas from cumulative `token_count.info.total_token_usage` snapshots.
+
+Unchanged cumulative snapshots are treated as telemetry replays and add zero usage. Classification starts at the beginning of each selected rollout before date filters are applied, so a first dashboard launch or a limited date range still receives the correct cumulative baseline.
 
 Displayed token accounting follows the same practical convention used by local usage tools:
 
@@ -41,6 +49,12 @@ Total = Input + Cached + Output
 ```
 
 The historical dashboard total is preserved as `Total w/o cached`. The `Total` column includes cached input so you can see the full token volume represented in local Codex logs.
+
+### Codex 5.6 compatibility
+
+Version 1.1 adds telemetry compatibility for Codex models in the `gpt-5.6-*` family and prevents repeated local snapshots from inflating usage and cost estimates. The `Usage / Diagnostics` control above the tables opens an optional audit view with raw events, deduplicated updates, replay rate, and estimated local overcount.
+
+These diagnostics analyze locally persisted rollout events. They may explain a gap between local raw-event sums and upstream statistics, but they do not prove whether a request was accepted, rejected, or billed by OpenAI. The dashboard remains a local usage estimator rather than a server billing ledger.
 
 ## Cost Estimates
 
@@ -108,7 +122,7 @@ To install a specific release instead of the latest `main`, use a tag:
 
 ```bash
 git fetch --tags
-git checkout v1.0.3
+git checkout v1.1.0
 npm install
 ```
 

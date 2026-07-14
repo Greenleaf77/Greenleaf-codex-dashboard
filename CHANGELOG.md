@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.1.0 - 2026-07-14
+
+- Added telemetry compatibility for Codex models in the `gpt-5.6-*` family.
+- Fixed inflated token and cost estimates caused by replayed `token_count` snapshots whose cumulative usage had not changed.
+- Preferred exact `raw_response_completed` token usage when available, with deduplicated cumulative-component deltas as the fallback.
+- Added an optional, lazily loaded `Diagnostics` workspace for replay rates and estimated local overcount while keeping the main Usage tables unchanged.
+- Added honest loading indicators with elapsed time for longer rollout scans and cached Diagnostics results for the active filter.
+- Clarified that local rollout telemetry is not an OpenAI server billing ledger and cannot prove that a request was accepted or rejected.
+- Added focused telemetry-classification tests for baselines, cumulative deltas, replays, counter resets, exact response deduplication, and range filtering.
+
 ## 1.0.4 - 2026-07-13
 
 - Redesigned the dashboard with a compact graphite visual system.
