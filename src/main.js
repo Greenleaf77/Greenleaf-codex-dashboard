@@ -1,4 +1,5 @@
 import "./styles.css";
+import { compactNumber } from "./format.js";
 
 const app = document.querySelector("#app");
 const tooltip = document.createElement("div");
@@ -24,7 +25,7 @@ const chartRangeOptions = [
   { value: "30d", label: "30d" },
   { value: "custom", label: "Custom" }
 ];
-const chartColors = ["#4f8fc1", "#45d1c4", "#9bd72b", "#ff674f", "#168df2", "#b98cff", "#f2bf4a", "#ea6aa6"];
+const chartColors = ["#3b82f6", "#22c55e", "#f59e0b", "#8b5cf6", "#14b8a6", "#f05d4f", "#60a5fa", "#a3e635"];
 const iconPaths = {
   brand: '<path d="m12 3.5 7 4v9l-7 4-7-4v-9l7-4Z"/><polyline points="8.2 12 10.7 14.5 15.8 9.4"/>',
   sessions: '<circle cx="12" cy="8" r="3.2"/><path d="M5 20c.6-3.2 3.2-5 7-5s6.4 1.8 7 5"/>',
@@ -69,13 +70,6 @@ const expandedModels = new Set();
 const numberFormatter = new Intl.NumberFormat("en-US");
 const moneyFormatter = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" });
 const monthFormatter = new Intl.DateTimeFormat("en-US", { month: "short" });
-
-function compact(value) {
-  const number = Number(value || 0);
-  if (number >= 1_000_000) return `${(number / 1_000_000).toFixed(1)}M`;
-  if (number >= 1_000) return `${(number / 1_000).toFixed(1)}k`;
-  return numberFormatter.format(number);
-}
 
 function full(value) {
   return numberFormatter.format(Number(value || 0));
@@ -338,7 +332,7 @@ function renderTokensOverTime(chart) {
   return `
     <div class="chart-shell">
       <div class="chart-y-axis">
-        ${ticks.map((tick) => `<span>${compact(tick)}</span>`).join("")}
+        ${ticks.map((tick) => `<span>${compactNumber(tick)}</span>`).join("")}
       </div>
       <div class="chart-scroll">
         <div class="bar-chart" style="--bar-count: ${days.length}; --bar-width: ${barWidth}px; --bar-gap: ${barGap}px; --bar-fill: ${barFill}%; --bar-max: ${barMax}px">
@@ -538,7 +532,7 @@ function renderDiagnostics(diagnostics) {
         <div><span>Raw token events</span><strong>${full(summary.raw_token_events)}</strong></div>
         <div><span>Deduplicated updates</span><strong>${full(summary.deduplicated_usage_updates)}</strong></div>
         <div><span>Replayed events</span><strong>${full(summary.replayed_events)} <small>${(summary.replay_rate * 100).toFixed(1)}%</small></strong></div>
-        <div><span>Estimated local overcount</span><strong>${compact(summary.estimated_local_overcount_tokens)}</strong></div>
+        <div><span>Estimated local overcount</span><strong>${compactNumber(summary.estimated_local_overcount_tokens)}</strong></div>
       </div>
       <div class="diagnostics-integrity">
         Baselines ${full(summary.baseline_events)} · Resets ${full(summary.counter_resets)} · Unverifiable ${full(summary.unverifiable_events)}
@@ -675,6 +669,34 @@ async function ensureDiagnostics(data, force = false) {
   }
 }
 
+function dailySeries(data, key) {
+  return (data.daily || []).map((row) => Number(row[key] || 0));
+}
+
+function renderSparkline(values, label) {
+  const series = values.filter((value) => Number.isFinite(value));
+  if (series.length < 2 || !series.some((value) => value > 0)) return "";
+  const width = 320;
+  const height = 58;
+  const inset = 4;
+  const max = Math.max(...series, 1);
+  const step = (width - inset * 2) / Math.max(series.length - 1, 1);
+  const points = series.map((value, index) => {
+    const x = inset + index * step;
+    const y = height - inset - (value / max) * (height - inset * 2);
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  }).join(" ");
+  const area = `${inset},${height - inset} ${points} ${width - inset},${height - inset}`;
+  return `
+    <div class="metric-sparkline" role="img" aria-label="${escapeHtml(label)}">
+      <svg viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" aria-hidden="true">
+        <polygon points="${area}"></polygon>
+        <polyline points="${points}"></polyline>
+      </svg>
+    </div>
+  `;
+}
+
 function render(data) {
   currentData = data;
   const totals = data.totals;
@@ -683,13 +705,15 @@ function render(data) {
   const heatColumns = Math.max(1, Math.ceil(heat.length / 7));
 
   app.innerHTML = `
-    <header>
+    <header class="app-header">
       <div class="brand-block">
-        <span class="brand-mark">${icon("brand")}</span>
-        <div>
+        <div class="brand-pill">
+          <span class="brand-mark">${icon("brand")}</span>
           <h1>Codex Usage</h1>
-          <div class="subtle">Generated ${escapeHtml(data.generated_at)} from local Codex logs</div>
-          <div class="segment-note">Showing ${escapeHtml(describeRange(data))}</div>
+        </div>
+        <div class="brand-meta">
+          <span>Generated ${escapeHtml(data.generated_at)} from local Codex logs</span>
+          <strong>Showing ${escapeHtml(describeRange(data))}</strong>
         </div>
       </div>
       <div class="header-tools">
@@ -716,20 +740,38 @@ function render(data) {
       </div>
     </header>
 
-    <div class="cards">
-      ${card("Sessions", full(totals.sessions), "sessions", "violet")}
-      ${card("Input tokens", compact(totals.input_tokens), "input", "blue")}
-      ${card("Output tokens", compact(totals.output_tokens), "output", "cyan")}
-      ${card("Total w/o cached", compact(totals.total_tokens), "calculator", "slate")}
-      ${card("Cached input", compact(totals.cached_input_tokens), "cache", "violet")}
-      ${card("Total tokens", compact(totals.total_with_cached_tokens), "layers", "cyan")}
-      ${card("Active days", full(totals.active_days), "calendar", "slate")}
-      ${card("API estimate", `${money(totals.cost_usd)}<span class="metric-note">${escapeHtml(data.pricing?.source || "pricing unavailable")}</span>`, "coin", "lime")}
-      ${card("Favorite model", escapeHtml(data.favorite_model), "star", "amber")}
-      ${card("Current streak", `${full(data.current_streak)}d`, "flame", "coral")}
-      ${card("Longest streak", `${full(data.longest_streak)}d`, "trophy", "amber")}
-      ${card("Peak day", `${escapeHtml(data.peak_day)}${data.peak_day_tokens ? `<span class="metric-note">${compact(data.peak_day_tokens)}</span>` : ""}`, "chart", "blue")}
-      ${card("Data source", "SQLite + JSONL", "database", "violet")}
+    <div class="metric-hero-grid">
+      ${metricCard({
+        label: "Total tokens",
+        value: compactNumber(totals.total_with_cached_tokens),
+        iconName: "layers",
+        tone: "violet",
+        note: `Cached ${compactNumber(totals.cached_input_tokens)} · Without cache ${compactNumber(totals.total_tokens)}`,
+        series: dailySeries(data, "total_with_cached_tokens"),
+        hero: true
+      })}
+      ${metricCard({
+        label: "API estimate",
+        value: money(totals.cost_usd),
+        iconName: "coin",
+        tone: "amber",
+        note: escapeHtml(data.pricing?.source || "pricing unavailable"),
+        series: dailySeries(data, "cost_usd"),
+        hero: true
+      })}
+    </div>
+    <div class="metric-secondary-grid">
+      ${metricCard({ label: "Sessions", value: full(totals.sessions), iconName: "sessions", tone: "blue", series: dailySeries(data, "sessions") })}
+      ${metricCard({ label: "Input tokens", value: compactNumber(totals.input_tokens), iconName: "input", tone: "blue", series: dailySeries(data, "input_tokens") })}
+      ${metricCard({ label: "Output tokens", value: compactNumber(totals.output_tokens), iconName: "output", tone: "green", series: dailySeries(data, "output_tokens") })}
+      ${metricCard({ label: "Total w/o cached", value: compactNumber(totals.total_tokens), iconName: "calculator", tone: "coral", series: dailySeries(data, "total_tokens") })}
+      ${metricCard({ label: "Cached input", value: compactNumber(totals.cached_input_tokens), iconName: "cache", tone: "cyan", series: dailySeries(data, "cached_input_tokens") })}
+      ${metricCard({ label: "Active days", value: full(totals.active_days), iconName: "calendar", tone: "blue" })}
+      ${metricCard({ label: "Favorite model", value: escapeHtml(data.favorite_model), iconName: "star", tone: "violet" })}
+      ${metricCard({ label: "Current streak", value: `${full(data.current_streak)}d`, iconName: "flame", tone: "coral" })}
+      ${metricCard({ label: "Longest streak", value: `${full(data.longest_streak)}d`, iconName: "trophy", tone: "amber" })}
+      ${metricCard({ label: "Peak day", value: escapeHtml(data.peak_day), iconName: "chart", tone: "green", note: data.peak_day_tokens ? `${compactNumber(data.peak_day_tokens)} tokens` : "", series: dailySeries(data, "total_tokens") })}
+      ${metricCard({ label: "Data source", value: "SQLite + JSONL", iconName: "database", tone: "violet" })}
     </div>
 
     ${renderVisualizationPanel(data, heat, months, heatColumns)}
@@ -824,8 +866,22 @@ function icon(name, className = "") {
   return `<svg class="icon ${className}" aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">${paths}</svg>`;
 }
 
-function card(label, value, iconName, tone) {
-  return `<div class="card metric-${tone}"><span class="metric-icon">${icon(iconName)}</span><div class="metric-copy"><div class="label">${label}</div><div class="value">${value}</div></div></div>`;
+function metricCard({ label, value, iconName, tone, note = "", series = [], hero = false }) {
+  const classes = ["metric-card", `metric-${tone}`, hero ? "metric-card-hero" : ""]
+    .filter(Boolean)
+    .join(" ");
+  return `
+    <article class="${classes}">
+      <span class="metric-accent" aria-hidden="true"></span>
+      <div class="metric-card-head">
+        <div class="metric-label">${escapeHtml(label)}</div>
+        <span class="metric-icon">${icon(iconName)}</span>
+      </div>
+      <div class="metric-value">${value}</div>
+      ${note ? `<div class="metric-note">${note}</div>` : ""}
+      ${renderSparkline(series, `${label} trend`)}
+    </article>
+  `;
 }
 
 function showHeatTooltip(event) {

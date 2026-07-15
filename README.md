@@ -9,6 +9,8 @@ This project is not affiliated with OpenAI.
 ## Features
 
 - Local-only dashboard served on `127.0.0.1`
+- Warm graphite telemetry-console interface with responsive hero metrics and compact daily sparklines
+- Billion-scale compact values in cards and charts while detailed tables preserve full token counts
 - Summary cards for sessions, token usage with and without cached input, API-equivalent cost estimate, active days, streaks, peak day, and favorite model
 - Daily usage table with input, output, total without cached input, cached input, total with cached input, and estimated cost
 - Model breakdown table with expandable daily model details and estimated cost by model
