@@ -4,7 +4,7 @@ Local web dashboard for Codex usage statistics. It reads your local Codex state 
 
 This project is not affiliated with OpenAI.
 
-![Codex Usage Dashboard screenshot](docs/screenshot.png?v=1.2.0)
+![Codex Usage Dashboard screenshot](docs/screenshot-v1.3.0.png)
 
 ## Features
 
@@ -14,11 +14,11 @@ This project is not affiliated with OpenAI.
 - Summary cards for sessions, token usage with and without cached input, API-equivalent cost estimate, active days, streaks, peak day, and favorite model
 - Daily usage table with input, output, total without cached input, cached input, total with cached input, and estimated cost
 - Model breakdown table with expandable daily model details and estimated cost by model
-- Visualization tabs for daily heatmap and stacked tokens-over-time bar chart
+- Visualization tabs for daily heatmap and stacked tokens-over-time bar chart, with one shared `With cache` / `Without cache` accounting control
 - Tokens-over-time chart split by model, with independent all-time, 1-year, 6-month, 90-day, 30-day, and custom date filters
 - Adaptive chart buckets: daily through 60 days, weekly through 6 months, and monthly for longer ranges
 - Range filters: all time, 30 days, 7 days, 1 day, and custom dates
-- Optional filter to ignore the `codex-auto-review` model
+- Optional filter to ignore the `codex-auto-review` model; auto-review data is included by default
 - Deduplicated rollout telemetry that avoids counting unchanged cumulative snapshots as new model usage
 - Optional `Diagnostics` workspace for inspecting replay rates and estimated local overcount without adding columns to the main Usage tables
 - Loading indicators with elapsed time for longer local-history scans

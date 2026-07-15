@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.3.0 - 2026-07-15
+
+- Added one shared `With cache` / `Without cache` accounting control for Daily heatmap and Tokens over time.
+- Made cache-inclusive visualization and included `codex-auto-review` data the defaults while preserving explicit URL and cookie preferences.
+- Extended chart buckets and per-model stacks with additive cache-inclusive totals without changing existing token or cost semantics.
+- Renamed the README screenshot asset to `screenshot-v1.3.0.png` to prevent stale GitHub/CDN image caching.
+
 ## 1.2.0 - 2026-07-15
 
 - Redesigned the dark interface as a warm graphite telemetry console while preserving all existing dashboard behavior.

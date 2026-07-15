@@ -1,5 +1,12 @@
 import "./styles.css";
 import { compactNumber } from "./format.js";
+import {
+  WITH_CACHE,
+  WITHOUT_CACHE,
+  metricValue,
+  resolveCacheMode,
+  resolveIgnoreAutoReview
+} from "./visualization-accounting.js";
 
 const app = document.querySelector("#app");
 const tooltip = document.createElement("div");
@@ -16,6 +23,10 @@ const rangeOptions = [
 const visualizationOptions = [
   { value: "heatmap", label: "Daily heatmap" },
   { value: "tokens", label: "Tokens over time" }
+];
+const accountingOptions = [
+  { value: WITH_CACHE, label: "With cache" },
+  { value: WITHOUT_CACHE, label: "Without cache" }
 ];
 const chartRangeOptions = [
   { value: "all", label: "All" },
@@ -45,7 +56,7 @@ const iconPaths = {
   models: '<rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/><line x1="10" y1="7" x2="14" y2="7"/><line x1="7" y1="10" x2="7" y2="14"/><line x1="17" y1="10" x2="17" y2="14"/>'
 };
 const autoReviewModel = "codex-auto-review";
-const ignoreAutoReviewCookie = "ignore_codex_auto_review";
+const ignoreAutoReviewCookie = "ignore_codex_auto_review_v2";
 
 const initialState = readUrlState();
 let activeRange = initialState.range;
@@ -55,7 +66,8 @@ let activeVisualization = initialState.visualization;
 let chartRange = initialState.chartRange;
 let chartStartDate = initialState.chartStart;
 let chartEndDate = initialState.chartEnd;
-let ignoreAutoReview = readIgnoreAutoReviewCookie();
+let cacheMode = initialState.cacheMode;
+let ignoreAutoReview = resolveIgnoreAutoReview(initialState.ignoreAutoReview, readCookie(ignoreAutoReviewCookie));
 let activeTableView = "usage";
 let currentData = null;
 let diagnosticsController = null;
@@ -128,7 +140,9 @@ function readUrlState() {
     visualization: visualizationOptions.some((option) => option.value === visualization) ? visualization : "heatmap",
     chartRange: chartRangeOptions.some((option) => option.value === selectedChartRange) ? selectedChartRange : "30d",
     chartStart: params.get("chart_start") || "",
-    chartEnd: params.get("chart_end") || ""
+    chartEnd: params.get("chart_end") || "",
+    cacheMode: resolveCacheMode(params.get("cache")),
+    ignoreAutoReview: params.get("ignore_auto_review")
   };
 }
 
@@ -143,15 +157,6 @@ function readCookie(name) {
 function writeCookie(name, value, days = 365) {
   const expires = new Date(Date.now() + days * 24 * 60 * 60 * 1000).toUTCString();
   document.cookie = `${encodeURIComponent(name)}=${encodeURIComponent(value)}; expires=${expires}; path=/; SameSite=Lax`;
-}
-
-function readIgnoreAutoReviewCookie() {
-  const stored = readCookie(ignoreAutoReviewCookie);
-  if (stored === null) {
-    writeCookie(ignoreAutoReviewCookie, "1");
-    return true;
-  }
-  return stored === "1";
 }
 
 function escapeHtml(value) {
@@ -169,6 +174,7 @@ function buildQuery(rangeName, includeDiagnostics = false) {
   params.set("ignore_auto_review", ignoreAutoReview ? "1" : "0");
   params.set("visualization", activeVisualization);
   params.set("chart_range", chartRange);
+  params.set("cache", cacheMode);
   if (rangeName === "custom") {
     normalizeCustomRange();
     params.set("start", customStartDate);
@@ -222,10 +228,10 @@ function modelColor(model, models) {
   return chartColors[index % chartColors.length];
 }
 
-function heatmapCells(daily, rangeName, rangeStart, rangeEnd) {
+function heatmapCells(daily, rangeName, rangeStart, rangeEnd, accountingMode) {
   const byDay = new Map(daily.map((row) => [row.day, row]));
   const today = new Date();
-  const maxTokens = Math.max(0, ...daily.map((row) => row.total_tokens || 0));
+  const maxTokens = Math.max(0, ...daily.map((row) => metricValue(row, accountingMode)));
   let first = daily.length ? parseDay(daily[0].day) : new Date(today.getFullYear(), today.getMonth(), today.getDate());
   let last = new Date(Math.max(today.getTime(), daily.length ? parseDay(daily.at(-1).day)?.getTime() || today.getTime() : today.getTime()));
 
@@ -240,8 +246,8 @@ function heatmapCells(daily, rangeName, rangeStart, rangeEnd) {
   const cells = [];
   for (const cursor = new Date(first); cursor <= last; cursor.setDate(cursor.getDate() + 1)) {
     const key = localDayKey(cursor);
-    const row = byDay.get(key) || { sessions: 0, total_tokens: 0 };
-    const tokens = row.total_tokens || 0;
+    const row = byDay.get(key) || { sessions: 0, total_tokens: 0, total_with_cached_tokens: 0 };
+    const tokens = metricValue(row, accountingMode);
     let level = 0;
     if (tokens && maxTokens) {
       if (tokens < maxTokens * 0.2) level = 1;
@@ -255,6 +261,7 @@ function heatmapCells(daily, rangeName, rangeStart, rangeEnd) {
 }
 
 function renderVisualizationPanel(data, heat, months, heatColumns) {
+  const accountingLabel = cacheMode === WITH_CACHE ? "With cache" : "Without cache";
   return `
     <section>
       <div class="viz-header">
@@ -263,28 +270,34 @@ function renderVisualizationPanel(data, heat, months, heatColumns) {
             <span class="section-icon tone-cyan">${icon("usage")}</span>
             <div>
               <h2>${activeVisualization === "tokens" ? "Tokens over time" : "Daily Heatmap"}</h2>
-              <div class="viz-note">${activeVisualization === "tokens" ? `Showing ${escapeHtml(describeChartRange(data.chart))}` : "Usage intensity by day"}</div>
+              <div class="viz-note">${activeVisualization === "tokens" ? `Showing ${escapeHtml(describeChartRange(data.chart))}` : "Usage intensity by day"} · ${accountingLabel}</div>
             </div>
           </div>
         </div>
         <div class="viz-controls">
-          <nav class="segments viz-tabs" aria-label="Visualization">
-            ${visualizationOptions.map((option) => `<button class="seg ${activeVisualization === option.value ? "active" : ""}" data-visualization="${option.value}">${option.label}</button>`).join("")}
-          </nav>
+          <div class="viz-primary-controls">
+            <nav class="segments accounting-tabs" aria-label="Token accounting">
+              ${accountingOptions.map((option) => `<button class="seg ${cacheMode === option.value ? "active" : ""}" data-cache-mode="${option.value}" aria-pressed="${cacheMode === option.value}">${option.label}</button>`).join("")}
+            </nav>
+            <nav class="segments viz-tabs" aria-label="Visualization">
+              ${visualizationOptions.map((option) => `<button class="seg ${activeVisualization === option.value ? "active" : ""}" data-visualization="${option.value}">${option.label}</button>`).join("")}
+            </nav>
+          </div>
           ${activeVisualization === "tokens" ? renderChartRangeControls(data.chart) : ""}
         </div>
       </div>
-      ${activeVisualization === "tokens" ? renderTokensOverTime(data.chart) : renderHeatmap(heat, months, heatColumns)}
+      ${activeVisualization === "tokens" ? renderTokensOverTime(data.chart, cacheMode) : renderHeatmap(heat, months, heatColumns, cacheMode)}
     </section>
   `;
 }
 
-function renderHeatmap(heat, months, heatColumns) {
+function renderHeatmap(heat, months, heatColumns, accountingMode) {
+  const accountingLabel = accountingMode === WITH_CACHE ? "with cache" : "without cache";
   return `
     <div class="heat-wrap">
       <div class="heatmap-shell">
         <div class="heatmap" style="grid-template-columns: repeat(${heatColumns}, 16px)">
-          ${heat.map((cell) => `<div class="heat-cell level-${cell.level}" aria-label="${cell.day}: ${full(cell.tokens)} total tokens" data-tooltip-date="${cell.day}" data-tooltip-tokens="${full(cell.tokens)} total tokens"></div>`).join("")}
+          ${heat.map((cell) => `<div class="heat-cell level-${cell.level}" aria-label="${cell.day}: ${full(cell.tokens)} tokens ${accountingLabel}" data-tooltip-date="${cell.day}" data-tooltip-tokens="${full(cell.tokens)} tokens ${accountingLabel}"></div>`).join("")}
         </div>
         <div class="month-labels" style="grid-template-columns: repeat(${heatColumns}, 16px)">
           ${months.map((month) => `<span style="grid-column: ${month.column}">${escapeHtml(month.label)}</span>`).join("")}
@@ -317,10 +330,10 @@ function renderChartRangeControls(chart) {
   `;
 }
 
-function renderTokensOverTime(chart) {
+function renderTokensOverTime(chart, accountingMode) {
   const days = chart.days || [];
   const models = chart.models || [];
-  const maxTokens = Math.max(1, ...days.map((day) => day.total_tokens || 0));
+  const maxTokens = Math.max(1, ...days.map((day) => metricValue(day, accountingMode)));
   const ticks = [1, 0.75, 0.5, 0.25, 0].map((ratio) => Math.round(maxTokens * ratio));
   const labelEvery = Math.max(1, Math.ceil(days.length / 10));
   const { barWidth, barGap, barFill, barMax } = chartBarSizing(chart.granularity, days.length);
@@ -343,7 +356,7 @@ function renderTokensOverTime(chart) {
             ${days.map(() => "<span></span>").join("")}
           </div>
           <div class="chart-bars">
-            ${days.map((day, index) => renderChartBar(day, models, maxTokens, index, labelEvery, days.length)).join("")}
+            ${days.map((day, index) => renderChartBar(day, models, maxTokens, index, labelEvery, days.length, accountingMode)).join("")}
           </div>
         </div>
       </div>
@@ -365,17 +378,19 @@ function chartBarSizing(granularity, count) {
   return { barWidth: 28, barGap: 4, barFill: 76, barMax: 24 };
 }
 
-function renderChartBar(day, models, maxTokens, index, labelEvery, dayCount) {
-  const tokens = Number(day.total_tokens || 0);
+function renderChartBar(day, models, maxTokens, index, labelEvery, dayCount, accountingMode) {
+  const tokens = metricValue(day, accountingMode);
   const height = tokens ? Math.max(2, (tokens / maxTokens) * 100) : 0;
   const label = index % labelEvery === 0 || index === dayCount - 1 ? dayLabel(day.label, day.day, chartRange) : "";
   const title = day.bucket_start && day.bucket_end && day.bucket_start !== day.bucket_end ? `${day.bucket_start} - ${day.bucket_end}` : day.day;
+  const accountingLabel = accountingMode === WITH_CACHE ? "with cache" : "without cache";
   return `
     <div class="bar-slot">
-      <div class="stacked-bar ${tokens ? "" : "empty"}" style="height: ${height}%" data-tooltip-title="${escapeHtml(title)}" data-tooltip-body="${full(day.total_tokens)} total tokens">
+      <div class="stacked-bar ${tokens ? "" : "empty"}" style="height: ${height}%" data-tooltip-title="${escapeHtml(title)}" data-tooltip-body="${full(tokens)} tokens ${accountingLabel}">
         ${(day.models || []).map((item) => {
-          const segmentHeight = day.total_tokens ? (item.total_tokens / day.total_tokens) * 100 : 0;
-          return `<div class="bar-segment" style="height: ${segmentHeight}%; background: ${modelColor(item.model, models)}" data-tooltip-title="${escapeHtml(item.model)}" data-tooltip-body="${escapeHtml(title)}<br>${full(item.total_tokens)} tokens"></div>`;
+          const itemTokens = metricValue(item, accountingMode);
+          const segmentHeight = tokens ? (itemTokens / tokens) * 100 : 0;
+          return `<div class="bar-segment" style="height: ${segmentHeight}%; background: ${modelColor(item.model, models)}" data-tooltip-title="${escapeHtml(item.model)}" data-tooltip-body="${escapeHtml(title)}<br>${full(itemTokens)} tokens ${accountingLabel}"></div>`;
         }).join("")}
       </div>
       <div class="bar-label">${escapeHtml(label)}</div>
@@ -700,7 +715,7 @@ function renderSparkline(values, label) {
 function render(data) {
   currentData = data;
   const totals = data.totals;
-  const heat = heatmapCells(data.daily, data.range, data.range_start, data.range_end);
+  const heat = heatmapCells(data.daily, data.range, data.range_start, data.range_end, cacheMode);
   const months = monthLabels(heat);
   const heatColumns = Math.max(1, Math.ceil(heat.length / 7));
 
@@ -800,6 +815,14 @@ function render(data) {
     });
   });
 
+  document.querySelectorAll("[data-cache-mode]").forEach((button) => {
+    button.addEventListener("click", () => {
+      cacheMode = resolveCacheMode(button.dataset.cacheMode);
+      syncUrl();
+      render(data);
+    });
+  });
+
   document.querySelectorAll("[data-chart-range]").forEach((button) => {
     button.addEventListener("click", () => {
       chartRange = button.dataset.chartRange;
@@ -844,6 +867,7 @@ function render(data) {
     ignoreAutoReviewInput.addEventListener("change", () => {
       ignoreAutoReview = ignoreAutoReviewInput.checked;
       writeCookie(ignoreAutoReviewCookie, ignoreAutoReview ? "1" : "0");
+      syncUrl();
       refresh();
     });
   }

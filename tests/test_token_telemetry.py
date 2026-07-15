@@ -124,6 +124,32 @@ class TokenTelemetryTests(unittest.TestCase):
         self.assertFalse(handler.filters_from_query("")["include_diagnostics"])
         self.assertTrue(handler.filters_from_query("include_diagnostics=1")["include_diagnostics"])
 
+    def test_chart_aggregates_tokens_with_and_without_cached_input(self):
+        filters = dashboard_api.resolve_chart_range("30d", None, None, False)
+        filters["start_day"] = "2026-07-15"
+        filters["end_day"] = "2026-07-15"
+        events = [
+            dashboard_api.usage_event(
+                "t1", "gpt-a", "2026-07-15T10:00:00Z", usage(100, 80, 10), "exact", "usage_update"
+            ),
+            dashboard_api.usage_event(
+                "t2", "gpt-b", "2026-07-15T11:00:00Z", usage(50, 20, 5), "exact", "usage_update"
+            ),
+        ]
+
+        chart = dashboard_api.chart_days_from_events(events, filters)
+
+        self.assertEqual(chart["days"][0]["total_tokens"], 65)
+        self.assertEqual(chart["days"][0]["total_with_cached_tokens"], 165)
+        self.assertEqual(
+            {row["model"]: row["total_with_cached_tokens"] for row in chart["days"][0]["models"]},
+            {"gpt-a": 110, "gpt-b": 55},
+        )
+        self.assertEqual(
+            {row["model"]: row["total_with_cached_tokens"] for row in chart["models"]},
+            {"gpt-a": 110, "gpt-b": 55},
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
