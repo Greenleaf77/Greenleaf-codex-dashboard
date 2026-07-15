@@ -319,6 +319,13 @@ h2.section-title {
   gap: 8px;
 }
 
+.viz-primary-controls {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
 .viz-tabs {
   justify-content: flex-end;
 }
@@ -1078,6 +1085,10 @@ tbody tr:hover td {
   .chart-filter {
     width: 100%;
     justify-items: stretch;
+  }
+
+  .viz-primary-controls {
+    justify-content: flex-start;
   }
 
   .viz-tabs,

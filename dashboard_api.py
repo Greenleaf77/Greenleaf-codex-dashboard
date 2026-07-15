@@ -579,8 +579,9 @@ def chart_bucket_for_day(day: dt.date, granularity: str) -> tuple[dt.date, dt.da
 
 
 def chart_days_from_events(events: list[dict], filters: dict[str, str | int | bool | None]) -> dict:
-    bucket_model_map: dict[str, dict[str, int]] = {}
-    model_totals: dict[str, int] = {}
+    metric_keys = ("total_tokens", "total_with_cached_tokens")
+    bucket_model_map: dict[str, dict[str, dict[str, int]]] = {}
+    model_totals: dict[str, dict[str, int]] = {}
     start_day = parse_iso_day(str(filters["start_day"])) if filters.get("start_day") else None
     end_day = parse_iso_day(str(filters["end_day"])) if filters.get("end_day") else None
 
@@ -601,10 +602,13 @@ def chart_days_from_events(events: list[dict], filters: dict[str, str | int | bo
         bucket_start, _, _ = chart_bucket_for_day(event_day, granularity)
         bucket_key = bucket_start.isoformat()
         model = event["model"]
-        tokens = int(event["total_tokens"])
         bucket_models = bucket_model_map.setdefault(bucket_key, {})
-        bucket_models[model] = bucket_models.get(model, 0) + tokens
-        model_totals[model] = model_totals.get(model, 0) + tokens
+        bucket_totals = bucket_models.setdefault(model, {key: 0 for key in metric_keys})
+        overall_totals = model_totals.setdefault(model, {key: 0 for key in metric_keys})
+        for key in metric_keys:
+            tokens = int(event[key])
+            bucket_totals[key] += tokens
+            overall_totals[key] += tokens
 
     days = []
     cursor, _, _ = chart_bucket_for_day(start_day, granularity)
@@ -612,9 +616,11 @@ def chart_days_from_events(events: list[dict], filters: dict[str, str | int | bo
         bucket_start, bucket_end, label = chart_bucket_for_day(cursor, granularity)
         day_key = bucket_start.isoformat()
         models = [
-            {"model": model, "total_tokens": tokens}
-            for model, tokens in sorted(bucket_model_map.get(day_key, {}).items(), key=lambda item: item[1], reverse=True)
-            if tokens
+            {"model": model, **totals}
+            for model, totals in sorted(
+                bucket_model_map.get(day_key, {}).items(), key=lambda item: item[1]["total_tokens"], reverse=True
+            )
+            if totals["total_tokens"] or totals["total_with_cached_tokens"]
         ]
         days.append(
             {
@@ -623,6 +629,7 @@ def chart_days_from_events(events: list[dict], filters: dict[str, str | int | bo
                 "bucket_end": bucket_end.isoformat(),
                 "label": label,
                 "total_tokens": sum(item["total_tokens"] for item in models),
+                "total_with_cached_tokens": sum(item["total_with_cached_tokens"] for item in models),
                 "models": models,
             }
         )
@@ -634,9 +641,9 @@ def chart_days_from_events(events: list[dict], filters: dict[str, str | int | bo
             cursor = bucket_start + dt.timedelta(days=1)
 
     models = [
-        {"model": model, "total_tokens": total}
-        for model, total in sorted(model_totals.items(), key=lambda item: item[1], reverse=True)
-        if total
+        {"model": model, **totals}
+        for model, totals in sorted(model_totals.items(), key=lambda item: item[1]["total_tokens"], reverse=True)
+        if totals["total_tokens"] or totals["total_with_cached_tokens"]
     ]
     return {
         "range": filters["range"],
