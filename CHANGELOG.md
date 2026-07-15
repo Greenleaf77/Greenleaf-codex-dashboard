@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.2.0 - 2026-07-15
+
+- Redesigned the dark interface as a warm graphite telemetry console while preserving all existing dashboard behavior.
+- Added responsive hero metrics, semantic accent colors, and compact daily sparklines derived from the existing usage payload.
+- Added billion-scale compact values in metric cards and chart axes while keeping full token counts in detailed tables.
+- Centered metric icons within their accent backplates across hero and secondary cards.
+- Kept `All time` as the default dashboard range and updated the README screenshot to include the heatmap and table rows.
+
 ## 1.1.0 - 2026-07-14
 
 - Added telemetry compatibility for Codex models in the `gpt-5.6-*` family.
