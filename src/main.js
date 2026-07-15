@@ -13,6 +13,10 @@ const tooltip = document.createElement("div");
 tooltip.className = "heat-tooltip";
 document.body.appendChild(tooltip);
 
+const providerOptions = [
+  { value: "codex", label: "CODEX" },
+  { value: "claude", label: "CLAUDE" }
+];
 const rangeOptions = [
   { value: "all", label: "All" },
   { value: "30d", label: "30d" },
@@ -59,7 +63,10 @@ const autoReviewModel = "codex-auto-review";
 const ignoreAutoReviewCookie = "ignore_codex_auto_review_v2";
 
 const initialState = readUrlState();
+let activeProvider = initialState.provider;
 let activeRange = initialState.range;
+let customRangePending = false;
+let customRangeOpen = false;
 let customStartDate = initialState.start;
 let customEndDate = initialState.end;
 let activeVisualization = initialState.visualization;
@@ -128,12 +135,37 @@ function normalizeChartCustomRange() {
   }
 }
 
+function positionCustomRangeDialog(dialog, anchor) {
+  const margin = 8;
+  const gap = 8;
+  const viewport = window.visualViewport;
+  const viewportLeft = viewport?.offsetLeft || 0;
+  const viewportTop = viewport?.offsetTop || 0;
+  const viewportWidth = viewport?.width || window.innerWidth;
+  const viewportHeight = viewport?.height || window.innerHeight;
+  const anchorRect = anchor.getBoundingClientRect();
+  const dialogRect = dialog.getBoundingClientRect();
+  const maxLeft = viewportLeft + viewportWidth - dialogRect.width - margin;
+  const maxTop = viewportTop + viewportHeight - dialogRect.height - margin;
+  let left = anchorRect.right - dialogRect.width;
+  let top = anchorRect.bottom + gap;
+
+  left = Math.max(viewportLeft + margin, Math.min(left, maxLeft));
+  if (top > maxTop) top = anchorRect.top - dialogRect.height - gap;
+  top = Math.max(viewportTop + margin, Math.min(top, maxTop));
+
+  dialog.style.left = `${left}px`;
+  dialog.style.top = `${top}px`;
+}
+
 function readUrlState() {
   const params = new URLSearchParams(window.location.search);
+  const provider = params.get("provider") || "codex";
   const range = params.get("range") || "all";
   const visualization = params.get("visualization") || "heatmap";
   const selectedChartRange = params.get("chart_range") || "30d";
   return {
+    provider: providerOptions.some((option) => option.value === provider) ? provider : "codex",
     range: rangeOptions.some((option) => option.value === range) ? range : "all",
     start: params.get("start") || "",
     end: params.get("end") || "",
@@ -170,8 +202,9 @@ function escapeHtml(value) {
 
 function buildQuery(rangeName, includeDiagnostics = false) {
   const params = new URLSearchParams();
+  params.set("provider", activeProvider);
   params.set("range", rangeName);
-  params.set("ignore_auto_review", ignoreAutoReview ? "1" : "0");
+  params.set("ignore_auto_review", activeProvider === "codex" && ignoreAutoReview ? "1" : "0");
   params.set("visualization", activeVisualization);
   params.set("chart_range", chartRange);
   params.set("cache", cacheMode);
@@ -474,7 +507,7 @@ function renderModelDetails(row) {
 }
 
 function diagnosticsKey(data) {
-  return [data.range, data.range_start || "", data.range_end || "", data.ignore_auto_review ? "1" : "0"].join("|");
+  return [data.provider || "codex", data.range, data.range_start || "", data.range_end || "", data.ignore_auto_review ? "1" : "0"].join("|");
 }
 
 function renderUsageTables(data) {
@@ -574,22 +607,24 @@ function renderDiagnosticsError(message) {
 }
 
 function renderTableView(data) {
+  const supportsDiagnostics = Boolean(data.supports_diagnostics);
+  if (!supportsDiagnostics) activeTableView = "usage";
   const key = diagnosticsKey(data);
   let workspace = renderUsageTables(data);
-  if (activeTableView === "diagnostics") {
+  if (supportsDiagnostics && activeTableView === "diagnostics") {
     if (diagnosticsCache.has(key)) workspace = renderDiagnostics(diagnosticsCache.get(key));
     else if (diagnosticsErrors.has(key)) workspace = renderDiagnosticsError(diagnosticsErrors.get(key));
     else workspace = renderDiagnosticsLoading();
   }
-  return `
+  const toolbar = supportsDiagnostics ? `
     <div class="table-view-toolbar">
       <nav class="segments" aria-label="Table view">
         <button class="seg ${activeTableView === "usage" ? "active" : ""}" type="button" data-table-view="usage" aria-pressed="${activeTableView === "usage"}">Usage</button>
         <button class="seg ${activeTableView === "diagnostics" ? "active" : ""}" type="button" data-table-view="diagnostics" aria-pressed="${activeTableView === "diagnostics"}">Diagnostics</button>
       </nav>
     </div>
-    <div id="table-workspace">${workspace}</div>
-  `;
+  ` : "";
+  return `${toolbar}<div id="table-workspace">${workspace}</div>`;
 }
 
 function clearDiagnosticsTimer() {
@@ -641,6 +676,7 @@ function bindTableView(data) {
 }
 
 async function ensureDiagnostics(data, force = false) {
+  if (!data.supports_diagnostics) return;
   const key = diagnosticsKey(data);
   if (!force && diagnosticsCache.has(key)) {
     if (activeTableView === "diagnostics") updateTableView(data);
@@ -714,46 +750,71 @@ function renderSparkline(values, label) {
 
 function render(data) {
   currentData = data;
+  const provider = data.provider || "codex";
+  const providerLabel = data.provider_label || (provider === "claude" ? "Claude" : "Codex");
   const totals = data.totals;
   const heat = heatmapCells(data.daily, data.range, data.range_start, data.range_end, cacheMode);
   const months = monthLabels(heat);
   const heatColumns = Math.max(1, Math.ceil(heat.length / 7));
+  const indexingNote = data.indexing
+    ? ` · ${full(data.indexing.events)} events from ${full(data.indexing.files)} JSONL files`
+    : "";
+  const rangeSummary = customRangePending ? "Choose custom range" : describeRange(data);
+  document.documentElement.dataset.provider = provider;
+  document.documentElement.classList.toggle("custom-range-modal-open", customRangeOpen);
+  document.title = `${providerLabel} Usage`;
 
   app.innerHTML = `
     <header class="app-header">
       <div class="brand-block">
-        <div class="brand-pill">
-          <span class="brand-mark">${icon("brand")}</span>
-          <h1>Codex Usage</h1>
-        </div>
-        <div class="brand-meta">
-          <span>Generated ${escapeHtml(data.generated_at)} from local Codex logs</span>
-          <strong>Showing ${escapeHtml(describeRange(data))}</strong>
+        <div class="brand-identity">
+          <div class="brand-pill">
+            <span class="brand-mark">${icon("brand")}</span>
+            <h1>${escapeHtml(providerLabel)} Usage</h1>
+          </div>
+          <div class="brand-meta">
+            <span>Generated ${escapeHtml(data.generated_at)} from local ${escapeHtml(providerLabel)} logs${indexingNote}</span>
+            <strong>Showing ${escapeHtml(rangeSummary)}</strong>
+          </div>
         </div>
       </div>
       <div class="header-tools">
-        <label class="toggle-option">
-          <input id="ignore-auto-review" type="checkbox" ${data.ignore_auto_review ? "checked" : ""}>
-          <span>Ignore "${escapeHtml(autoReviewModel)}" model</span>
-        </label>
-        <nav class="segments" aria-label="Range">
-          ${rangeOptions.map((range) => `<button class="seg ${data.range === range.value ? "active" : ""}" data-range="${range.value}">${range.label}</button>`).join("")}
-        </nav>
-        ${data.range === "custom" ? `
-          <form class="custom-range" id="custom-range-form">
-            <label>
-              <span>From</span>
-              <input id="custom-start" type="date" value="${escapeHtml(data.range_start || customStartDate)}">
-            </label>
-            <label>
-              <span>To</span>
-              <input id="custom-end" type="date" value="${escapeHtml(data.range_end || customEndDate)}">
-            </label>
-            <button class="custom-apply" type="submit">Apply</button>
-          </form>
+        <div class="header-filter-row">
+          <nav class="segments provider-switch" aria-label="Usage provider">
+            ${providerOptions.map((option) => `<button class="seg provider-option ${provider === option.value ? "active" : ""}" type="button" data-provider="${option.value}" aria-pressed="${provider === option.value}">${option.label}</button>`).join("")}
+          </nav>
+          <nav class="segments range-switch" aria-label="Range">
+            ${rangeOptions.map((range) => `<button class="seg ${activeRange === range.value ? "active" : ""}" type="button" data-range="${range.value}" ${range.value === "custom" ? `id="custom-range-trigger" aria-haspopup="dialog" aria-expanded="${customRangeOpen}"` : ""}>${range.label}</button>`).join("")}
+          </nav>
+        </div>
+        ${provider === "codex" ? `
+          <label class="toggle-option">
+            <input id="ignore-auto-review" type="checkbox" ${data.ignore_auto_review ? "checked" : ""}>
+            <span>Ignore "${escapeHtml(autoReviewModel)}" model</span>
+          </label>
         ` : ""}
       </div>
     </header>
+
+    ${customRangeOpen ? `
+      <dialog class="custom-range-dialog" id="custom-range-dialog" aria-labelledby="custom-range-title">
+        <form class="custom-range" id="custom-range-form">
+          <div class="custom-range-heading">
+            <strong id="custom-range-title">Custom range</strong>
+            <button class="custom-range-close" type="button" aria-label="Close custom range">×</button>
+          </div>
+          <label>
+            <span>From</span>
+            <input id="custom-start" type="date" value="${escapeHtml(customStartDate)}">
+          </label>
+          <label>
+            <span>To</span>
+            <input id="custom-end" type="date" value="${escapeHtml(customEndDate)}">
+          </label>
+          <button class="custom-apply" type="submit">Apply</button>
+        </form>
+      </dialog>
+    ` : ""}
 
     <div class="metric-hero-grid">
       ${metricCard({
@@ -761,7 +822,9 @@ function render(data) {
         value: compactNumber(totals.total_with_cached_tokens),
         iconName: "layers",
         tone: "violet",
-        note: `Cached ${compactNumber(totals.cached_input_tokens)} · Without cache ${compactNumber(totals.total_tokens)}`,
+        note: provider === "claude"
+          ? `Cache reads ${compactNumber(totals.cache_read_input_tokens)} · Cache writes ${compactNumber(totals.cache_creation_input_tokens)}`
+          : `Cached ${compactNumber(totals.cached_input_tokens)} · Without cache ${compactNumber(totals.total_tokens)}`,
         series: dailySeries(data, "total_with_cached_tokens"),
         hero: true
       })}
@@ -786,7 +849,7 @@ function render(data) {
       ${metricCard({ label: "Current streak", value: `${full(data.current_streak)}d`, iconName: "flame", tone: "coral" })}
       ${metricCard({ label: "Longest streak", value: `${full(data.longest_streak)}d`, iconName: "trophy", tone: "amber" })}
       ${metricCard({ label: "Peak day", value: escapeHtml(data.peak_day), iconName: "chart", tone: "green", note: data.peak_day_tokens ? `${compactNumber(data.peak_day_tokens)} tokens` : "", series: dailySeries(data, "total_tokens") })}
-      ${metricCard({ label: "Data source", value: "SQLite + JSONL", iconName: "database", tone: "violet" })}
+      ${metricCard({ label: "Data source", value: escapeHtml(data.data_source || "SQLite + JSONL"), iconName: "database", tone: "violet" })}
     </div>
 
     ${renderVisualizationPanel(data, heat, months, heatColumns)}
@@ -796,12 +859,35 @@ function render(data) {
   bindTableView(data);
   if (activeTableView === "diagnostics") ensureDiagnostics(data);
 
+  document.querySelectorAll("button[data-provider]").forEach((button) => {
+    button.addEventListener("click", () => {
+      customRangePending = false;
+      customRangeOpen = false;
+      activeRange = data.range;
+      activeProvider = button.dataset.provider;
+      activeTableView = "usage";
+      expandedModels.clear();
+      syncUrl();
+      refresh();
+    });
+  });
+
   document.querySelectorAll("[data-range]").forEach((button) => {
     button.addEventListener("click", () => {
-      activeRange = button.dataset.range;
-      if (activeRange === "custom") {
+      const nextRange = button.dataset.range;
+      if (nextRange === "custom") {
+        activeRange = "custom";
+        if (!isIsoDate(customStartDate)) customStartDate = data.range_start || todayKey();
+        if (!isIsoDate(customEndDate)) customEndDate = data.range_end || customStartDate;
         normalizeCustomRange();
+        customRangePending = data.range !== "custom";
+        customRangeOpen = true;
+        render(data);
+        return;
       }
+      customRangePending = false;
+      customRangeOpen = false;
+      activeRange = nextRange;
       syncUrl();
       refresh();
     });
@@ -849,14 +935,62 @@ function render(data) {
     });
   }
 
+  const customRangeDialog = document.querySelector("#custom-range-dialog");
+  const customRangeTrigger = document.querySelector("#custom-range-trigger");
   const customRangeForm = document.querySelector("#custom-range-form");
-  if (customRangeForm) {
+  if (customRangeDialog && customRangeTrigger && customRangeForm) {
+    let listenersAttached = true;
+    const repositionDialog = () => positionCustomRangeDialog(customRangeDialog, customRangeTrigger);
+    const removePositionListeners = () => {
+      if (!listenersAttached) return;
+      listenersAttached = false;
+      window.removeEventListener("resize", repositionDialog);
+      window.visualViewport?.removeEventListener("resize", repositionDialog);
+      window.visualViewport?.removeEventListener("scroll", repositionDialog);
+    };
+    const dismissDialog = () => {
+      removePositionListeners();
+      customRangeOpen = false;
+      document.documentElement.classList.remove("custom-range-modal-open");
+      if (customRangePending) {
+        activeRange = data.range;
+        customRangePending = false;
+      }
+      customRangeDialog.close();
+      render(data);
+    };
+
+    customRangeDialog.showModal();
+    repositionDialog();
+    customRangeDialog.classList.add("positioned");
+    document.querySelector("#custom-start")?.focus();
+    window.addEventListener("resize", repositionDialog);
+    window.visualViewport?.addEventListener("resize", repositionDialog);
+    window.visualViewport?.addEventListener("scroll", repositionDialog);
+    customRangeDialog.addEventListener("close", removePositionListeners, { once: true });
+    customRangeDialog.addEventListener("cancel", (event) => {
+      event.preventDefault();
+      dismissDialog();
+    });
+    customRangeDialog.addEventListener("click", (event) => {
+      if (event.target !== customRangeDialog) return;
+      const rect = customRangeDialog.getBoundingClientRect();
+      const inside = event.clientX >= rect.left && event.clientX <= rect.right
+        && event.clientY >= rect.top && event.clientY <= rect.bottom;
+      if (!inside) dismissDialog();
+    });
+    customRangeDialog.querySelector(".custom-range-close")?.addEventListener("click", dismissDialog);
     customRangeForm.addEventListener("submit", (event) => {
       event.preventDefault();
       customStartDate = document.querySelector("#custom-start")?.value || customStartDate;
       customEndDate = document.querySelector("#custom-end")?.value || customEndDate;
       normalizeCustomRange();
       activeRange = "custom";
+      customRangePending = false;
+      customRangeOpen = false;
+      removePositionListeners();
+      document.documentElement.classList.remove("custom-range-modal-open");
+      customRangeDialog.close();
       syncUrl();
       refresh();
     });
@@ -950,6 +1084,10 @@ async function refresh() {
     const data = await load(activeRange);
     diagnosticsCache.delete(diagnosticsKey(data));
     diagnosticsErrors.delete(diagnosticsKey(data));
+    activeProvider = data.provider || activeProvider;
+    activeRange = data.range || activeRange;
+    customRangePending = false;
+    customRangeOpen = false;
     ignoreAutoReview = Boolean(data.ignore_auto_review);
     if (data.range === "custom") {
       customStartDate = data.range_start || customStartDate;
@@ -963,7 +1101,10 @@ async function refresh() {
     render(data);
   } catch (error) {
     if (error.name === "AbortError") return;
-    app.innerHTML = `<section class="state error"><h1>Codex Usage</h1><p>Could not load usage data.</p><code>${escapeHtml(error.message)}</code></section>`;
+    customRangeOpen = false;
+    document.documentElement.classList.remove("custom-range-modal-open");
+    const providerLabel = activeProvider === "claude" ? "Claude" : "Codex";
+    app.innerHTML = `<section class="state error"><h1>${providerLabel} Usage</h1><p>Could not load usage data.</p><code>${escapeHtml(error.message)}</code></section>`;
   }
 }
 

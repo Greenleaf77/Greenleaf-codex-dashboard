@@ -1,14 +1,16 @@
-# Codex Usage Dashboard
+# Codex + Claude Usage Dashboard
 
-Local web dashboard for Codex usage statistics. It reads your local Codex state and rollout logs, then renders sessions, token usage, model breakdowns, a daily heatmap, and a stacked token chart by model.
+Local web dashboard for Codex and Claude Code usage statistics. Switch between providers to view sessions, token usage, model breakdowns, a daily heatmap, and a stacked token chart by model.
 
-This project is not affiliated with OpenAI.
+This project is not affiliated with OpenAI or Anthropic.
 
 ![Codex Usage Dashboard screenshot](docs/screenshot-v1.3.0.png)
 
 ## Features
 
 - Local-only dashboard served on `127.0.0.1`
+- `CODEX` / `CLAUDE` provider switch with one shared dashboard interface
+- Incremental Claude JSONL index that imports only new transcript data into a local SQLite database
 - Warm graphite telemetry-console interface with responsive hero metrics and compact daily sparklines
 - Billion-scale compact values in cards and charts while detailed tables preserve full token counts
 - Summary cards for sessions, token usage with and without cached input, API-equivalent cost estimate, active days, streaks, peak day, and favorite model
@@ -31,6 +33,13 @@ The dashboard reads:
 ```text
 ~/.codex/state_5.sqlite
 ~/.codex/sessions/**/rollout-*.jsonl
+~/.claude/projects/**/*.jsonl
+```
+
+Claude usage metadata is indexed locally into:
+
+```text
+~/.claude/usage-dashboard.sqlite
 ```
 
 It uses `state_5.sqlite` to discover Codex threads and rollout paths. Token counts are reconstructed from rollout telemetry in chronological order:
@@ -39,6 +48,12 @@ It uses `state_5.sqlite` to discover Codex threads and rollout paths. Token coun
 2. Otherwise, the dashboard uses component deltas from cumulative `token_count.info.total_token_usage` snapshots.
 
 Unchanged cumulative snapshots are treated as telemetry replays and add zero usage. Classification starts at the beginning of each selected rollout before date filters are applied, so a first dashboard launch or a limited date range still receives the correct cumulative baseline.
+
+### Claude Code indexing
+
+For Claude Code, the dashboard scans project and subagent JSONL transcripts for assistant records containing `message.model`, `message.usage`, `sessionId`, `timestamp`, and `uuid`. It stores usage metadata only; prompts, responses, tool inputs, working directories, and attachments are not copied into the SQLite index.
+
+Each source file has a persisted byte offset. Subsequent dashboard loads process only appended JSONL lines and newly discovered files. Event UUIDs are unique in SQLite, so repeated records do not inflate usage. Removed or truncated transcript files are reconciled on the next index pass.
 
 Displayed token accounting follows the same practical convention used by local usage tools:
 
@@ -50,7 +65,7 @@ Cached = cached_input_tokens
 Total = Input + Cached + Output
 ```
 
-The historical dashboard total is preserved as `Total w/o cached`. The `Total` column includes cached input so you can see the full token volume represented in local Codex logs.
+The historical dashboard total is preserved as `Total w/o cached`. The `Total` column includes cached input so you can see the full token volume represented in local logs. For Claude, `Cached` combines cache-creation and cache-read tokens; the top summary shows the two values separately.
 
 ### Codex 5.6 compatibility
 
@@ -66,15 +81,18 @@ The dashboard estimates API-equivalent USD cost from token counts. It uses the c
 https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json
 ```
 
-If the pricing file cannot be fetched, the dashboard falls back to bundled prices for known Codex models.
+If the pricing file cannot be fetched, the dashboard falls back to bundled prices for known Codex and Claude models.
 
 Cost accounting follows the same practical formula used by local usage tools:
 
 ```text
-Cost = Input * input price + Cached input * cache-read price + Output * output price
+Cost = Input * input price
+     + Cache creation * cache-write price
+     + Cache read * cache-read price
+     + Output * output price
 ```
 
-These values are estimates only. They are not your actual OpenAI subscription bill.
+These values are estimates only. They are not your actual OpenAI or Anthropic subscription bill.
 
 Because prices are fetched at dashboard load time, historical days are recalculated with the current price table. If a model's API price changes later, the estimated cost for older dates can change too.
 
@@ -91,9 +109,9 @@ Do not run this bound to a public interface unless you have reviewed the code an
 - macOS, Linux, or Windows
 - Node.js 20+
 - Python 3.10+
-- Local Codex logs in `~/.codex`
+- Local Codex logs in `~/.codex`, Claude Code logs in `~/.claude/projects`, or both
 
-On Windows, `~/.codex` resolves to `%USERPROFILE%\.codex`.
+On Windows, `~/.codex` and `~/.claude` resolve under `%USERPROFILE%`.
 
 The launcher and smoke-check try `python` first, then `python3`. You can also override the interpreter with the `PYTHON` environment variable.
 

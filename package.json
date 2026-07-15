@@ -1,6 +1,6 @@
 {
   "name": "codex-usage-dashboard",
-  "description": "Local dashboard for Codex usage statistics from ~/.codex logs.",
+  "description": "Local dashboard for Codex and Claude Code usage statistics from local logs.",
   "private": false,
   "version": "1.3.0",
   "license": "MIT",

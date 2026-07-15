@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Local Codex usage dashboard backed by ~/.codex/state_5.sqlite."""
+"""Local Codex and Claude Code usage dashboard."""
 
 from __future__ import annotations
 
@@ -14,8 +14,11 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
 
+from claude_usage import DEFAULT_CLAUDE_DB, DEFAULT_CLAUDE_PROJECTS, index_claude_usage, load_claude_events
+
 
 DEFAULT_DB = Path.home() / ".codex" / "state_5.sqlite"
+PROVIDERS = {"codex", "claude"}
 RANGES = {"all", "30d", "7d", "1d", "custom"}
 CHART_RANGES = {"all", "1y", "6m", "90d", "30d", "custom"}
 AUTO_REVIEW_MODEL = "codex-auto-review"
@@ -42,6 +45,36 @@ FALLBACK_PRICING = {
         "input_cost_per_token": 0.00000175,
         "cache_read_input_token_cost": 0.000000175,
         "output_cost_per_token": 0.000014,
+    },
+    "gpt-5.6-sol": {
+        "input_cost_per_token": 0.000005,
+        "cache_creation_input_token_cost": 0.00000625,
+        "cache_read_input_token_cost": 0.0000005,
+        "output_cost_per_token": 0.00003,
+    },
+    "claude-sonnet-5": {
+        "input_cost_per_token": 0.000002,
+        "cache_creation_input_token_cost": 0.0000025,
+        "cache_read_input_token_cost": 0.0000002,
+        "output_cost_per_token": 0.00001,
+    },
+    "claude-fable-5": {
+        "input_cost_per_token": 0.00001,
+        "cache_creation_input_token_cost": 0.0000125,
+        "cache_read_input_token_cost": 0.000001,
+        "output_cost_per_token": 0.00005,
+    },
+    "claude-opus-4-8": {
+        "input_cost_per_token": 0.000005,
+        "cache_creation_input_token_cost": 0.00000625,
+        "cache_read_input_token_cost": 0.0000005,
+        "output_cost_per_token": 0.000025,
+    },
+    "claude-sonnet-4-6": {
+        "input_cost_per_token": 0.000003,
+        "cache_creation_input_token_cost": 0.00000375,
+        "cache_read_input_token_cost": 0.0000003,
+        "output_cost_per_token": 0.000015,
     },
 }
 
@@ -79,6 +112,10 @@ def iso_from_unix(value: int | None) -> str:
 
 def day_from_iso_timestamp(value: str) -> str:
     return dt.datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone().date().isoformat()
+
+
+def normalize_provider(provider: str | None) -> str:
+    return provider if provider in PROVIDERS else "codex"
 
 
 def normalize_range(range_name: str | None) -> str:
@@ -159,11 +196,12 @@ def load_pricing() -> dict:
 
 
 def model_price_key(model: str, pricing_models: dict) -> str | None:
-    candidates = [
-        model,
-        model.replace("openai/", ""),
-        f"openai/{model}",
-    ]
+    base_model = model
+    for prefix in ("openai/", "anthropic/"):
+        if base_model.startswith(prefix):
+            base_model = base_model.removeprefix(prefix)
+            break
+    candidates = [model, base_model, f"openai/{base_model}", f"anthropic/{base_model}"]
     for candidate in candidates:
         if candidate in pricing_models:
             return candidate
@@ -183,13 +221,21 @@ def token_cost_usd(event: dict, pricing: dict) -> tuple[float, str | None]:
 
     model_price = price_source[price_key]
     input_price = float(model_price.get("input_cost_per_token") or 0)
-    cache_price = model_price.get("cache_read_input_token_cost")
-    if cache_price is None:
-        cache_price = input_price
+    cache_creation_price = model_price.get("cache_creation_input_token_cost")
+    if cache_creation_price is None:
+        cache_creation_price = input_price
+    cache_read_price = model_price.get("cache_read_input_token_cost")
+    if cache_read_price is None:
+        cache_read_price = input_price
     output_price = float(model_price.get("output_cost_per_token") or 0)
+    cache_creation_tokens = int(event.get("cache_creation_input_tokens") or 0)
+    cache_read_tokens = event.get("cache_read_input_tokens")
+    if cache_read_tokens is None:
+        cache_read_tokens = max(int(event["cached_input_tokens"]) - cache_creation_tokens, 0)
     cost = (
         event["input_tokens"] * input_price
-        + event["cached_input_tokens"] * float(cache_price)
+        + cache_creation_tokens * float(cache_creation_price)
+        + int(cache_read_tokens) * float(cache_read_price)
         + event["output_tokens"] * output_price
     )
     return cost, None
@@ -341,6 +387,8 @@ def usage_event(
         "classification": classification,
         "response_id": response_id,
         "input_tokens": billable_input_tokens,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": cached_input_tokens,
         "cached_input_tokens": cached_input_tokens,
         "raw_input_tokens": raw_input_tokens,
         "output_tokens": output_tokens,
@@ -733,12 +781,24 @@ def load_usage(
     chart_start_day: str | None = None,
     chart_end_day: str | None = None,
     include_diagnostics: bool = False,
+    provider: str = "codex",
+    claude_projects_path: Path = DEFAULT_CLAUDE_PROJECTS,
+    claude_db_path: Path = DEFAULT_CLAUDE_DB,
 ) -> dict:
+    provider = normalize_provider(provider)
+    if provider == "claude":
+        ignore_auto_review = False
+        include_diagnostics = False
     filters = resolve_range(range_name, start_day, end_day, ignore_auto_review)
     chart_filters = resolve_chart_range(chart_range, chart_start_day, chart_end_day, ignore_auto_review)
     start_timestamps = [filters["start_ts"], chart_filters["start_ts"]]
     scan_start_ts = None if any(value is None for value in start_timestamps) else min(int(value) for value in start_timestamps)
-    telemetry = scan_token_telemetry(db_path, scan_start_ts, ignore_auto_review)
+    indexing = None
+    if provider == "claude":
+        indexing = index_claude_usage(claude_projects_path, claude_db_path)
+        telemetry = {"usage_events": load_claude_events(claude_db_path, scan_start_ts), "token_events": []}
+    else:
+        telemetry = scan_token_telemetry(db_path, scan_start_ts, ignore_auto_review)
     events = filter_telemetry_events(telemetry["usage_events"], filters)
     chart_events = filter_telemetry_events(telemetry["usage_events"], chart_filters)
     diagnostic_token_records = filter_telemetry_events(telemetry["token_events"], filters)
@@ -762,6 +822,8 @@ def load_usage(
                 "day": day,
                 "sessions": set(),
                 "input_tokens": 0,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
                 "cached_input_tokens": 0,
                 "raw_input_tokens": 0,
                 "output_tokens": 0,
@@ -778,6 +840,8 @@ def load_usage(
                 "model": model,
                 "sessions": set(),
                 "input_tokens": 0,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
                 "cached_input_tokens": 0,
                 "raw_input_tokens": 0,
                 "output_tokens": 0,
@@ -795,6 +859,8 @@ def load_usage(
                 "day": day,
                 "sessions": set(),
                 "input_tokens": 0,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
                 "cached_input_tokens": 0,
                 "raw_input_tokens": 0,
                 "output_tokens": 0,
@@ -807,6 +873,8 @@ def load_usage(
         model_daily["sessions"].add(event["thread_id"])
         for key in (
             "input_tokens",
+            "cache_creation_input_tokens",
+            "cache_read_input_tokens",
             "cached_input_tokens",
             "raw_input_tokens",
             "output_tokens",
@@ -836,6 +904,8 @@ def load_usage(
     favorite = model_rows[0]["model"] if model_rows else "-"
     peak = max(day_rows, key=lambda row: row["total_tokens"], default=None)
     total_input = sum(row["input_tokens"] for row in day_rows)
+    total_cache_creation = sum(row["cache_creation_input_tokens"] for row in day_rows)
+    total_cache_read = sum(row["cache_read_input_tokens"] for row in day_rows)
     total_cached = sum(row["cached_input_tokens"] for row in day_rows)
     total_output = sum(row["output_tokens"] for row in day_rows)
     total_reasoning = sum(row["reasoning_output_tokens"] for row in day_rows)
@@ -843,7 +913,12 @@ def load_usage(
     total_with_cached = sum(row["total_with_cached_tokens"] for row in day_rows)
     total_cost = sum(row["cost_usd"] for row in day_rows)
 
+    provider_label = "Claude" if provider == "claude" else "Codex"
     result = {
+        "provider": provider,
+        "provider_label": provider_label,
+        "data_source": "Claude JSONL → SQLite" if provider == "claude" else "SQLite + JSONL",
+        "supports_diagnostics": provider == "codex",
         "range": filters["range"],
         "range_start": filters["start_day"],
         "range_end": filters["end_day"],
@@ -853,6 +928,8 @@ def load_usage(
             "sessions": len(thread_ids),
             "active_days": len(days),
             "input_tokens": total_input,
+            "cache_creation_input_tokens": total_cache_creation,
+            "cache_read_input_tokens": total_cache_read,
             "cached_input_tokens": total_cached,
             "output_tokens": total_output,
             "reasoning_output_tokens": total_reasoning,
@@ -876,6 +953,8 @@ def load_usage(
         "peak_day": peak["day"] if peak else "-",
         "peak_day_tokens": peak["total_tokens"] if peak else 0,
     }
+    if indexing is not None:
+        result["indexing"] = indexing
     if include_diagnostics:
         result["diagnostics"] = diagnostics_from_events(events, diagnostic_token_records)
     return result
@@ -926,6 +1005,8 @@ def heatmap_days(
 
 
 def render_dashboard(data: dict) -> str:
+    provider = data.get("provider", "codex")
+    provider_label = data.get("provider_label", "Codex")
     totals = data["totals"]
     daily_desc = list(reversed(data["daily"]))
     heat_cells = heatmap_days(data["daily"], data["range"], data.get("range_start"), data.get("range_end"))
@@ -944,14 +1025,14 @@ def render_dashboard(data: dict) -> str:
 
     def range_link(label: str, value: str) -> str:
         active = " active" if data["range"] == value else ""
-        return f'<a class="seg{active}" href="/?range={value}">{label}</a>'
+        return f'<a class="seg{active}" href="/?provider={provider}&range={value}">{label}</a>'
 
     day_rows = "\n".join(
         f"""
         <tr>
           <td>{html.escape(row["day"])}</td>
           <td>All</td>
-          <td>Codex</td>
+          <td>{html.escape(str(provider_label))}</td>
           <td class="num">{fmt_int(row["input_tokens"])}</td>
           <td class="num">{fmt_int(row["output_tokens"])}</td>
           <td class="num">{fmt_int(row["total_tokens"])}</td>
@@ -997,7 +1078,7 @@ def render_dashboard(data: dict) -> str:
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Codex Usage Dashboard</title>
+  <title>{html.escape(str(provider_label))} Usage Dashboard</title>
   <style>
     :root {{
       color-scheme: dark;
@@ -1197,8 +1278,8 @@ def render_dashboard(data: dict) -> str:
   <main>
     <header>
       <div>
-        <h1>Codex Usage</h1>
-        <div class="subtle">Generated {html.escape(data["generated_at"])} from ~/.codex/state_5.sqlite · <a href="/data.json?range={html.escape(data["range"])}">aggregate JSON</a></div>
+        <h1>{html.escape(str(provider_label))} Usage</h1>
+        <div class="subtle">Generated {html.escape(data["generated_at"])} from {html.escape(str(data.get("data_source", "local logs")))} · <a href="/data.json?provider={provider}&range={html.escape(data["range"])}">aggregate JSON</a></div>
         <div class="subtle">Showing {html.escape(range_summary)}</div>
       </div>
       <nav class="segments" aria-label="Range">
@@ -1312,6 +1393,8 @@ def render_error_page(message: str, db_path: Path) -> str:
 
 class DashboardHandler(BaseHTTPRequestHandler):
     db_path: Path = DEFAULT_DB
+    claude_projects_path: Path = DEFAULT_CLAUDE_PROJECTS
+    claude_db_path: Path = DEFAULT_CLAUDE_DB
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
@@ -1329,12 +1412,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def filters_from_query(self, query_string: str) -> dict[str, str | int | bool | None]:
         query = parse_qs(query_string)
+        provider = normalize_provider(query.get("provider", ["codex"])[0])
         filters = resolve_range(
             query.get("range", ["all"])[0],
             query.get("start", [None])[0],
             query.get("end", [None])[0],
-            parse_bool_flag(query.get("ignore_auto_review", [None])[0], default=False),
+            parse_bool_flag(query.get("ignore_auto_review", [None])[0], default=False) if provider == "codex" else False,
         )
+        filters["provider"] = provider
         chart_filters = resolve_chart_range(
             query.get("chart_range", ["30d"])[0],
             query.get("chart_start", [None])[0],
@@ -1344,7 +1429,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
         filters["chart_range"] = chart_filters["range"]
         filters["chart_start_day"] = chart_filters["start_day"]
         filters["chart_end_day"] = chart_filters["end_day"]
-        filters["include_diagnostics"] = parse_bool_flag(query.get("include_diagnostics", [None])[0], default=False)
+        filters["include_diagnostics"] = provider == "codex" and parse_bool_flag(
+            query.get("include_diagnostics", [None])[0], default=False
+        )
         return filters
 
     def send_body(self, status: int, content_type: str, body: bytes) -> None:
@@ -1368,11 +1455,15 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 filters["chart_start_day"],
                 filters["chart_end_day"],
                 bool(filters["include_diagnostics"]),
+                provider=str(filters["provider"]),
+                claude_projects_path=self.claude_projects_path,
+                claude_db_path=self.claude_db_path,
             )
             body = render_dashboard(data).encode("utf-8")
             self.send_body(200, "text/html; charset=utf-8", body)
         except Exception as exc:  # noqa: BLE001
-            body = render_error_page(str(exc), self.db_path).encode("utf-8")
+            source_path = self.claude_projects_path if filters["provider"] == "claude" else self.db_path
+            body = render_error_page(str(exc), source_path).encode("utf-8")
             self.send_body(503, "text/html; charset=utf-8", body)
 
     def serve_json(self, query_string: str) -> None:
@@ -1388,11 +1479,17 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 filters["chart_start_day"],
                 filters["chart_end_day"],
                 bool(filters["include_diagnostics"]),
+                provider=str(filters["provider"]),
+                claude_projects_path=self.claude_projects_path,
+                claude_db_path=self.claude_db_path,
             )
             status = 200
         except Exception as exc:  # noqa: BLE001
+            provider_label = "Claude" if filters["provider"] == "claude" else "Codex"
             payload = {
-                "error": "Could not read Codex usage data.",
+                "error": f"Could not read {provider_label} usage data.",
+                "provider": filters["provider"],
+                "provider_label": provider_label,
                 "range": filters["range"],
                 "range_start": filters["start_day"],
                 "range_end": filters["end_day"],
@@ -1483,21 +1580,35 @@ def run_check(db_path: Path) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Serve a local Codex usage dashboard.")
+    parser = argparse.ArgumentParser(description="Serve a local Codex and Claude usage dashboard.")
     parser.add_argument("--db", type=Path, default=Path(os.environ.get("CODEX_USAGE_DB", DEFAULT_DB)))
+    parser.add_argument(
+        "--claude-projects",
+        type=Path,
+        default=Path(os.environ.get("CLAUDE_PROJECTS_DIR", DEFAULT_CLAUDE_PROJECTS)),
+    )
+    parser.add_argument(
+        "--claude-db",
+        type=Path,
+        default=Path(os.environ.get("CLAUDE_USAGE_DB", DEFAULT_CLAUDE_DB)),
+    )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--check", action="store_true", help="Render all ranges once and exit.")
     args = parser.parse_args()
 
     DashboardHandler.db_path = args.db.expanduser()
+    DashboardHandler.claude_projects_path = args.claude_projects.expanduser()
+    DashboardHandler.claude_db_path = args.claude_db.expanduser()
     if args.check:
         run_check(DashboardHandler.db_path)
         return
 
     server = ThreadingHTTPServer((args.host, args.port), DashboardHandler)
-    print(f"Codex usage dashboard: http://{args.host}:{args.port}")
-    print(f"Data source: {DashboardHandler.db_path}")
+    print(f"Codex + Claude usage dashboard: http://{args.host}:{args.port}")
+    print(f"Codex source: {DashboardHandler.db_path}")
+    print(f"Claude source: {DashboardHandler.claude_projects_path}")
+    print(f"Claude index: {DashboardHandler.claude_db_path}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
