@@ -6,6 +6,7 @@
 - Kept additional Codex paths privacy-safe by storing only opaque checkpoint identifiers in Unibase.
 - Restored an independent visualization range for Daily Heatmap and Tokens over time without changing the Usage tables.
 - Updated Tokens over time buckets to daily through 90 days, weekly through six calendar months, and monthly for longer ranges.
+- Fixed Tokens over time to use a true linear height scale without inflating small bars or model segments.
 - Made the first Usage snapshot wait for the active startup import so the All scope is complete immediately.
 
 ## 2.0.0 - 2026-07-16

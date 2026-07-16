@@ -1,5 +1,6 @@
 import "./styles.css";
 import { compactNumber } from "./format.js";
+import { chartHeightPercent } from "./chart-scale.js";
 import { normalizeProvider, providerOptions } from "./provider-state.js";
 import { paginateRows, truncateModelName, USAGE_TABLE_PAGE_SIZE } from "./usage-table.js";
 import {
@@ -464,13 +465,13 @@ function chartBarSizing(granularity, count) {
 
 function renderChartBar(day, models, maxTokens, index, labelEvery, dayCount, accountingMode) {
   const tokens = metricValue(day, accountingMode);
-  const height = tokens ? Math.max(2, (tokens / maxTokens) * 100) : 0;
+  const height = chartHeightPercent(tokens, maxTokens);
   const label = index % labelEvery === 0 || index === dayCount - 1 ? dayLabel(day.label, day.day) : "";
   const title = day.bucket_start && day.bucket_end && day.bucket_start !== day.bucket_end ? `${day.bucket_start} - ${day.bucket_end}` : day.day;
   const accountingLabel = accountingMode === WITH_CACHE ? "with cache" : "without cache";
   return `
-    <div class="bar-slot">
-      <div class="stacked-bar ${tokens ? "" : "empty"}" style="height: ${height}%" data-tooltip-title="${escapeHtml(title)}" data-tooltip-body="${full(tokens)} tokens ${accountingLabel}">
+    <div class="bar-slot" data-tooltip-title="${escapeHtml(title)}" data-tooltip-body="${full(tokens)} tokens ${accountingLabel}">
+      <div class="stacked-bar ${tokens ? "" : "empty"}" style="height: ${height}%">
         ${(day.models || []).map((item) => {
           const itemTokens = metricValue(item, accountingMode);
           const segmentHeight = tokens ? (itemTokens / tokens) * 100 : 0;
@@ -921,10 +922,10 @@ function bindTableView(data) {
     cell.addEventListener("mouseleave", hideHeatTooltip);
   });
 
-  document.querySelectorAll(".stacked-bar, .bar-segment").forEach((item) => {
+  document.querySelectorAll(".bar-slot, .bar-segment").forEach((item) => {
     item.addEventListener("mouseenter", showChartTooltip);
     item.addEventListener("mousemove", positionHeatTooltip);
-    item.addEventListener("mouseleave", hideHeatTooltip);
+    item.addEventListener("mouseleave", handleChartTooltipLeave);
   });
 
   const retry = document.querySelector(".diagnostics-retry");
@@ -1715,10 +1716,22 @@ function showHeatTooltip(event) {
 }
 
 function showChartTooltip(event) {
-  const target = event.currentTarget;
+  showChartTooltipFor(event.currentTarget, event);
+}
+
+function showChartTooltipFor(target, event) {
   tooltip.innerHTML = `${escapeHtml(target.dataset.tooltipTitle)}<br><strong>${target.dataset.tooltipBody}</strong>`;
   tooltip.classList.add("visible");
   positionHeatTooltip(event);
+}
+
+function handleChartTooltipLeave(event) {
+  const slot = event.currentTarget.closest(".bar-slot");
+  if (event.currentTarget.classList.contains("bar-segment") && slot?.contains(event.relatedTarget)) {
+    showChartTooltipFor(slot, event);
+    return;
+  }
+  hideHeatTooltip();
 }
 
 function positionHeatTooltip(event) {

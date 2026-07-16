@@ -487,7 +487,6 @@ h2.section-title {
   align-self: end;
   justify-self: center;
   width: min(var(--bar-fill), var(--bar-max));
-  min-height: 2px;
   overflow: hidden;
   border-radius: 4px 4px 0 0;
   background: var(--surface-2);
@@ -496,10 +495,6 @@ h2.section-title {
 .stacked-bar.empty {
   min-height: 0;
   background: transparent;
-}
-
-.bar-segment {
-  min-height: 1px;
 }
 
 .bar-label {
