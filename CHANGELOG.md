@@ -1,5 +1,18 @@
 # Changelog
 
+## 2.1.0 - 2026-07-16
+
+- Added automatic Codex discovery for valid rollout paths registered in `state_5.sqlite`, including sessions outside the default `~/.codex` root.
+- Kept additional Codex paths privacy-safe by storing only opaque checkpoint identifiers in Unibase.
+- Restored an independent visualization range for Daily Heatmap and Tokens over time without changing the Usage tables.
+- Updated Tokens over time buckets to daily through 90 days, weekly through six calendar months, and monthly for longer ranges.
+- Fixed Tokens over time to use a true linear height scale without inflating small bars or model segments.
+- Fit every chart bucket into the visible panel so recent peaks are not hidden behind horizontal scrolling.
+- Collapsed identical OpenCode model rows across native providers and endpoints while preserving provider-level separation.
+- Kept Full reindex progress inside the Unibase settings section at desktop and mobile widths.
+- Gave Daily Heatmap an All-time default while Tokens over time retains a separate 30-day default.
+- Made the first Usage snapshot wait for the active startup import so the All scope is complete immediately.
+
 ## 2.0.0 - 2026-07-16
 
 - Renamed the product to MeterMesh and introduced the app-owned Unibase SQLite index.

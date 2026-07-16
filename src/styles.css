@@ -331,6 +331,16 @@ h2.section-title {
   gap: 8px;
 }
 
+.chart-filter {
+  display: grid;
+  justify-items: end;
+  gap: 8px;
+}
+
+.chart-custom-range {
+  padding: 8px;
+}
+
 .viz-tabs {
   justify-content: flex-end;
 }
@@ -423,7 +433,6 @@ h2.section-title {
 .bar-chart {
   position: relative;
   height: 320px;
-  min-width: max(100%, calc(var(--bar-count) * (var(--bar-width) + var(--bar-gap))));
   padding: 0 4px 20px;
 }
 
@@ -444,7 +453,7 @@ h2.section-title {
   position: absolute;
   inset: 0 4px 20px;
   display: grid;
-  grid-template-columns: repeat(var(--bar-count), minmax(var(--bar-width), 1fr));
+  grid-template-columns: repeat(var(--bar-count), minmax(0, 1fr));
   gap: var(--bar-gap);
   pointer-events: none;
 }
@@ -457,17 +466,19 @@ h2.section-title {
   position: relative;
   z-index: 1;
   display: grid;
-  grid-template-columns: repeat(var(--bar-count), minmax(var(--bar-width), 1fr));
+  grid-template-columns: repeat(var(--bar-count), minmax(0, 1fr));
   gap: var(--bar-gap);
   align-items: end;
-  height: 300px;
+  height: 320px;
+  overflow: clip;
 }
 
 .bar-slot {
+  position: relative;
   display: grid;
   grid-template-rows: 300px 20px;
   align-items: end;
-  min-width: var(--bar-width);
+  min-width: 0;
   height: 320px;
 }
 
@@ -477,7 +488,6 @@ h2.section-title {
   align-self: end;
   justify-self: center;
   width: min(var(--bar-fill), var(--bar-max));
-  min-height: 2px;
   overflow: hidden;
   border-radius: 4px 4px 0 0;
   background: var(--surface-2);
@@ -488,17 +498,31 @@ h2.section-title {
   background: transparent;
 }
 
-.bar-segment {
-  min-height: 1px;
-}
-
 .bar-label {
+  width: 100%;
+  min-width: 0;
   padding-top: 5px;
   color: var(--text-tertiary);
   font-size: 10px;
   line-height: 1.2;
   text-align: center;
   white-space: nowrap;
+}
+
+.bar-slot:first-child .bar-label {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  width: max-content;
+  text-align: left;
+}
+
+.bar-slot:last-child .bar-label {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  width: max-content;
+  text-align: right;
 }
 
 .chart-legend {
@@ -1087,6 +1111,10 @@ h2.section-title {
   gap: 18px;
 }
 
+.unibase-settings {
+  flex-wrap: wrap;
+}
+
 .settings-header h2,
 .confirm-dialog h2 {
   margin: 3px 0 0;
@@ -1240,6 +1268,8 @@ button:disabled {
 
 .operation-progress {
   flex: 1 0 100%;
+  width: 100%;
+  min-width: 0;
   display: grid;
   gap: 7px;
   margin-top: 10px;
@@ -1253,8 +1283,16 @@ button:disabled {
 }
 
 .operation-progress progress {
+  display: block;
   width: 100%;
+  max-width: 100%;
   accent-color: var(--lime);
+}
+
+.operation-progress code {
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  white-space: normal;
 }
 
 .confirm-dialog form {
@@ -2076,6 +2114,10 @@ tbody tr:hover td {
     justify-content: flex-start;
   }
 
+  .chart-filter {
+    justify-items: start;
+  }
+
   .viz-tabs {
     justify-content: flex-start;
   }
@@ -2241,6 +2283,15 @@ tbody tr:hover td {
 
   .custom-range {
     justify-content: stretch;
+  }
+
+  .chart-filter,
+  .chart-range-tabs {
+    width: 100%;
+  }
+
+  .chart-range-tabs .seg {
+    flex: 1;
   }
 
   .custom-range label,
