@@ -9,6 +9,8 @@
 - Fixed Tokens over time to use a true linear height scale without inflating small bars or model segments.
 - Fit every chart bucket into the visible panel so recent peaks are not hidden behind horizontal scrolling.
 - Collapsed identical OpenCode model rows across native providers and endpoints while preserving provider-level separation.
+- Kept Full reindex progress inside the Unibase settings section at desktop and mobile widths.
+- Gave Daily Heatmap an All-time default while Tokens over time retains a separate 30-day default.
 - Made the first Usage snapshot wait for the active startup import so the All scope is complete immediately.
 
 ## 2.0.0 - 2026-07-16

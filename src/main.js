@@ -39,6 +39,7 @@ const visualizationOptions = [
   { value: "heatmap", label: "Daily heatmap" },
   { value: "tokens", label: "Tokens over time" }
 ];
+const chartRangeDefaults = { heatmap: "all", tokens: "30d" };
 const accountingOptions = [
   { value: WITH_CACHE, label: "With cache" },
   { value: WITHOUT_CACHE, label: "Without cache" }
@@ -84,6 +85,15 @@ let customRangeOpen = false;
 let customStartDate = initialState.start;
 let customEndDate = initialState.end;
 let activeChartRange = initialState.chartRange;
+const chartStateByVisualization = {
+  heatmap: { range: chartRangeDefaults.heatmap, start: "", end: "" },
+  tokens: { range: chartRangeDefaults.tokens, start: "", end: "" },
+  [initialState.visualization]: {
+    range: initialState.chartRange,
+    start: initialState.chartStart,
+    end: initialState.chartEnd
+  }
+};
 let chartStartDate = initialState.chartStart;
 let chartEndDate = initialState.chartEnd;
 let activeVisualization = initialState.visualization;
@@ -187,6 +197,21 @@ function normalizeChartCustomRange() {
   }
 }
 
+function saveActiveChartState() {
+  chartStateByVisualization[activeVisualization] = {
+    range: activeChartRange,
+    start: chartStartDate,
+    end: chartEndDate
+  };
+}
+
+function restoreChartState(visualization) {
+  const state = chartStateByVisualization[visualization];
+  activeChartRange = state.range;
+  chartStartDate = state.start;
+  chartEndDate = state.end;
+}
+
 function positionCustomRangeDialog(dialog, anchor) {
   const margin = 8;
   const gap = 8;
@@ -214,18 +239,21 @@ function readUrlState() {
   const params = new URLSearchParams(window.location.search);
   const provider = params.get("provider") || "all";
   const range = params.get("range") || "all";
-  const chartRange = params.get("chart_range") || "30d";
   const visualization = params.get("visualization") || "heatmap";
+  const normalizedVisualization = visualizationOptions.some((option) => option.value === visualization) ? visualization : "heatmap";
+  const chartRange = params.get("chart_range") || chartRangeDefaults[normalizedVisualization];
   const selectedPageSize = Number.parseInt(params.get("page_size") || "25", 10);
   return {
     provider: normalizeProvider(provider),
     range: rangeOptions.some((option) => option.value === range) ? range : "all",
     start: params.get("start") || "",
     end: params.get("end") || "",
-    chartRange: chartRangeOptions.some((option) => option.value === chartRange) ? chartRange : "30d",
+    chartRange: chartRangeOptions.some((option) => option.value === chartRange)
+      ? chartRange
+      : chartRangeDefaults[normalizedVisualization],
     chartStart: params.get("chart_start") || "",
     chartEnd: params.get("chart_end") || "",
-    visualization: visualizationOptions.some((option) => option.value === visualization) ? visualization : "heatmap",
+    visualization: normalizedVisualization,
     cacheMode: resolveCacheMode(params.get("cache")),
     ignoreAutoReview: params.get("ignore_auto_review"),
     view: ["usage", "diagnostics", "requests"].includes(params.get("view")) ? params.get("view") : "usage",
@@ -863,9 +891,17 @@ function bindTableView(data) {
 
   document.querySelectorAll("[data-visualization]").forEach((button) => {
     button.addEventListener("click", () => {
-      activeVisualization = button.dataset.visualization;
+      const nextVisualization = button.dataset.visualization;
+      if (nextVisualization === activeVisualization) return;
+      saveActiveChartState();
+      activeVisualization = nextVisualization;
+      restoreChartState(activeVisualization);
+      const canReuseChart = data.chart?.range === activeChartRange
+        && (activeChartRange !== "custom"
+          || (data.chart.range_start === chartStartDate && data.chart.range_end === chartEndDate));
       syncUrl();
-      render(data);
+      if (canReuseChart) render(data);
+      else refresh();
     });
   });
 
@@ -876,9 +912,11 @@ function bindTableView(data) {
         chartStartDate = isIsoDate(chartStartDate) ? chartStartDate : data.chart.range_start || todayKey();
         chartEndDate = isIsoDate(chartEndDate) ? chartEndDate : data.chart.range_end || chartStartDate;
         normalizeChartCustomRange();
+        saveActiveChartState();
         render(data);
         return;
       }
+      saveActiveChartState();
       syncUrl();
       refresh();
     });
@@ -891,6 +929,7 @@ function bindTableView(data) {
     chartEndDate = String(form.get("chart_end") || "");
     normalizeChartCustomRange();
     activeChartRange = "custom";
+    saveActiveChartState();
     syncUrl();
     refresh();
   });
@@ -1073,7 +1112,7 @@ function renderSettingsDialog() {
             <button id="full-reindex" type="button" ${dirty || operationRunning ? "disabled" : ""}>Full reindex</button>
             <button id="reset-unibase" class="danger" type="button" ${dirty || operationRunning ? "disabled" : ""}>Reset Unibase</button>
           </div>
-          ${operation ? `<div class="operation-progress"><div><strong>${escapeHtml(operation.kind)}</strong><span>${escapeHtml(operation.state)}</span></div><progress max="${Math.max(operation.progress_total, 1)}" value="${operation.progress_current}"></progress>${operation.error ? `<code>${escapeHtml(operation.error)}</code>` : ""}</div>` : ""}
+          ${operation ? `<div class="operation-progress" role="status" aria-live="polite"><div><strong>${escapeHtml(operation.kind)}</strong><span>${escapeHtml(operation.state)}</span></div><progress aria-label="${escapeHtml(operation.kind)} progress" max="${Math.max(operation.progress_total, 1)}" value="${operation.progress_current}"></progress>${operation.error ? `<code>${escapeHtml(operation.error)}</code>` : ""}</div>` : ""}
         </section>
         <div class="settings-actions">
           <button class="settings-cancel" type="button">Cancel</button>
@@ -1763,6 +1802,7 @@ async function refresh() {
       chartStartDate = data.chart.range_start || chartStartDate;
       chartEndDate = data.chart.range_end || chartEndDate;
     }
+    saveActiveChartState();
     render(data);
   } catch (error) {
     if (error.name === "AbortError") return;
@@ -1779,6 +1819,7 @@ if (activeRange === "custom") {
 if (activeChartRange === "custom") {
   normalizeChartCustomRange();
 }
+saveActiveChartState();
 
 syncUrl();
 refresh();

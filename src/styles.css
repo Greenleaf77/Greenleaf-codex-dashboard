@@ -1111,6 +1111,10 @@ h2.section-title {
   gap: 18px;
 }
 
+.unibase-settings {
+  flex-wrap: wrap;
+}
+
 .settings-header h2,
 .confirm-dialog h2 {
   margin: 3px 0 0;
@@ -1264,6 +1268,8 @@ button:disabled {
 
 .operation-progress {
   flex: 1 0 100%;
+  width: 100%;
+  min-width: 0;
   display: grid;
   gap: 7px;
   margin-top: 10px;
@@ -1277,8 +1283,16 @@ button:disabled {
 }
 
 .operation-progress progress {
+  display: block;
   width: 100%;
+  max-width: 100%;
   accent-color: var(--lime);
+}
+
+.operation-progress code {
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  white-space: normal;
 }
 
 .confirm-dialog form {
