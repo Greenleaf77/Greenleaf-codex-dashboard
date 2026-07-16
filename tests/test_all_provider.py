@@ -9,6 +9,7 @@ import unibase
 
 class AllProviderTests(unittest.TestCase):
     def setUp(self):
+        dashboard_api.USAGE_RESPONSE_CACHE.clear()
         self.temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp_dir.cleanup)
         self.path = Path(self.temp_dir.name) / "unibase.sqlite3"
@@ -160,7 +161,7 @@ class AllProviderTests(unittest.TestCase):
             payload = handler.usage_payload(filters)
         self.assertEqual(payload["provider"], "all")
 
-    def test_production_usage_payload_waits_for_refresh_before_reading(self):
+    def test_production_usage_payload_reads_committed_generation_without_waiting(self):
         handler = object.__new__(dashboard_api.DashboardHandler)
         handler.unibase_path = self.path
         source_root = Path(self.temp_dir.name) / "sources"
@@ -169,20 +170,29 @@ class AllProviderTests(unittest.TestCase):
         handler.opencode_db_path = source_root / "opencode" / "opencode.db"
         filters = handler.filters_from_query("provider=all&range=all&chart_range=all")
         with patch.object(dashboard_api, "schedule_enabled_sources_refresh") as refresh, patch.object(
-            dashboard_api, "wait_for_source_refresh", return_value=True
-        ) as wait, patch.object(
             dashboard_api, "load_pricing", return_value=self.pricing
         ):
-            handler.usage_payload(filters)
-        refresh.assert_called_once_with(
-            self.path,
-            handler.opencode_db_path,
-            codex_root=handler.db_path.parent,
-            codex_state_db=handler.db_path,
-            claude_root=handler.claude_projects_path.parent,
-            reason="usage request",
-        )
-        wait.assert_called_once_with()
+            payload = handler.usage_payload(filters)
+        refresh.assert_not_called()
+        self.assertEqual(payload["sync"]["state"], "idle")
+
+    def test_production_usage_payload_reuses_generation_cache(self):
+        handler = object.__new__(dashboard_api.DashboardHandler)
+        handler.unibase_path = self.path
+        source_root = Path(self.temp_dir.name) / "sources"
+        handler.db_path = source_root / ".codex" / "state_5.sqlite"
+        handler.claude_projects_path = source_root / ".claude" / "projects"
+        handler.opencode_db_path = source_root / "opencode" / "opencode.db"
+        filters = handler.filters_from_query("provider=all&range=all&chart_range=all")
+
+        with patch.object(dashboard_api, "load_pricing", return_value=self.pricing), patch.object(
+            dashboard_api, "load_unibase_usage", wraps=dashboard_api.load_unibase_usage
+        ) as load_usage:
+            first = handler.usage_payload(filters)
+            second = handler.usage_payload(filters)
+
+        self.assertEqual(first["generation"], second["generation"])
+        self.assertEqual(load_usage.call_count, 1)
 
     def test_cache_alias_does_not_double_count(self):
         data = self.load("all")

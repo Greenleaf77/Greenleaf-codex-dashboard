@@ -118,6 +118,29 @@ class UnibaseFoundationTests(unittest.TestCase):
         self.db.set_source_enabled("live", True)
         self.assertEqual(len(self.db.active_event_rows()), 1)
 
+    def test_incremental_projection_updates_only_dirty_event_keys(self):
+        self.db.register_source(unibase.DiscoveredSource(
+            "live", "codex", "live", self.root, "live", "live",
+            True, 1000, None, None, "ready",
+        ))
+        for index in (1, 2):
+            self.db.add_event("live", None, {
+                "provider": "codex", "event_key": f"event-{index}", "stream_key": f"stream-{index}",
+                "timestamp_utc": "2026-07-16T12:00:00Z", "occurred_at": 1784203200 + index,
+                "model": "gpt-test", "native_provider_id": "openai", "semantics": "exact",
+                "classification": "usage_update", "input_tokens": index, "cache_read_tokens": 0,
+                "cache_write_tokens": 0, "output_tokens": 1, "reasoning_tokens": 0,
+                "cost_usd": None, "cost_kind": "unavailable",
+            }, 1)
+        first_generation = self.db.rebuild_active_events()
+
+        second_generation = self.db.rebuild_active_events({("codex", "event-1")})
+        rows = {row["event_key"]: row for row in self.db.active_event_rows("codex")}
+
+        self.assertGreater(second_generation, first_generation)
+        self.assertEqual(rows["event-1"]["generation"], second_generation)
+        self.assertEqual(rows["event-2"]["generation"], first_generation)
+
     def test_failed_atomic_file_replacement_keeps_previous_occurrence(self):
         self.db.register_source(unibase.DiscoveredSource(
             "backup", "claude", "normalized_backup", self.root, "backup", "backup",

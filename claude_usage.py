@@ -228,6 +228,7 @@ def import_claude_source(unibase: Unibase, source: dict) -> dict[str, int]:
     scanned_files = 0
     processed_records = 0
     seen_paths: list[str] = []
+    dirty_event_keys: set[tuple[str, str]] = set()
     base = root if root.name == "projects" else root / "projects"
     try:
         for path in files:
@@ -281,9 +282,13 @@ def import_claude_source(unibase: Unibase, source: dict) -> dict[str, int]:
                             processed_records += 1
                     final_offset = handle.tell()
                 if replaced:
-                    unibase.replace_source_file_events(source_id, source_file_id, parsed_events, scan_generation)
+                    dirty_event_keys.update(
+                        unibase.replace_source_file_events(source_id, source_file_id, parsed_events, scan_generation)
+                    )
                 else:
-                    unibase.add_events(source_id, source_file_id, parsed_events, scan_generation)
+                    dirty_event_keys.update(
+                        unibase.add_events(source_id, source_file_id, parsed_events, scan_generation)
+                    )
             final_stat = path.stat()
             content_hash = _prefix_hash(path, final_offset)
             unibase.upsert_source_file(
@@ -301,7 +306,8 @@ def import_claude_source(unibase: Unibase, source: dict) -> dict[str, int]:
             source_id,
             scan_generation,
             seen_paths,
-            rebuild_active=scanned_files > 0,
+            rebuild_active=False,
+            dirty_event_keys=dirty_event_keys,
         )
     except Exception as exc:
         unibase.mark_source_error(source_id, sanitize_error(exc) or "Claude import failed")

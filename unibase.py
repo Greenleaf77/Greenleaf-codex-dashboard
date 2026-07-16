@@ -830,11 +830,13 @@ class Unibase:
         source_file_id: int | None,
         events: Iterable[dict],
         scan_generation: int,
-    ) -> None:
+    ) -> set[tuple[str, str]]:
+        event_list = list(events)
         with self.connect() as conn:
             conn.execute("begin immediate")
-            for event in events:
+            for event in event_list:
                 self._add_event_conn(conn, source_id, source_file_id, event, scan_generation)
+        return {(str(event["provider"]), str(event["event_key"])) for event in event_list}
 
     def replace_source_file_events(
         self,
@@ -842,12 +844,25 @@ class Unibase:
         source_file_id: int,
         events: Iterable[dict],
         scan_generation: int,
-    ) -> None:
+    ) -> set[tuple[str, str]]:
+        event_list = list(events)
         with self.connect() as conn:
             conn.execute("begin immediate")
+            previous = conn.execute(
+                """
+                select distinct ev.provider, ev.event_key
+                from event_occurrences eo
+                join event_variants ev on ev.event_variant_id = eo.event_variant_id
+                where eo.source_id = ? and eo.source_file_id = ?
+                """,
+                (source_id, source_file_id),
+            ).fetchall()
             conn.execute("delete from event_occurrences where source_id = ? and source_file_id = ?", (source_id, source_file_id))
-            for event in events:
+            for event in event_list:
                 self._add_event_conn(conn, source_id, source_file_id, event, scan_generation)
+        dirty = {(str(row["provider"]), str(row["event_key"])) for row in previous}
+        dirty.update((str(event["provider"]), str(event["event_key"])) for event in event_list)
+        return dirty
 
     def replace_source_event_updates(
         self,
@@ -857,7 +872,7 @@ class Unibase:
         events: Iterable[dict],
         active_event_keys: set[str],
         scan_generation: int,
-    ) -> None:
+    ) -> set[tuple[str, str]]:
         event_list = list(events)
         updated_keys = {str(event["event_key"]) for event in event_list}
         with self.connect() as conn:
@@ -884,6 +899,7 @@ class Unibase:
                 )
             for event in event_list:
                 self._add_event_conn(conn, source_id, source_file_id, event, scan_generation)
+        return {(provider, str(event_key)) for event_key in keys_to_remove | updated_keys}
 
     def register_content_blob(self, sha256: str, size: int, provider: str, parser_version: int) -> tuple[int, bool]:
         with self.connect() as conn:
@@ -906,21 +922,37 @@ class Unibase:
         seen_paths: Iterable[str],
         *,
         rebuild_active: bool = True,
+        dirty_event_keys: Iterable[tuple[str, str]] = (),
     ) -> bool:
         seen = set(seen_paths)
         removed = False
+        dirty = set(dirty_event_keys)
         with self.connect() as conn:
             rows = conn.execute("select source_file_id, relative_path from source_files where source_id = ?", (source_id,)).fetchall()
             for row in rows:
                 if row["relative_path"] not in seen:
                     removed = True
+                    dirty.update(
+                        (str(event["provider"]), str(event["event_key"]))
+                        for event in conn.execute(
+                            """
+                            select distinct ev.provider, ev.event_key
+                            from event_occurrences eo
+                            join event_variants ev on ev.event_variant_id = eo.event_variant_id
+                            where eo.source_id = ? and eo.source_file_id = ?
+                            """,
+                            (source_id, row["source_file_id"]),
+                        ).fetchall()
+                    )
                     conn.execute("delete from event_occurrences where source_id = ? and source_file_id = ?", (source_id, row["source_file_id"]))
                     conn.execute("delete from source_files where source_file_id = ?", (row["source_file_id"],))
             conn.execute(
                 "update sources set discovery_status = 'ready', stale = 0, error = null, last_successful_generation = ?, last_successful_scan = ?, file_count = ?, updated_at = ? where source_id = ?",
                 (scan_generation, utc_now(), len(seen), utc_now(), source_id),
             )
-        if rebuild_active or removed:
+        if dirty:
+            self.rebuild_active_events(dirty)
+        elif rebuild_active or removed:
             self.rebuild_active_events()
         return rebuild_active or removed
 
@@ -931,66 +963,108 @@ class Unibase:
                 (sanitize_error(error), utc_now(), source_id),
             )
 
-    def rebuild_active_events(self) -> int:
+    def rebuild_active_events(self, event_keys: Iterable[tuple[str, str]] | None = None) -> int:
+        dirty = None if event_keys is None else set(event_keys)
+        if dirty == set():
+            return int(self.settings()["generation"])
         with OPERATION_LOCKS.acquire("active-events"):
             with self.connect() as conn:
                 conn.execute("begin immediate")
                 generation = int(conn.execute("select generation from app_settings where id = 1").fetchone()[0]) + 1
-                conn.execute("delete from active_events")
-                canonical_rows = conn.execute("select canonical_event_id, provider, event_key from canonical_events").fetchall()
-                for canonical in canonical_rows:
-                    variants = conn.execute(
-                        """
+                conn.execute("drop table if exists temp.dirty_event_keys")
+                if dirty is not None:
+                    conn.execute(
+                        "create temp table dirty_event_keys(provider text not null, event_key text not null, primary key(provider, event_key))"
+                    )
+                    conn.executemany(
+                        "insert into dirty_event_keys(provider, event_key) values (?, ?)",
+                        sorted(dirty),
+                    )
+                conn.execute("drop table if exists temp.active_event_winners")
+                conn.execute(
+                    f"""
+                    create temp table active_event_winners as
+                    with ranked_sources as (
                         select ev.*, s.priority, coalesce(s.snapshot_date, '') snapshot_date,
-                               s.source_id stable_source_id
+                               s.source_id stable_source_id,
+                               row_number() over (
+                                   partition by ev.event_variant_id
+                                   order by s.priority desc, coalesce(s.snapshot_date, '') desc, s.source_id asc
+                               ) source_rank
                         from event_variants ev
-                        join sources s on s.source_id = (
-                            select s2.source_id
-                            from event_occurrences eo2
-                            join sources s2 on s2.source_id = eo2.source_id
-                            where eo2.event_variant_id = ev.event_variant_id and s2.enabled = 1
-                            order by s2.priority desc, coalesce(s2.snapshot_date, '') desc, s2.source_id asc
-                            limit 1
-                        )
-                        where ev.provider = ? and ev.event_key = ?
-                        order by priority desc, snapshot_date desc, stable_source_id asc, ev.payload_hash asc
-                        """,
-                        (canonical["provider"], canonical["event_key"]),
-                    ).fetchall()
-                    if not variants:
-                        conn.execute(
-                            "update canonical_events set selected_variant_id = null, conflict_state = 'clean' where canonical_event_id = ?",
-                            (canonical["canonical_event_id"],),
-                        )
-                        continue
-                    winner = variants[0]
-                    conflict = "conflict" if len(variants) > 1 else "clean"
+                        join event_occurrences eo on eo.event_variant_id = ev.event_variant_id
+                        join sources s on s.source_id = eo.source_id and s.enabled = 1
+                        {"join dirty_event_keys dirty on dirty.provider = ev.provider and dirty.event_key = ev.event_key" if dirty is not None else ""}
+                    ), ranked_variants as (
+                        select ranked_sources.*,
+                               row_number() over (
+                                   partition by provider, event_key
+                                   order by priority desc, snapshot_date desc, stable_source_id asc, payload_hash asc
+                               ) variant_rank,
+                               count(*) over (partition by provider, event_key) variant_count
+                        from ranked_sources
+                        where source_rank = 1
+                    )
+                    select * from ranked_variants where variant_rank = 1
+                    """
+                )
+                if dirty is None:
+                    conn.execute("delete from active_events")
+                    conn.execute("update canonical_events set selected_variant_id = null, conflict_state = 'clean'")
+                else:
                     conn.execute(
-                        "update canonical_events set selected_variant_id = ?, conflict_state = ? where canonical_event_id = ?",
-                        (winner["event_variant_id"], conflict, canonical["canonical_event_id"]),
+                        """
+                        delete from active_events
+                        where exists (
+                            select 1 from dirty_event_keys dirty
+                            where dirty.provider = active_events.provider and dirty.event_key = active_events.event_key
+                        )
+                        """
                     )
                     conn.execute(
                         """
-                        insert into active_events(
-                            canonical_event_id, event_variant_id, generation, provider, event_key, stream_key,
-                            timestamp_utc, occurred_at, model, native_provider_id, semantics, classification,
-                            input_tokens, cache_read_tokens, cache_write_tokens, output_tokens, reasoning_tokens,
-                            cost_usd, cost_kind
-                        ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        (
-                            canonical["canonical_event_id"], winner["event_variant_id"], generation,
-                            winner["provider"], winner["event_key"], winner["stream_key"], winner["timestamp_utc"],
-                            winner["occurred_at"], winner["model"], winner["native_provider_id"], winner["semantics"],
-                            winner["classification"], winner["input_tokens"], winner["cache_read_tokens"],
-                            winner["cache_write_tokens"], winner["output_tokens"], winner["reasoning_tokens"],
-                            winner["cost_usd"], winner["cost_kind"],
-                        ),
+                        update canonical_events
+                        set selected_variant_id = null, conflict_state = 'clean'
+                        where exists (
+                            select 1 from dirty_event_keys dirty
+                            where dirty.provider = canonical_events.provider and dirty.event_key = canonical_events.event_key
+                        )
+                        """
                     )
+                conn.execute(
+                    """
+                    update canonical_events as canonical
+                    set selected_variant_id = winner.event_variant_id,
+                        conflict_state = case when winner.variant_count > 1 then 'conflict' else 'clean' end
+                    from active_event_winners as winner
+                    where canonical.provider = winner.provider and canonical.event_key = winner.event_key
+                    """
+                )
+                conn.execute(
+                    """
+                    insert into active_events(
+                        canonical_event_id, event_variant_id, generation, provider, event_key, stream_key,
+                        timestamp_utc, occurred_at, model, native_provider_id, semantics, classification,
+                        input_tokens, cache_read_tokens, cache_write_tokens, output_tokens, reasoning_tokens,
+                        cost_usd, cost_kind
+                    )
+                    select canonical.canonical_event_id, winner.event_variant_id, ?, winner.provider,
+                           winner.event_key, winner.stream_key, winner.timestamp_utc, winner.occurred_at,
+                           winner.model, winner.native_provider_id, winner.semantics, winner.classification,
+                           winner.input_tokens, winner.cache_read_tokens, winner.cache_write_tokens,
+                           winner.output_tokens, winner.reasoning_tokens, winner.cost_usd, winner.cost_kind
+                    from active_event_winners winner
+                    join canonical_events canonical
+                      on canonical.provider = winner.provider and canonical.event_key = winner.event_key
+                    """,
+                    (generation,),
+                )
                 conn.execute("update app_settings set generation = ?, state = 'ready', updated_at = ? where id = 1", (generation, utc_now()))
                 conn.execute(
                     "update sources set event_count = (select count(distinct eo.event_variant_id) from event_occurrences eo where eo.source_id = sources.source_id)"
                 )
+                conn.execute("drop table temp.active_event_winners")
+                conn.execute("drop table if exists temp.dirty_event_keys")
                 conn.commit()
                 return generation
 

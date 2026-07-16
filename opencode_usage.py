@@ -265,7 +265,7 @@ def import_opencode_source(unibase: Unibase, source: dict, db_override: Path | N
             imported += 1
 
         all_event_keys = {stable_id("opencode", "message", str(row["id"] or "")) for row in active_ids if row["id"]}
-        unibase.replace_source_event_updates(
+        dirty_event_keys = unibase.replace_source_event_updates(
             source_id, source_file_id, "opencode", parsed_events, all_event_keys, scan_generation
         )
         cursor = (
@@ -299,7 +299,8 @@ def import_opencode_source(unibase: Unibase, source: dict, db_override: Path | N
             source_id,
             scan_generation,
             [relative_path],
-            rebuild_active=source_changed,
+            rebuild_active=False,
+            dirty_event_keys=dirty_event_keys if source_changed else (),
         )
         active = unibase.active_event_rows("opencode")
         message_sums = {

@@ -315,14 +315,22 @@ def import_codex_source(
     seen_paths = []
     parsed_files = 0
     imported = 0
+    dirty_event_keys: set[tuple[str, str]] = set()
     try:
         for path, file_key in inventory:
             seen_paths.append(file_key)
             stat = path.stat()
-            content_hash = _file_hash(path)
             previous = unibase.file_checkpoint(source_id, file_key)
+            if previous and int(previous["size"]) == stat.st_size and int(previous["mtime_ns"]) == stat.st_mtime_ns:
+                continue
+            content_hash = _file_hash(path)
             unchanged = bool(previous and previous.get("content_hash") == content_hash and int(previous["size"]) == stat.st_size)
             if unchanged:
+                unibase.upsert_source_file(
+                    source_id, file_key, "codex_rollout", size=stat.st_size, mtime_ns=stat.st_mtime_ns,
+                    complete_offset=stat.st_size, content_hash=content_hash, scan_generation=scan_generation,
+                    parser_version=PARSER_VERSION,
+                )
                 continue
             unibase.register_content_blob(content_hash, stat.st_size, "codex", PARSER_VERSION)
             source_file_id = int(previous["source_file_id"]) if previous else unibase.upsert_source_file(
@@ -362,7 +370,9 @@ def import_codex_source(
                     "cost_kind": "unavailable",
                 })
                 imported += 1
-            unibase.replace_source_file_events(source_id, source_file_id, parsed_events, scan_generation)
+            dirty_event_keys.update(
+                unibase.replace_source_file_events(source_id, source_file_id, parsed_events, scan_generation)
+            )
             unibase.upsert_source_file(
                 source_id, file_key, "codex_rollout", size=stat.st_size, mtime_ns=stat.st_mtime_ns,
                 complete_offset=stat.st_size, content_hash=content_hash, scan_generation=scan_generation,
@@ -378,7 +388,8 @@ def import_codex_source(
             source_id,
             scan_generation,
             seen_paths,
-            rebuild_active=parsed_files > 0,
+            rebuild_active=False,
+            dirty_event_keys=dirty_event_keys,
         )
         if is_live and not state_inventory_complete:
             unibase.mark_source_error(source_id, "Codex state inventory is incomplete; retained committed data")

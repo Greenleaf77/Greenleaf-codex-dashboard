@@ -106,6 +106,8 @@ let diagnosticsRequestKey = null;
 let diagnosticsTimer = null;
 let usageLoadTimer = null;
 let usageController = null;
+let sourceSyncPollTimer = null;
+const usageCache = new Map();
 const diagnosticsCache = new Map();
 const diagnosticsErrors = new Map();
 const expandedModels = new Set();
@@ -595,18 +597,24 @@ async function load(rangeName) {
   usageController = new AbortController();
   const controller = usageController;
   const startedAt = Date.now();
+  const query = buildQuery(rangeName);
   const renderLoading = () => {
     const elapsedSeconds = Math.floor((Date.now() - startedAt) / 1000);
     const elapsed = elapsedSeconds >= 2 ? `<span>${full(elapsedSeconds)}s elapsed</span>` : "";
     app.innerHTML = `<section class="state usage-loading" aria-live="polite"><span class="diagnostics-spinner" aria-hidden="true"></span><strong>MeterMesh is loading Unibase…</strong>${elapsed}</section>`;
   };
-  renderLoading();
-  usageLoadTimer = window.setInterval(renderLoading, 1000);
+  if (currentData) {
+    document.documentElement.classList.add("usage-refreshing");
+  } else {
+    renderLoading();
+    usageLoadTimer = window.setInterval(renderLoading, 1000);
+  }
   console.info("[MeterMesh timing] usage fetch started", { range: rangeName, provider: activeProvider });
   try {
-    const response = await fetch(`/data.json?${buildQuery(rangeName)}`, { cache: "no-store", signal: controller.signal });
+    const response = await fetch(`/data.json?${query}`, { cache: "no-store", signal: controller.signal });
     if (!response.ok) throw new Error(`Usage API returned HTTP ${response.status}`);
     const data = await response.json();
+    usageCache.set(query, data);
     console.info("[MeterMesh timing] usage fetch completed", { elapsedMs: Date.now() - startedAt });
     return data;
   } catch (error) {
@@ -620,6 +628,7 @@ async function load(rangeName) {
       usageLoadTimer = null;
       usageController = null;
     }
+    document.documentElement.classList.remove("usage-refreshing");
   }
 }
 
@@ -1401,9 +1410,38 @@ function closeSettings() {
 }
 
 function invalidateDashboardCaches() {
+  usageCache.clear();
   diagnosticsCache.clear();
   diagnosticsErrors.clear();
   invalidateRequests();
+}
+
+function scheduleSourceSyncPoll(data) {
+  if (sourceSyncPollTimer) window.clearTimeout(sourceSyncPollTimer);
+  const delay = data.sync?.state === "running" ? 1000 : 30000;
+  sourceSyncPollTimer = window.setTimeout(async () => {
+    try {
+      const response = await fetch("/api/unibase/status", { cache: "no-store" });
+      if (!response.ok) throw new Error(`Sync status returned HTTP ${response.status}`);
+      const payload = await response.json();
+      if (!currentData) return;
+      const generationChanged = Number(payload.generation) !== Number(currentData.generation);
+      if (generationChanged && payload.source_sync?.state !== "running") {
+        usageCache.clear();
+        await refresh();
+        return;
+      }
+      const nextSync = payload.source_sync || currentData.sync;
+      if (nextSync?.state !== currentData.sync?.state) {
+        render({ ...currentData, sync: nextSync });
+      } else {
+        scheduleSourceSyncPoll(currentData);
+      }
+    } catch (error) {
+      console.warn("[MeterMesh timing] sync status poll failed", error);
+      if (currentData) scheduleSourceSyncPoll(currentData);
+    }
+  }, delay);
 }
 
 async function pollOperation(operationId) {
@@ -1521,6 +1559,7 @@ function render(data) {
   const indexingNote = data.indexing
     ? ` · ${full(data.indexing.events)} events from ${full(data.indexing.files)} JSONL files`
     : "";
+  const syncNote = data.sync?.state === "running" ? " · syncing sources in background" : "";
   const rangeSummary = customRangePending ? "Choose custom range" : describeRange(data);
   document.documentElement.dataset.provider = provider;
   document.documentElement.classList.toggle("custom-range-modal-open", customRangeOpen || chartCustomRangeOpen);
@@ -1537,7 +1576,7 @@ function render(data) {
             <span class="brand-scope">${escapeHtml(providerLabel)}</span>
           </div>
           <div class="brand-meta">
-            <span>Generated ${escapeHtml(data.generated_at)} from ${escapeHtml(data.data_source || "Unibase")}${indexingNote}</span>
+            <span>Generated ${escapeHtml(data.generated_at)} from ${escapeHtml(data.data_source || "Unibase")}${indexingNote}${syncNote}</span>
             <strong>Showing ${escapeHtml(rangeSummary)}</strong>
           </div>
         </div>
@@ -1878,6 +1917,7 @@ function render(data) {
     });
   }
 
+  scheduleSourceSyncPoll(data);
 }
 
 function icon(name, className = "") {
@@ -2006,6 +2046,8 @@ function hideHeatTooltip() {
 async function refresh() {
   cancelDiagnosticsRequest();
   try {
+    const cached = usageCache.get(buildQuery(activeRange));
+    if (cached) render(cached);
     const data = await load(activeRange);
     diagnosticsCache.delete(diagnosticsKey(data));
     diagnosticsErrors.delete(diagnosticsKey(data));

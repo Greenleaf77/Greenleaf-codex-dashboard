@@ -14,6 +14,7 @@ import sqlite3
 import threading
 import time
 import warnings
+from collections import OrderedDict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -32,6 +33,7 @@ from unibase import (
     Unibase,
     register_default_sources,
     resolve_unibase_path,
+    sanitize_error,
 )
 
 
@@ -46,11 +48,19 @@ AUTO_REVIEW_MODEL = "codex-auto-review"
 PRICING_URL = "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
 PRICING_CACHE_SECONDS = 600
 PRICING_CACHE: dict[str, object] = {"loaded_at": 0.0, "pricing": None}
+USAGE_RESPONSE_CACHE_SECONDS = 30.0
+USAGE_RESPONSE_CACHE_MAX_ENTRIES = 32
+USAGE_RESPONSE_CACHE_LOCK = threading.Lock()
+USAGE_RESPONSE_CACHE: OrderedDict[tuple[object, ...], tuple[float, dict]] = OrderedDict()
 SOURCE_REFRESH_DEBOUNCE_SECONDS = 300.0
 SOURCE_REFRESH_STATE_LOCK = threading.Lock()
-SOURCE_REFRESH_CONDITION = threading.Condition(SOURCE_REFRESH_STATE_LOCK)
 SOURCE_REFRESH_RUNNING = False
 SOURCE_REFRESH_LAST_STARTED = 0.0
+SOURCE_REFRESH_STARTED_AT: str | None = None
+SOURCE_REFRESH_COMPLETED_AT: str | None = None
+SOURCE_REFRESH_REASON: str | None = None
+SOURCE_REFRESH_ERROR: str | None = None
+SOURCE_REFRESH_SCHEDULER_POLL_SECONDS = 30.0
 FALLBACK_PRICING = {
     "gpt-5.5": {
         "input_cost_per_token": 0.000005,
@@ -2224,6 +2234,8 @@ def refresh_enabled_sources(
         for source in sources:
             if not source["enabled"] or source["discovery_status"] in {"incomplete", "ambiguous", "unavailable"}:
                 continue
+            if source["kind"] != "live" and source["discovery_status"] == "ready" and source["last_successful_scan"]:
+                continue
             source_started_at = time.perf_counter()
             source_name = f'{source["provider"]}/{source["relative_name"]}'
             try:
@@ -2252,15 +2264,15 @@ def source_refresh_running() -> bool:
         return SOURCE_REFRESH_RUNNING
 
 
-def wait_for_source_refresh(timeout: float = 120.0) -> bool:
-    deadline = time.monotonic() + timeout
-    with SOURCE_REFRESH_CONDITION:
-        while SOURCE_REFRESH_RUNNING:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                return False
-            SOURCE_REFRESH_CONDITION.wait(remaining)
-    return True
+def source_refresh_status() -> dict[str, object]:
+    with SOURCE_REFRESH_STATE_LOCK:
+        return {
+            "state": "running" if SOURCE_REFRESH_RUNNING else "idle",
+            "reason": SOURCE_REFRESH_REASON,
+            "started_at": SOURCE_REFRESH_STARTED_AT,
+            "completed_at": SOURCE_REFRESH_COMPLETED_AT,
+            "error": SOURCE_REFRESH_ERROR,
+        }
 
 
 def schedule_enabled_sources_refresh(
@@ -2272,7 +2284,8 @@ def schedule_enabled_sources_refresh(
     claude_root: Path | None = None,
     reason: str,
 ) -> bool:
-    global SOURCE_REFRESH_LAST_STARTED, SOURCE_REFRESH_RUNNING
+    global SOURCE_REFRESH_ERROR, SOURCE_REFRESH_LAST_STARTED, SOURCE_REFRESH_REASON
+    global SOURCE_REFRESH_RUNNING, SOURCE_REFRESH_STARTED_AT
 
     now = time.monotonic()
     with SOURCE_REFRESH_STATE_LOCK:
@@ -2284,9 +2297,13 @@ def schedule_enabled_sources_refresh(
             return False
         SOURCE_REFRESH_RUNNING = True
         SOURCE_REFRESH_LAST_STARTED = now
+        SOURCE_REFRESH_STARTED_AT = dt.datetime.now(dt.timezone.utc).isoformat()
+        SOURCE_REFRESH_REASON = reason
+        SOURCE_REFRESH_ERROR = None
 
     def worker() -> None:
-        global SOURCE_REFRESH_LAST_STARTED, SOURCE_REFRESH_RUNNING
+        global SOURCE_REFRESH_COMPLETED_AT, SOURCE_REFRESH_ERROR, SOURCE_REFRESH_LAST_STARTED
+        global SOURCE_REFRESH_RUNNING
         try:
             print(f"[MeterMesh timing] source refresh started; reason={reason}", flush=True)
             refresh_enabled_sources(
@@ -2297,15 +2314,40 @@ def schedule_enabled_sources_refresh(
                 claude_root=claude_root,
             )
         except Exception as exc:  # noqa: BLE001
+            with SOURCE_REFRESH_STATE_LOCK:
+                SOURCE_REFRESH_ERROR = sanitize_error(exc)
             print(f"[MeterMesh timing] source refresh failed: {exc.__class__.__name__}: {exc}", flush=True)
         finally:
-            with SOURCE_REFRESH_CONDITION:
+            with SOURCE_REFRESH_STATE_LOCK:
                 SOURCE_REFRESH_RUNNING = False
                 SOURCE_REFRESH_LAST_STARTED = time.monotonic()
-                SOURCE_REFRESH_CONDITION.notify_all()
+                SOURCE_REFRESH_COMPLETED_AT = dt.datetime.now(dt.timezone.utc).isoformat()
 
     threading.Thread(target=worker, name="metermesh-source-refresh", daemon=True).start()
     return True
+
+
+def start_source_refresh_scheduler(
+    unibase_path: Path,
+    opencode_live_db: Path | None = None,
+    *,
+    codex_root: Path | None = None,
+    codex_state_db: Path | None = None,
+    claude_root: Path | None = None,
+) -> None:
+    def worker() -> None:
+        while True:
+            time.sleep(SOURCE_REFRESH_SCHEDULER_POLL_SECONDS)
+            schedule_enabled_sources_refresh(
+                unibase_path,
+                opencode_live_db,
+                codex_root=codex_root,
+                codex_state_db=codex_state_db,
+                claude_root=claude_root,
+                reason="periodic",
+            )
+
+    threading.Thread(target=worker, name="metermesh-source-scheduler", daemon=True).start()
 
 
 def _checkpoint_database(path: Path) -> None:
@@ -2902,30 +2944,43 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def usage_payload(self, filters: dict) -> dict:
         if self.unibase_path:
-            schedule_enabled_sources_refresh(
-                self.unibase_path,
-                self.opencode_db_path,
-                codex_root=self.db_path.parent,
-                codex_state_db=self.db_path,
-                claude_root=self.claude_projects_path.parent
-                if self.claude_projects_path.name == "projects" else self.claude_projects_path,
-                reason="usage request",
+            generation = int(Unibase(self.unibase_path, migrate=False).settings()["generation"])
+            cache_key = (
+                str(self.unibase_path), generation, filters["range"], filters["start_day"], filters["end_day"],
+                bool(filters["ignore_auto_review"]), filters["chart_range"], filters["chart_start_day"],
+                filters["chart_end_day"], bool(filters["include_diagnostics"]), filters["provider"], filters["timezone"],
             )
-            if not wait_for_source_refresh():
-                raise TimeoutError("Timed out waiting for Unibase source refresh")
-            return load_unibase_usage(
-                self.unibase_path,
-                str(filters["range"]),
-                filters["start_day"],
-                filters["end_day"],
-                bool(filters["ignore_auto_review"]),
-                str(filters["chart_range"]),
-                filters["chart_start_day"],
-                filters["chart_end_day"],
-                bool(filters["include_diagnostics"]),
-                provider=str(filters["provider"]),
-                timezone_name=str(filters["timezone"]),
-            )
+            now = time.monotonic()
+            with USAGE_RESPONSE_CACHE_LOCK:
+                cached = USAGE_RESPONSE_CACHE.get(cache_key)
+                if cached and now - cached[0] <= USAGE_RESPONSE_CACHE_SECONDS:
+                    USAGE_RESPONSE_CACHE.move_to_end(cache_key)
+                    payload = dict(cached[1])
+                else:
+                    if cached:
+                        del USAGE_RESPONSE_CACHE[cache_key]
+                    payload = None
+            if payload is None:
+                payload = load_unibase_usage(
+                    self.unibase_path,
+                    str(filters["range"]),
+                    filters["start_day"],
+                    filters["end_day"],
+                    bool(filters["ignore_auto_review"]),
+                    str(filters["chart_range"]),
+                    filters["chart_start_day"],
+                    filters["chart_end_day"],
+                    bool(filters["include_diagnostics"]),
+                    provider=str(filters["provider"]),
+                    timezone_name=str(filters["timezone"]),
+                )
+                with USAGE_RESPONSE_CACHE_LOCK:
+                    USAGE_RESPONSE_CACHE[cache_key] = (now, dict(payload))
+                    USAGE_RESPONSE_CACHE.move_to_end(cache_key)
+                    while len(USAGE_RESPONSE_CACHE) > USAGE_RESPONSE_CACHE_MAX_ENTRIES:
+                        USAGE_RESPONSE_CACHE.popitem(last=False)
+            payload["sync"] = source_refresh_status()
+            return payload
         return load_usage(
             self.db_path,
             str(filters["range"]),
@@ -3011,15 +3066,6 @@ class DashboardHandler(BaseHTTPRequestHandler):
         try:
             database = Unibase(self.unibase_path, migrate=False)
             self.seed_legacy_preference(database)
-            schedule_enabled_sources_refresh(
-                self.unibase_path,
-                self.opencode_db_path,
-                codex_root=self.db_path.parent,
-                codex_state_db=self.db_path,
-                claude_root=self.claude_projects_path.parent
-                if self.claude_projects_path.name == "projects" else self.claude_projects_path,
-                reason="requests request",
-            )
             payload = load_requests(
                 self.unibase_path,
                 provider=query.get("provider", ["all"])[0],
@@ -3034,6 +3080,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 bucket_start=query.get("bucket_start", [None])[0],
                 child_page=int(query.get("child_page", ["1"])[0]),
             )
+            payload["sync"] = source_refresh_status()
             status = 200
         except SnapshotConflict as exc:
             payload = {"error": str(exc)}
@@ -3160,6 +3207,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         query = parse_qs(query_string)
         try:
             status = Unibase(self.unibase_path, migrate=False).operation_status(query.get("operation_id", [None])[0])
+            status["source_sync"] = source_refresh_status()
             self.send_json(200, status)
         except Exception:
             self.send_json(503, {"error": "Could not read Unibase operation status."})
@@ -3332,6 +3380,17 @@ def main() -> None:
             else DashboardHandler.claude_projects_path
         ),
         reason="startup",
+    )
+    start_source_refresh_scheduler(
+        DashboardHandler.unibase_path,
+        DashboardHandler.opencode_db_path,
+        codex_root=DashboardHandler.db_path.parent,
+        codex_state_db=DashboardHandler.db_path,
+        claude_root=(
+            DashboardHandler.claude_projects_path.parent
+            if DashboardHandler.claude_projects_path.name == "projects"
+            else DashboardHandler.claude_projects_path
+        ),
     )
     try:
         server.serve_forever()

@@ -1540,6 +1540,24 @@ tfoot td {
   font-size: 12px;
 }
 
+:root.usage-refreshing body::before {
+  position: fixed;
+  z-index: 10000;
+  top: 0;
+  right: 0;
+  left: 0;
+  height: 2px;
+  background: linear-gradient(90deg, transparent, var(--cyan), transparent);
+  background-size: 45% 100%;
+  content: "";
+  animation: usage-refresh-slide 1s linear infinite;
+}
+
+@keyframes usage-refresh-slide {
+  from { background-position: -70% 0; }
+  to { background-position: 170% 0; }
+}
+
 /* Warm graphite telemetry shell */
 .app-header {
   align-items: center;
@@ -2498,7 +2516,8 @@ tbody tr:hover td {
     transition: none;
   }
 
-  .diagnostics-spinner {
+  .diagnostics-spinner,
+  :root.usage-refreshing body::before {
     animation: none;
   }
 }
