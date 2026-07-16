@@ -15,6 +15,7 @@ PARSER_VERSION = 2
 AUTO_REVIEW_MODEL = "codex-auto-review"
 USAGE_COMPONENTS = ("input_tokens", "cached_input_tokens", "output_tokens", "reasoning_output_tokens")
 ROLLOUT_UUID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+ROLLOUT_FILENAME = re.compile(r"^rollout-.*\.jsonl$")
 
 
 def parse_usage_components(value: object, *, cumulative: bool = False) -> dict[str, int] | None:
@@ -218,40 +219,104 @@ def rollout_metadata(path: Path, content_hash: str) -> tuple[str, str]:
     return stable_id("codex", "stream", session_id), str(model or "(unknown)")
 
 
-def _state_models(root: Path) -> dict[str, str]:
-    state_path = root / "state_5.sqlite"
+def _validated_state_rollout(value: object) -> tuple[Path, Path, str] | None:
+    if not isinstance(value, str) or not value:
+        return None
+    path = Path(value)
+    if not path.is_absolute() or ".." in path.parts or not ROLLOUT_FILENAME.fullmatch(path.name):
+        return None
+    session_indexes = [index for index, part in enumerate(path.parts) if part == "sessions"]
+    if not session_indexes:
+        return None
+    try:
+        sessions_root = Path(*path.parts[: session_indexes[-1] + 1]).resolve()
+        resolved = path.resolve()
+        relative = resolved.relative_to(sessions_root).as_posix()
+    except (OSError, RuntimeError, ValueError):
+        return None
+    return resolved, sessions_root, relative
+
+
+def _state_rollouts(state_path: Path) -> tuple[dict[Path, str], bool]:
     if not state_path.is_file():
-        return {}
+        return {}, False
     try:
         with open_source_sqlite_readonly(state_path) as conn:
             columns = {row[1] for row in conn.execute("pragma table_info(threads)")}
-            if not {"id", "model", "rollout_path"}.issubset(columns):
-                return {}
-            return {
-                Path(row["rollout_path"]).name: str(row["model"] or "(unknown)")
-                for row in conn.execute("select rollout_path, model from threads where rollout_path != ''")
-            }
+            if "rollout_path" not in columns:
+                return {}, False
+            model_sql = "model" if "model" in columns else "null"
+            rows = conn.execute(
+                f"select rollout_path, {model_sql} model from threads where rollout_path != ''"
+            ).fetchall()
     except Exception:
-        return {}
+        return {}, False
+
+    rollouts: dict[Path, str] = {}
+    complete = True
+    for row in rows:
+        validated = _validated_state_rollout(row["rollout_path"])
+        if validated is None:
+            complete = False
+            continue
+        path, _, _ = validated
+        rollouts[path] = str(row["model"] or "(unknown)")
+    return rollouts, complete
 
 
-def import_codex_source(unibase: Unibase, source: dict, *, ignore_auto_review: bool = False) -> dict[str, int]:
+def import_codex_source(
+    unibase: Unibase,
+    source: dict,
+    *,
+    ignore_auto_review: bool = False,
+    state_path: Path | None = None,
+    require_state_inventory: bool = False,
+) -> dict[str, int]:
     source_id = str(source["source_id"])
     root = Path(source["root_path"])
     if not root.exists():
         error = FileNotFoundError("Codex source is unavailable")
         unibase.mark_source_error(source_id, error)
         raise error
-    files = codex_usage_files(root)
+    default_files = codex_usage_files(root)
+    is_live = source.get("kind") == "live"
+    state_rollouts, state_inventory_complete = _state_rollouts(
+        state_path or root / "state_5.sqlite"
+    )
+    backup_models = {path.name: model for path, model in state_rollouts.items()} if not is_live else {}
+
+    inventory: list[tuple[Path, str]] = []
+    default_paths = set()
+    for path in default_files:
+        resolved = path.resolve()
+        default_paths.add(resolved)
+        relative = path.relative_to(root).as_posix()
+        inventory.append((path, f'file:{stable_id("codex", "source-file", relative)}'))
+    for path in (sorted(state_rollouts) if is_live else []):
+        if path in default_paths:
+            continue
+        validated = _validated_state_rollout(str(path))
+        if validated is None:
+            state_inventory_complete = False
+            continue
+        resolved, sessions_root, relative = validated
+        root_key = stable_id("codex", "rollout-root", str(sessions_root))
+        file_key = stable_id("codex", "source-file", relative)
+        external_key = f"external:{root_key}:{file_key}"
+        if not resolved.is_file():
+            state_inventory_complete = False
+            continue
+        inventory.append((resolved, external_key))
+
+    if require_state_inventory and not state_inventory_complete:
+        raise RuntimeError("Codex state inventory is unavailable or incomplete")
+
     scan_generation = unibase.begin_source_scan(source_id)
-    models = _state_models(root)
     seen_paths = []
     parsed_files = 0
     imported = 0
     try:
-        for path in files:
-            relative = path.relative_to(root).as_posix()
-            file_key = f'file:{stable_id("codex", "source-file", relative)}'
+        for path, file_key in inventory:
             seen_paths.append(file_key)
             stat = path.stat()
             content_hash = _file_hash(path)
@@ -265,7 +330,7 @@ def import_codex_source(unibase: Unibase, source: dict, *, ignore_auto_review: b
                 scan_generation=scan_generation, parser_version=PARSER_VERSION,
             )
             stream_key, metadata_model = rollout_metadata(path, content_hash)
-            model = models.get(path.name, metadata_model)
+            model = state_rollouts.get(path.resolve(), backup_models.get(path.name, metadata_model))
             telemetry = {"usage_events": []} if ignore_auto_review and model == AUTO_REVIEW_MODEL else scan_rollout_telemetry(path, stream_key, model)
             ordinals: dict[tuple[str, str, str], int] = {}
             parsed_events = []
@@ -304,14 +369,21 @@ def import_codex_source(unibase: Unibase, source: dict, *, ignore_auto_review: b
                 parser_version=PARSER_VERSION,
             )
             parsed_files += 1
+        if is_live and not state_inventory_complete:
+            seen_paths.extend(
+                key for key in unibase.source_file_keys(source_id, file_kind="codex_rollout")
+                if key.startswith("external:")
+            )
         unibase.reconcile_source_files(
             source_id,
             scan_generation,
             seen_paths,
             rebuild_active=parsed_files > 0,
         )
+        if is_live and not state_inventory_complete:
+            unibase.mark_source_error(source_id, "Codex state inventory is incomplete; retained committed data")
         return {
-            "files": len(files),
+            "files": len(set(seen_paths)),
             "scanned_files": parsed_files,
             "processed_records": imported,
             "new_events": imported,

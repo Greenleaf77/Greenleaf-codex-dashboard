@@ -73,20 +73,39 @@ class AllProviderTests(unittest.TestCase):
         self.assertEqual(handler.filters_from_query("")["provider"], "all")
         self.assertEqual(handler.filters_from_query("provider=invalid")["provider"], "all")
 
-    def test_chart_range_always_matches_global_range(self):
+    def test_chart_range_is_independent_from_global_range(self):
         handler = object.__new__(dashboard_api.DashboardHandler)
         handler.unibase_path = self.path
         filters = handler.filters_from_query("range=7d&chart_range=all")
-        self.assertEqual(filters["chart_range"], "7d")
-        self.assertEqual(filters["chart_start_day"], filters["start_day"])
-        self.assertEqual(filters["chart_end_day"], filters["end_day"])
+        self.assertEqual(filters["chart_range"], "all")
+        self.assertIsNone(filters["chart_start_day"])
+        self.assertIsNone(filters["chart_end_day"])
 
         custom = handler.filters_from_query(
-            "range=custom&start=2026-07-10&end=2026-07-12&chart_start=2020-01-01&chart_end=2020-01-02"
+            "range=custom&start=2026-07-10&end=2026-07-12&chart_range=custom&chart_start=2020-01-01&chart_end=2020-01-02"
         )
         self.assertEqual(custom["chart_range"], "custom")
-        self.assertEqual(custom["chart_start_day"], "2026-07-10")
-        self.assertEqual(custom["chart_end_day"], "2026-07-12")
+        self.assertEqual(custom["chart_start_day"], "2020-01-01")
+        self.assertEqual(custom["chart_end_day"], "2020-01-02")
+
+    def test_chart_granularity_uses_requested_boundaries(self):
+        self.assertEqual(dashboard_api.chart_granularity(
+            dashboard_api.dt.date(2026, 1, 1), dashboard_api.dt.date(2026, 3, 31)
+        ), "day")
+        self.assertEqual(dashboard_api.chart_granularity(
+            dashboard_api.dt.date(2026, 1, 1), dashboard_api.dt.date(2026, 4, 1)
+        ), "week")
+        self.assertEqual(dashboard_api.chart_granularity(
+            dashboard_api.dt.date(2026, 1, 16), dashboard_api.dt.date(2026, 7, 16)
+        ), "week")
+        self.assertEqual(dashboard_api.chart_granularity(
+            dashboard_api.dt.date(2026, 1, 16), dashboard_api.dt.date(2026, 7, 17)
+        ), "month")
+        timezone_day = dashboard_api.resolve_chart_range(
+            "1d", today=dashboard_api.dt.date(2026, 7, 17)
+        )
+        self.assertEqual(timezone_day["start_day"], "2026-07-17")
+        self.assertEqual(timezone_day["end_day"], "2026-07-17")
 
     def test_production_usage_payload_does_not_call_provider_scanners(self):
         handler = object.__new__(dashboard_api.DashboardHandler)
@@ -104,7 +123,7 @@ class AllProviderTests(unittest.TestCase):
             payload = handler.usage_payload(filters)
         self.assertEqual(payload["provider"], "all")
 
-    def test_production_usage_payload_schedules_source_refresh_without_waiting(self):
+    def test_production_usage_payload_waits_for_refresh_before_reading(self):
         handler = object.__new__(dashboard_api.DashboardHandler)
         handler.unibase_path = self.path
         source_root = Path(self.temp_dir.name) / "sources"
@@ -113,6 +132,8 @@ class AllProviderTests(unittest.TestCase):
         handler.opencode_db_path = source_root / "opencode" / "opencode.db"
         filters = handler.filters_from_query("provider=all&range=all&chart_range=all")
         with patch.object(dashboard_api, "schedule_enabled_sources_refresh") as refresh, patch.object(
+            dashboard_api, "wait_for_source_refresh", return_value=True
+        ) as wait, patch.object(
             dashboard_api, "load_pricing", return_value=self.pricing
         ):
             handler.usage_payload(filters)
@@ -120,9 +141,11 @@ class AllProviderTests(unittest.TestCase):
             self.path,
             handler.opencode_db_path,
             codex_root=handler.db_path.parent,
+            codex_state_db=handler.db_path,
             claude_root=handler.claude_projects_path.parent,
             reason="usage request",
         )
+        wait.assert_called_once_with()
 
     def test_cache_alias_does_not_double_count(self):
         data = self.load("all")

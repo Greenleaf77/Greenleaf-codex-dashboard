@@ -331,6 +331,16 @@ h2.section-title {
   gap: 8px;
 }
 
+.chart-filter {
+  display: grid;
+  justify-items: end;
+  gap: 8px;
+}
+
+.chart-custom-range {
+  padding: 8px;
+}
+
 .viz-tabs {
   justify-content: flex-end;
 }
@@ -2076,6 +2086,10 @@ tbody tr:hover td {
     justify-content: flex-start;
   }
 
+  .chart-filter {
+    justify-items: start;
+  }
+
   .viz-tabs {
     justify-content: flex-start;
   }
@@ -2241,6 +2255,15 @@ tbody tr:hover td {
 
   .custom-range {
     justify-content: stretch;
+  }
+
+  .chart-filter,
+  .chart-range-tabs {
+    width: 100%;
+  }
+
+  .chart-range-tabs .seg {
+    flex: 1;
   }
 
   .custom-range label,

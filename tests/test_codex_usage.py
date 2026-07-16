@@ -1,4 +1,5 @@
 import json
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -32,6 +33,13 @@ def token(timestamp, last, total):
 def write_rows(path, rows):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+
+
+def write_state(path, rows):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(path) as conn:
+        conn.execute("create table threads (id text primary key, rollout_path text, model text)")
+        conn.executemany("insert into threads values (?, ?, ?)", rows)
 
 
 class CodexUsageAdapterTests(unittest.TestCase):
@@ -113,6 +121,72 @@ class CodexUsageAdapterTests(unittest.TestCase):
         events = self.unibase.active_event_rows("codex")
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0]["input_tokens"], 9)
+
+    def test_imports_additional_rollout_paths_from_state(self):
+        default_path = self.codex_root / "sessions" / "a" / "rollout-shared.jsonl"
+        external_path = self.root / ".codex-work" / "sessions" / "b" / "rollout-shared.jsonl"
+        write_rows(default_path, [session_meta("default"), exact("2026-07-16T12:00:00Z", "default-response", usage(5))])
+        write_rows(external_path, [session_meta("external"), exact("2026-07-16T12:01:00Z", "external-response", usage(7))])
+        write_state(
+            self.codex_root / "state_5.sqlite",
+            [("default", str(default_path), "gpt-default"), ("external", str(external_path), "gpt-external")],
+        )
+
+        result = self.import_source()
+        events = self.unibase.active_event_rows("codex")
+
+        self.assertEqual(result["files"], 2)
+        self.assertEqual({row["model"] for row in events}, {"gpt-default", "gpt-external"})
+        self.assertEqual(sum(row["input_tokens"] for row in events), 12)
+        with self.unibase.connect(readonly=True) as conn:
+            stored = [row[0] for row in conn.execute("select relative_path from source_files order by relative_path")]
+        self.assertEqual(len(stored), 2)
+        self.assertTrue(any(value.startswith("external:") for value in stored))
+        self.assertNotIn(".codex-work", " ".join(stored))
+        self.assertNotIn("rollout-shared", " ".join(stored))
+
+    def test_missing_state_preserves_committed_external_events(self):
+        external_path = self.root / ".codex-work" / "sessions" / "b" / "rollout-external.jsonl"
+        write_rows(external_path, [session_meta("external"), exact("2026-07-16T12:01:00Z", "external-response", usage(7))])
+        state_path = self.codex_root / "state_5.sqlite"
+        write_state(state_path, [("external", str(external_path), "gpt-external")])
+        self.import_source()
+        state_path.unlink()
+
+        self.import_source()
+
+        events = self.unibase.active_event_rows("codex")
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["model"], "gpt-external")
+        source = self.unibase.sources("codex")[0]
+        self.assertTrue(source["stale"])
+        self.assertEqual(source["discovery_status"], "error")
+
+    def test_missing_external_file_preserves_committed_event_until_state_removes_it(self):
+        external_path = self.root / ".codex-work" / "sessions" / "b" / "rollout-external.jsonl"
+        write_rows(external_path, [session_meta("external"), exact("2026-07-16T12:01:00Z", "external-response", usage(7))])
+        state_path = self.codex_root / "state_5.sqlite"
+        write_state(state_path, [("external", str(external_path), "gpt-external")])
+        self.import_source()
+        external_path.unlink()
+
+        self.import_source()
+        self.assertEqual(len(self.unibase.active_event_rows("codex")), 1)
+
+        with sqlite3.connect(state_path) as conn:
+            conn.execute("delete from threads")
+        self.import_source()
+        self.assertEqual(self.unibase.active_event_rows("codex"), [])
+
+    def test_required_state_inventory_rejects_incomplete_reindex_input(self):
+        (self.codex_root / "sessions").mkdir(parents=True)
+        with self.assertRaisesRegex(RuntimeError, "inventory"):
+            codex_usage.import_codex_source(
+                self.unibase,
+                self.unibase.sources("codex")[0],
+                state_path=self.codex_root / "missing-state.sqlite",
+                require_state_inventory=True,
+            )
 
     def test_windows_filename_uuid_fallback(self):
         path = self.root / "folder\\rollout-2026-07-16T00-00-00-123e4567-e89b-12d3-a456-426614174000.jsonl"

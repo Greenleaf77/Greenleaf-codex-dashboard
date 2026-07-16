@@ -26,6 +26,14 @@ const rangeOptions = [
   { value: "1d", label: "1d" },
   { value: "custom", label: "Custom" }
 ];
+const chartRangeOptions = [
+  { value: "30d", label: "30d" },
+  { value: "90d", label: "90d" },
+  { value: "6m", label: "6m" },
+  { value: "1y", label: "1y" },
+  { value: "all", label: "All" },
+  { value: "custom", label: "Custom" }
+];
 const visualizationOptions = [
   { value: "heatmap", label: "Daily heatmap" },
   { value: "tokens", label: "Tokens over time" }
@@ -74,6 +82,9 @@ let customRangePending = false;
 let customRangeOpen = false;
 let customStartDate = initialState.start;
 let customEndDate = initialState.end;
+let activeChartRange = initialState.chartRange;
+let chartStartDate = initialState.chartStart;
+let chartEndDate = initialState.chartEnd;
 let activeVisualization = initialState.visualization;
 let cacheMode = initialState.cacheMode;
 let ignoreAutoReview = resolveIgnoreAutoReview(initialState.ignoreAutoReview, legacyIgnoreCookie);
@@ -167,6 +178,14 @@ function normalizeCustomRange() {
   }
 }
 
+function normalizeChartCustomRange() {
+  if (!isIsoDate(chartStartDate)) chartStartDate = todayKey();
+  if (!isIsoDate(chartEndDate)) chartEndDate = chartStartDate;
+  if (chartStartDate > chartEndDate) {
+    [chartStartDate, chartEndDate] = [chartEndDate, chartStartDate];
+  }
+}
+
 function positionCustomRangeDialog(dialog, anchor) {
   const margin = 8;
   const gap = 8;
@@ -194,6 +213,7 @@ function readUrlState() {
   const params = new URLSearchParams(window.location.search);
   const provider = params.get("provider") || "all";
   const range = params.get("range") || "all";
+  const chartRange = params.get("chart_range") || "30d";
   const visualization = params.get("visualization") || "heatmap";
   const selectedPageSize = Number.parseInt(params.get("page_size") || "25", 10);
   return {
@@ -201,6 +221,9 @@ function readUrlState() {
     range: rangeOptions.some((option) => option.value === range) ? range : "all",
     start: params.get("start") || "",
     end: params.get("end") || "",
+    chartRange: chartRangeOptions.some((option) => option.value === chartRange) ? chartRange : "30d",
+    chartStart: params.get("chart_start") || "",
+    chartEnd: params.get("chart_end") || "",
     visualization: visualizationOptions.some((option) => option.value === visualization) ? visualization : "heatmap",
     cacheMode: resolveCacheMode(params.get("cache")),
     ignoreAutoReview: params.get("ignore_auto_review"),
@@ -237,6 +260,7 @@ function buildQuery(rangeName, includeDiagnostics = false) {
   const params = new URLSearchParams();
   params.set("provider", activeProvider);
   params.set("range", rangeName);
+  params.set("chart_range", activeChartRange);
   if (legacyIgnoreOverride !== null) params.set("ignore_auto_review", ignoreAutoReview ? "1" : "0");
   params.set("visualization", activeVisualization);
   params.set("cache", cacheMode);
@@ -251,6 +275,11 @@ function buildQuery(rangeName, includeDiagnostics = false) {
     normalizeCustomRange();
     params.set("start", customStartDate);
     params.set("end", customEndDate);
+  }
+  if (activeChartRange === "custom") {
+    normalizeChartCustomRange();
+    params.set("chart_start", chartStartDate);
+    params.set("chart_end", chartEndDate);
   }
   if (includeDiagnostics) params.set("include_diagnostics", "1");
   return params.toString();
@@ -269,6 +298,17 @@ function describeRange(data) {
   }
   if (data.range === "7d") return "Last 7 days";
   if (data.range === "30d") return "Last 30 days";
+  return "All time";
+}
+
+function describeChartRange(chart) {
+  if (chart.range === "custom" && chart.range_start && chart.range_end) {
+    return `${chart.range_start} - ${chart.range_end}`;
+  }
+  if (chart.range === "30d") return "Last 30 days";
+  if (chart.range === "90d") return "Last 90 days";
+  if (chart.range === "6m") return "Last 6 months";
+  if (chart.range === "1y") return "Last year";
   return "All time";
 }
 
@@ -326,18 +366,30 @@ function renderVisualizationPanel(data, heat, months, heatColumns) {
             <span class="section-icon tone-cyan">${icon("usage")}</span>
             <div>
               <h2>${activeVisualization === "tokens" ? "Tokens over time" : "Daily Heatmap"}</h2>
-              <div class="viz-note">${activeVisualization === "tokens" ? `Showing ${escapeHtml(describeRange(data.chart))}` : "Usage intensity by day"} · ${accountingLabel}</div>
+              <div class="viz-note">Showing ${escapeHtml(describeChartRange(data.chart))} · ${accountingLabel}</div>
             </div>
           </div>
         </div>
         <div class="viz-controls">
           <div class="viz-primary-controls">
             <nav class="segments accounting-tabs" aria-label="Token accounting">
-              ${accountingOptions.map((option) => `<button class="seg ${cacheMode === option.value ? "active" : ""}" data-cache-mode="${option.value}" aria-pressed="${cacheMode === option.value}">${option.label}</button>`).join("")}
+              ${accountingOptions.map((option) => `<button class="seg ${cacheMode === option.value ? "active" : ""}" type="button" data-cache-mode="${option.value}" aria-pressed="${cacheMode === option.value}">${option.label}</button>`).join("")}
             </nav>
             <nav class="segments viz-tabs" aria-label="Visualization">
-              ${visualizationOptions.map((option) => `<button class="seg ${activeVisualization === option.value ? "active" : ""}" data-visualization="${option.value}">${option.label}</button>`).join("")}
+              ${visualizationOptions.map((option) => `<button class="seg ${activeVisualization === option.value ? "active" : ""}" type="button" data-visualization="${option.value}" aria-pressed="${activeVisualization === option.value}">${option.label}</button>`).join("")}
             </nav>
+          </div>
+          <div class="chart-filter">
+            <nav class="segments chart-range-tabs" aria-label="Visualization range">
+              ${chartRangeOptions.map((option) => `<button class="seg ${activeChartRange === option.value ? "active" : ""}" type="button" data-chart-range="${option.value}" aria-pressed="${activeChartRange === option.value}">${option.label}</button>`).join("")}
+            </nav>
+            ${activeChartRange === "custom" ? `
+              <form class="custom-range chart-custom-range" id="chart-range-form">
+                <label>From<input type="date" name="chart_start" value="${escapeHtml(chartStartDate)}" required></label>
+                <label>To<input type="date" name="chart_end" value="${escapeHtml(chartEndDate)}" required></label>
+                <button class="custom-apply" type="submit">Apply</button>
+              </form>
+            ` : ""}
           </div>
         </div>
       </div>
@@ -565,7 +617,8 @@ function renderUsageTables(data) {
   const modelPage = paginateRows(data.models, modelUsagePage);
   dailyUsagePage = dailyPage.page;
   modelUsagePage = modelPage.page;
-  const heat = heatmapCells(data.daily, data.range, data.range_start, data.range_end, cacheMode);
+  const chartDaily = data.chart?.daily || data.daily;
+  const heat = heatmapCells(chartDaily, data.chart.range, data.chart.range_start, data.chart.range_end, cacheMode);
   const months = monthLabels(heat);
   const heatColumns = Math.max(1, Math.ceil(heat.length / 7));
   return `
@@ -826,6 +879,32 @@ function bindTableView(data) {
       syncUrl();
       render(data);
     });
+  });
+
+  document.querySelectorAll("[data-chart-range]").forEach((button) => {
+    button.addEventListener("click", () => {
+      activeChartRange = button.dataset.chartRange;
+      if (activeChartRange === "custom") {
+        chartStartDate = isIsoDate(chartStartDate) ? chartStartDate : data.chart.range_start || todayKey();
+        chartEndDate = isIsoDate(chartEndDate) ? chartEndDate : data.chart.range_end || chartStartDate;
+        normalizeChartCustomRange();
+        render(data);
+        return;
+      }
+      syncUrl();
+      refresh();
+    });
+  });
+
+  document.querySelector("#chart-range-form")?.addEventListener("submit", (event) => {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    chartStartDate = String(form.get("chart_start") || "");
+    chartEndDate = String(form.get("chart_end") || "");
+    normalizeChartCustomRange();
+    activeChartRange = "custom";
+    syncUrl();
+    refresh();
   });
 
   document.querySelectorAll("[data-cache-mode]").forEach((button) => {
@@ -1672,12 +1751,17 @@ async function refresh() {
     diagnosticsErrors.delete(diagnosticsKey(data));
     activeProvider = data.provider || activeProvider;
     activeRange = data.range || activeRange;
+    activeChartRange = data.chart?.range || activeChartRange;
     customRangePending = false;
     customRangeOpen = false;
     ignoreAutoReview = Boolean(data.ignore_auto_review);
     if (data.range === "custom") {
       customStartDate = data.range_start || customStartDate;
       customEndDate = data.range_end || customEndDate;
+    }
+    if (data.chart?.range === "custom") {
+      chartStartDate = data.chart.range_start || chartStartDate;
+      chartEndDate = data.chart.range_end || chartEndDate;
     }
     render(data);
   } catch (error) {
@@ -1691,6 +1775,9 @@ async function refresh() {
 
 if (activeRange === "custom") {
   normalizeCustomRange();
+}
+if (activeChartRange === "custom") {
+  normalizeChartCustomRange();
 }
 
 syncUrl();
