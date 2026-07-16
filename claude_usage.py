@@ -8,9 +8,12 @@ import json
 import sqlite3
 from pathlib import Path
 
+from unibase import ClosingConnection, Unibase, sanitize_error, stable_id
+
 
 DEFAULT_CLAUDE_PROJECTS = Path.home() / ".claude" / "projects"
 DEFAULT_CLAUDE_DB = Path.home() / ".claude" / "usage-dashboard.sqlite"
+PARSER_VERSION = 2
 
 
 SCHEMA = """
@@ -45,7 +48,7 @@ create index if not exists usage_events_source_path on usage_events(source_path)
 
 def connect(db_path: Path) -> sqlite3.Connection:
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(db_path, timeout=30)
+    conn = sqlite3.connect(db_path, timeout=30, factory=ClosingConnection)
     conn.row_factory = sqlite3.Row
     conn.execute("pragma journal_mode = wal")
     conn.execute("pragma busy_timeout = 30000")
@@ -116,6 +119,200 @@ def parse_usage_event(item: object, source_path: str, line_offset: int, raw_line
         "cache_creation_input_tokens": cache_creation_input_tokens,
         "cache_read_input_tokens": cache_read_input_tokens,
         "output_tokens": output_tokens,
+    }
+
+
+def _hash_private_id(kind: str, value: object) -> str:
+    return stable_id("claude", kind, str(value or ""))
+
+
+def parse_unibase_event(item: object) -> dict | None:
+    """Extract Claude assistant usage without retaining transcript content or raw IDs."""
+    if not isinstance(item, dict) or item.get("type") != "assistant":
+        return None
+    message = item.get("message")
+    if not isinstance(message, dict) or message.get("role") != "assistant":
+        return None
+    usage = message.get("usage")
+    if not isinstance(usage, dict):
+        return None
+    timestamp = parse_timestamp(item.get("timestamp"))
+    if timestamp is None:
+        return None
+    model = str(message.get("model") or "").strip()
+    if not model or model.startswith("<"):
+        return None
+
+    input_tokens = token_value(usage, "input_tokens")
+    cache_write_tokens = token_value(usage, "cache_creation_input_tokens")
+    cache_read_tokens = token_value(usage, "cache_read_input_tokens")
+    output_tokens = token_value(usage, "output_tokens")
+    if not any((input_tokens, cache_write_tokens, cache_read_tokens, output_tokens)):
+        return None
+
+    native_id = str(item.get("uuid") or message.get("id") or "").strip()
+    session_value = item.get("sessionId") or item.get("session_id") or native_id
+    stream_key = _hash_private_id("session", session_value)
+    timestamp_text, occurred_at, _, _ = timestamp
+    if native_id:
+        event_key = _hash_private_id("event", native_id)
+    else:
+        fallback = {
+            "timestamp": timestamp_text,
+            "model": model,
+            "stream": stream_key,
+            "input": input_tokens,
+            "cache_read": cache_read_tokens,
+            "cache_write": cache_write_tokens,
+            "output": output_tokens,
+        }
+        event_key = stable_id("claude", "fallback", json.dumps(fallback, sort_keys=True, separators=(",", ":")))
+    return {
+        "provider": "claude",
+        "event_key": event_key,
+        "stream_key": stream_key,
+        "timestamp_utc": dt.datetime.fromtimestamp(occurred_at, dt.timezone.utc).isoformat().replace("+00:00", "Z"),
+        "occurred_at": occurred_at,
+        "model": model,
+        "native_provider_id": "anthropic",
+        "semantics": "claude_metadata",
+        "classification": "usage_update",
+        "input_tokens": input_tokens,
+        "cache_read_tokens": cache_read_tokens,
+        "cache_write_tokens": cache_write_tokens,
+        "output_tokens": output_tokens,
+        "reasoning_tokens": 0,
+        "cost_usd": None,
+        "cost_kind": "unavailable",
+    }
+
+
+def claude_usage_files(root: Path) -> list[Path]:
+    projects = root if root.name == "projects" else root / "projects"
+    if not projects.is_dir():
+        return []
+    excluded_parts = {"tool-results", "file-history", "history", "sessions"}
+    files = []
+    for path in projects.glob("**/*.jsonl"):
+        relative = path.relative_to(projects)
+        if not path.is_file() or excluded_parts.intersection(relative.parts):
+            continue
+        if path.name.startswith(".claude.json.backup") or path.name.startswith("meta"):
+            continue
+        files.append(path)
+    return sorted(files)
+
+
+def _prefix_hash(path: Path, size: int) -> str:
+    digest = hashlib.sha256()
+    remaining = size
+    with path.open("rb") as handle:
+        while remaining > 0:
+            chunk = handle.read(min(1024 * 1024, remaining))
+            if not chunk:
+                break
+            digest.update(chunk)
+            remaining -= len(chunk)
+    return digest.hexdigest()
+
+
+def import_claude_source(unibase: Unibase, source: dict) -> dict[str, int]:
+    source_id = str(source["source_id"])
+    root = Path(source["root_path"])
+    files = claude_usage_files(root)
+    if not root.exists():
+        error = FileNotFoundError("Claude source is unavailable")
+        unibase.mark_source_error(source_id, error)
+        raise error
+    scan_generation = unibase.begin_source_scan(source_id)
+    scanned_files = 0
+    processed_records = 0
+    seen_paths: list[str] = []
+    base = root if root.name == "projects" else root / "projects"
+    try:
+        for path in files:
+            relative_path = path.relative_to(base).as_posix()
+            file_key = f'file:{stable_id("claude", "source-file", relative_path)}'
+            seen_paths.append(file_key)
+            stat = path.stat()
+            previous = unibase.file_checkpoint(source_id, file_key)
+            offset = int(previous["complete_offset"]) if previous else 0
+            replaced = bool(
+                previous
+                and (
+                    stat.st_size < offset
+                    or (stat.st_size == int(previous["size"]) and stat.st_mtime_ns != int(previous["mtime_ns"]))
+                    or (
+                        offset > 0
+                        and previous.get("content_hash")
+                        and stat.st_mtime_ns != int(previous["mtime_ns"])
+                        and _prefix_hash(path, offset) != previous["content_hash"]
+                    )
+                )
+            )
+            if replaced:
+                offset = 0
+            source_file_id = int(previous["source_file_id"]) if previous else unibase.upsert_source_file(
+                source_id, file_key, "claude_transcript", size=0, mtime_ns=0,
+                complete_offset=0, scan_generation=scan_generation, parser_version=PARSER_VERSION,
+            )
+            final_offset = offset
+            parsed_events = []
+            if previous is None or replaced or offset < stat.st_size:
+                scanned_files += 1
+                with path.open("rb") as handle:
+                    handle.seek(offset)
+                    while True:
+                        line_start = handle.tell()
+                        raw_line = handle.readline()
+                        if not raw_line:
+                            break
+                        complete = raw_line.endswith(b"\n")
+                        try:
+                            item = json.loads(raw_line)
+                        except (json.JSONDecodeError, UnicodeDecodeError):
+                            if not complete:
+                                handle.seek(line_start)
+                                break
+                            continue
+                        parsed = parse_unibase_event(item)
+                        if parsed:
+                            parsed_events.append(parsed)
+                            processed_records += 1
+                    final_offset = handle.tell()
+                if replaced:
+                    unibase.replace_source_file_events(source_id, source_file_id, parsed_events, scan_generation)
+                else:
+                    unibase.add_events(source_id, source_file_id, parsed_events, scan_generation)
+            final_stat = path.stat()
+            content_hash = _prefix_hash(path, final_offset)
+            unibase.upsert_source_file(
+                source_id,
+                file_key,
+                "claude_transcript",
+                size=final_stat.st_size,
+                mtime_ns=final_stat.st_mtime_ns,
+                complete_offset=final_offset,
+                content_hash=content_hash,
+                scan_generation=scan_generation,
+                parser_version=PARSER_VERSION,
+            )
+        unibase.reconcile_source_files(
+            source_id,
+            scan_generation,
+            seen_paths,
+            rebuild_active=scanned_files > 0,
+        )
+    except Exception as exc:
+        unibase.mark_source_error(source_id, sanitize_error(exc) or "Claude import failed")
+        raise
+    active_count = len([row for row in unibase.active_event_rows("claude")])
+    return {
+        "files": len(files),
+        "scanned_files": scanned_files,
+        "processed_records": processed_records,
+        "new_events": processed_records,
+        "events": active_count,
     }
 
 

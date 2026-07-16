@@ -7,7 +7,7 @@ export default defineConfig({
     strictPort: true,
     proxy: {
       "/data.json": "http://127.0.0.1:8766",
-      "/api/usage": "http://127.0.0.1:8766"
+      "/api": "http://127.0.0.1:8766"
     }
   }
 });

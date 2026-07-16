@@ -1,30 +1,54 @@
 #!/usr/bin/env python3
-"""Local Codex and Claude Code usage dashboard."""
+"""MeterMesh local multi-provider usage dashboard backed by Unibase."""
 
 from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import html
+import ipaddress
 import json
 import os
 import sqlite3
+import threading
+import time
+import warnings
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from claude_usage import DEFAULT_CLAUDE_DB, DEFAULT_CLAUDE_PROJECTS, index_claude_usage, load_claude_events
+from claude_usage import import_claude_source
+from codex_usage import import_codex_source
+from opencode_usage import import_opencode_source, resolve_opencode_db
+from unibase import (
+    OPERATION_LOCKS,
+    ClosingConnection,
+    OperationConflict,
+    RevisionConflict,
+    Unibase,
+    register_default_sources,
+    resolve_unibase_path,
+)
 
 
 DEFAULT_DB = Path.home() / ".codex" / "state_5.sqlite"
-PROVIDERS = {"codex", "claude"}
+PROVIDERS = {"all", "codex", "claude", "opencode"}
 RANGES = {"all", "30d", "7d", "1d", "custom"}
-CHART_RANGES = {"all", "1y", "6m", "90d", "30d", "custom"}
+CHART_RANGES = {"all", "1y", "6m", "90d", "30d", "7d", "1d", "custom"}
+REQUEST_GROUPS = {"none", "1m", "15m", "30m", "1h", "6h", "12h", "24h"}
+REQUEST_PAGE_SIZES = {10, 25, 50, 100}
 AUTO_REVIEW_MODEL = "codex-auto-review"
 PRICING_URL = "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
 PRICING_CACHE_SECONDS = 600
 PRICING_CACHE: dict[str, object] = {"loaded_at": 0.0, "pricing": None}
+SOURCE_REFRESH_DEBOUNCE_SECONDS = 300.0
+SOURCE_REFRESH_STATE_LOCK = threading.Lock()
+SOURCE_REFRESH_RUNNING = False
+SOURCE_REFRESH_LAST_STARTED = 0.0
 FALLBACK_PRICING = {
     "gpt-5.5": {
         "input_cost_per_token": 0.000005,
@@ -82,7 +106,7 @@ FALLBACK_PRICING = {
 def connect(db_path: Path) -> sqlite3.Connection:
     if not db_path.exists():
         raise FileNotFoundError(f"Codex state database not found: {db_path}")
-    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, factory=ClosingConnection)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -115,7 +139,7 @@ def day_from_iso_timestamp(value: str) -> str:
 
 
 def normalize_provider(provider: str | None) -> str:
-    return provider if provider in PROVIDERS else "codex"
+    return provider if provider in PROVIDERS else "all"
 
 
 def normalize_range(range_name: str | None) -> str:
@@ -168,8 +192,9 @@ def load_pricing() -> dict:
     if isinstance(cached, dict) and now - loaded_at < PRICING_CACHE_SECONDS:
         return cached
 
+    started_at = time.perf_counter()
     try:
-        request = Request(PRICING_URL, headers={"User-Agent": "codex-usage-dashboard"})
+        request = Request(PRICING_URL, headers={"User-Agent": "MeterMesh/2.0"})
         with urlopen(request, timeout=2.5) as response:
             live_pricing = json.loads(response.read().decode("utf-8"))
         pricing = {
@@ -192,6 +217,11 @@ def load_pricing() -> dict:
 
     PRICING_CACHE["loaded_at"] = now
     PRICING_CACHE["pricing"] = pricing
+    print(
+        f"[MeterMesh timing] pricing refresh: {(time.perf_counter() - started_at) * 1000:.0f} ms; "
+        f'source={pricing["source"]}',
+        flush=True,
+    )
     return pricing
 
 
@@ -287,7 +317,13 @@ def resolve_chart_range(
     start_date: dt.date | None = None
     end_date: dt.date | None = None
 
-    if range_name == "30d":
+    if range_name == "1d":
+        start_date = today
+        end_date = today
+    elif range_name == "7d":
+        start_date = today - dt.timedelta(days=6)
+        end_date = today
+    elif range_name == "30d":
         start_date = today - dt.timedelta(days=29)
         end_date = today
     elif range_name == "90d":
@@ -960,6 +996,1138 @@ def load_usage(
     return result
 
 
+PROVIDER_LABELS = {"all": "All", "codex": "Codex", "claude": "Claude", "opencode": "OpenCode"}
+AGGREGATE_KEYS = (
+    "input_tokens",
+    "cache_creation_input_tokens",
+    "cache_read_input_tokens",
+    "cached_input_tokens",
+    "raw_input_tokens",
+    "output_tokens",
+    "reasoning_output_tokens",
+    "total_tokens",
+    "total_with_cached_tokens",
+    "cost_usd",
+)
+
+
+def resolve_timezone(value: str | None) -> ZoneInfo:
+    try:
+        return ZoneInfo(value or "UTC")
+    except ZoneInfoNotFoundError:
+        return ZoneInfo("UTC")
+
+
+def event_from_active_row(row: dict, timezone: ZoneInfo, all_scope: bool, pricing: dict) -> tuple[dict, str | None]:
+    timestamp = dt.datetime.fromisoformat(str(row["timestamp_utc"]).replace("Z", "+00:00"))
+    local = timestamp.astimezone(timezone)
+    provider = str(row["provider"])
+    model = str(row["model"])
+    model_label = f"{PROVIDER_LABELS[provider]} · {model}" if all_scope else model
+    cache_read = int(row["cache_read_tokens"] or 0)
+    cache_write = int(row["cache_write_tokens"] or 0)
+    input_tokens = int(row["input_tokens"] or 0)
+    output_tokens = int(row["output_tokens"] or 0)
+    event = {
+        "provider": provider,
+        "thread_id": f'{provider}:{row["stream_key"]}',
+        "timestamp": row["timestamp_utc"],
+        "hour": local.strftime("%Y-%m-%d %H:00"),
+        "day": local.date().isoformat(),
+        "model": model_label,
+        "model_key": f'{provider}:{row.get("native_provider_id") or provider}:{model}',
+        "source": row["semantics"],
+        "classification": row["classification"],
+        "input_tokens": input_tokens,
+        "cache_creation_input_tokens": cache_write,
+        "cache_read_input_tokens": cache_read,
+        "cached_input_tokens": cache_read + cache_write,
+        "raw_input_tokens": input_tokens + cache_read + cache_write,
+        "output_tokens": output_tokens,
+        "reasoning_output_tokens": int(row["reasoning_tokens"] or 0),
+        "total_tokens": input_tokens + output_tokens,
+        "total_with_cached_tokens": input_tokens + output_tokens + cache_read + cache_write,
+        "cost_kind": row["cost_kind"],
+        "event_label": {
+            "exact": "Exact response usage",
+            "cumulative_fallback": "Cumulative fallback",
+            "claude_metadata": "Claude metadata",
+            "opencode_recorded": "Recorded by OpenCode",
+        }.get(row["semantics"], str(row["semantics"])),
+    }
+    missing_model = None
+    if row["cost_kind"] == "recorded" and row["cost_usd"] is not None:
+        event["cost_usd"] = float(row["cost_usd"])
+    else:
+        event["cost_usd"], missing_model = token_cost_usd({**event, "model": model}, pricing)
+        event["cost_kind"] = "unavailable" if missing_model else "estimated"
+    return event, missing_model
+
+
+def _aggregate_rows(events: list[dict]) -> tuple[list[dict], list[dict]]:
+    daily_map: dict[str, dict] = {}
+    model_map: dict[str, dict] = {}
+    for event in events:
+        day = event["day"]
+        model = event["model"]
+        daily = daily_map.setdefault(day, {"day": day, "sessions": set(), **{key: 0 for key in AGGREGATE_KEYS}})
+        model_row = model_map.setdefault(
+            event["model_key"],
+            {
+                "model": model,
+                "model_key": event["model_key"],
+                "provider": event["provider"],
+                "sessions": set(),
+                "daily_map": {},
+                **{key: 0 for key in AGGREGATE_KEYS},
+            },
+        )
+        model_daily = model_row["daily_map"].setdefault(
+            day, {"day": day, "sessions": set(), **{key: 0 for key in AGGREGATE_KEYS}}
+        )
+        for target in (daily, model_row, model_daily):
+            target["sessions"].add(event["thread_id"])
+            for key in AGGREGATE_KEYS:
+                target[key] += event[key]
+    daily_rows = sorted(daily_map.values(), key=lambda row: row["day"])
+    for row in daily_rows:
+        row["sessions"] = len(row["sessions"])
+    model_rows = sorted(model_map.values(), key=lambda row: (row["total_tokens"], len(row["sessions"])), reverse=True)
+    for row in model_rows:
+        row["sessions"] = len(row["sessions"])
+        model_days = sorted(row.pop("daily_map").values(), key=lambda item: item["day"], reverse=True)
+        for item in model_days:
+            item["sessions"] = len(item["sessions"])
+        row["active_days"] = len(model_days)
+        row["daily"] = model_days
+    return daily_rows, model_rows
+
+
+def _usage_where(
+    provider: str,
+    start_ts: int | None,
+    end_ts: int | None,
+    ignore_auto_review: bool,
+) -> tuple[str, list[object]]:
+    clauses = []
+    params: list[object] = []
+    if provider != "all":
+        clauses.append("provider = ?")
+        params.append(provider)
+    if start_ts is not None:
+        clauses.append("occurred_at >= ?")
+        params.append(start_ts)
+    if end_ts is not None:
+        clauses.append("occurred_at < ?")
+        params.append(end_ts)
+    if ignore_auto_review:
+        clauses.append("not (provider = 'codex' and model = ?)")
+        params.append(AUTO_REVIEW_MODEL)
+    return (" where " + " and ".join(clauses) if clauses else ""), params
+
+
+def _register_local_day(conn: sqlite3.Connection, timezone: ZoneInfo) -> None:
+    def local_day(occurred_at: int | float | None) -> str | None:
+        if occurred_at is None:
+            return None
+        return dt.datetime.fromtimestamp(int(occurred_at), timezone).date().isoformat()
+
+    conn.create_function("mm_local_day", 1, local_day, deterministic=True)
+
+
+def _local_day_sql(timezone: ZoneInfo, start_ts: int | None, end_ts: int | None) -> str:
+    if start_ts is None or end_ts is None or end_ts <= start_ts:
+        return "mm_local_day(occurred_at)"
+    offsets = set()
+    cursor = start_ts
+    last_ts = end_ts - 1
+    while cursor <= last_ts:
+        offset = dt.datetime.fromtimestamp(cursor, timezone).utcoffset()
+        offsets.add(int(offset.total_seconds()) if offset else 0)
+        if len(offsets) > 1:
+            return "mm_local_day(occurred_at)"
+        cursor += 24 * 60 * 60
+    offset = dt.datetime.fromtimestamp(last_ts, timezone).utcoffset()
+    offsets.add(int(offset.total_seconds()) if offset else 0)
+    if len(offsets) != 1:
+        return "mm_local_day(occurred_at)"
+    return f"date(occurred_at + {offsets.pop()}, 'unixepoch')"
+
+
+def _usage_time_bounds(
+    conn: sqlite3.Connection,
+    provider: str,
+    start_ts: int | None,
+    end_ts: int | None,
+    ignore_auto_review: bool,
+) -> tuple[int | None, int | None]:
+    where, params = _usage_where(provider, start_ts, end_ts, ignore_auto_review)
+    row = conn.execute(
+        "select min(occurred_at) first_event, max(occurred_at) last_event from active_events" + where,
+        params,
+    ).fetchone()
+    if row["first_event"] is None:
+        return start_ts, end_ts
+    return int(row["first_event"]), int(row["last_event"]) + 1
+
+
+def _usage_group_rows(
+    conn: sqlite3.Connection,
+    provider: str,
+    start_ts: int | None,
+    end_ts: int | None,
+    ignore_auto_review: bool,
+    local_day_sql: str,
+) -> list[dict]:
+    where, params = _usage_where(provider, start_ts, end_ts, ignore_auto_review)
+    rows = conn.execute(
+        """
+        select """ + local_day_sql + """ day,
+               provider,
+               model,
+               coalesce(nullif(native_provider_id, ''), provider) native_provider_id,
+               count(*) event_count,
+               sum(input_tokens) input_tokens,
+               sum(cache_read_tokens) cache_read_tokens,
+               sum(cache_write_tokens) cache_write_tokens,
+               sum(output_tokens) output_tokens,
+               sum(reasoning_tokens) reasoning_tokens,
+               sum(case when cost_kind = 'recorded' and cost_usd is not null then cost_usd else 0.0 end) recorded_cost,
+               sum(case when cost_kind = 'recorded' and cost_usd is not null then 0 else input_tokens end) repriced_input_tokens,
+               sum(case when cost_kind = 'recorded' and cost_usd is not null then 0 else cache_read_tokens end) repriced_cache_read_tokens,
+               sum(case when cost_kind = 'recorded' and cost_usd is not null then 0 else cache_write_tokens end) repriced_cache_write_tokens,
+               sum(case when cost_kind = 'recorded' and cost_usd is not null then 0 else output_tokens end) repriced_output_tokens,
+               sum(case when cost_kind = 'recorded' and cost_usd is not null then 0 else 1 end) repriced_events,
+               sum(classification = 'counter_reset') counter_resets,
+               sum(classification = 'unverifiable_event') unverifiable_events,
+               sum(semantics = 'exact') exact_usage_events,
+               sum(semantics = 'cumulative_fallback') fallback_usage_events,
+               min(occurred_at) first_occurred_at,
+               min(canonical_event_id) first_event_id
+        from active_events
+        """ + where + """
+        group by day, provider, model, native_provider_id
+        order by first_occurred_at, first_event_id
+        """,
+        params,
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def _usage_session_rows(
+    conn: sqlite3.Connection,
+    provider: str,
+    start_ts: int | None,
+    end_ts: int | None,
+    ignore_auto_review: bool,
+    local_day_sql: str,
+) -> list[dict]:
+    where, params = _usage_where(provider, start_ts, end_ts, ignore_auto_review)
+    rows = conn.execute(
+        """
+        select distinct """ + local_day_sql + """ day,
+               provider,
+               stream_key,
+               model,
+               coalesce(nullif(native_provider_id, ''), provider) native_provider_id
+        from active_events
+        """ + where,
+        params,
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def _chart_group_rows(
+    conn: sqlite3.Connection,
+    provider: str,
+    start_ts: int | None,
+    end_ts: int | None,
+    ignore_auto_review: bool,
+    local_day_sql: str,
+) -> list[dict]:
+    where, params = _usage_where(provider, start_ts, end_ts, ignore_auto_review)
+    rows = conn.execute(
+        """
+        select """ + local_day_sql + """ day,
+               provider,
+               model,
+               sum(input_tokens + output_tokens) total_tokens,
+               sum(input_tokens + output_tokens + cache_read_tokens + cache_write_tokens) total_with_cached_tokens,
+               min(occurred_at) first_occurred_at,
+               min(canonical_event_id) first_event_id
+        from active_events
+        """ + where + """
+        group by day, provider, model
+        order by first_occurred_at, first_event_id
+        """,
+        params,
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def _repriced_models(
+    conn: sqlite3.Connection,
+    provider: str,
+    start_ts: int | None,
+    end_ts: int | None,
+    ignore_auto_review: bool,
+) -> list[str]:
+    where, params = _usage_where(provider, start_ts, end_ts, ignore_auto_review)
+    cost_clause = "(cost_kind != 'recorded' or cost_usd is null)"
+    where += (" and " if where else " where ") + cost_clause
+    return [
+        str(row["model"])
+        for row in conn.execute("select distinct model from active_events" + where, params).fetchall()
+    ]
+
+
+def _price_usage_group(row: dict, pricing: dict, all_scope: bool) -> dict:
+    provider = str(row["provider"])
+    model = str(row["model"])
+    model_label = f"{PROVIDER_LABELS[provider]} · {model}" if all_scope else model
+    input_tokens = int(row["input_tokens"] or 0)
+    cache_read = int(row["cache_read_tokens"] or 0)
+    cache_write = int(row["cache_write_tokens"] or 0)
+    output_tokens = int(row["output_tokens"] or 0)
+    recorded_cost = float(row["recorded_cost"] or 0)
+    repriced_events = int(row["repriced_events"] or 0)
+    estimated_cost = 0.0
+    missing_model = None
+    if repriced_events:
+        estimated_cost, missing_model = token_cost_usd(
+            {
+                "model": model,
+                "input_tokens": int(row["repriced_input_tokens"] or 0),
+                "cache_creation_input_tokens": int(row["repriced_cache_write_tokens"] or 0),
+                "cache_read_input_tokens": int(row["repriced_cache_read_tokens"] or 0),
+                "cached_input_tokens": int(row["repriced_cache_read_tokens"] or 0)
+                + int(row["repriced_cache_write_tokens"] or 0),
+                "output_tokens": int(row["repriced_output_tokens"] or 0),
+            },
+            pricing,
+        )
+    return {
+        **row,
+        "model": model_label,
+        "raw_model": model,
+        "model_key": f'{provider}:{row["native_provider_id"]}:{model}',
+        "input_tokens": input_tokens,
+        "cache_creation_input_tokens": cache_write,
+        "cache_read_input_tokens": cache_read,
+        "cached_input_tokens": cache_read + cache_write,
+        "raw_input_tokens": input_tokens + cache_read + cache_write,
+        "output_tokens": output_tokens,
+        "reasoning_output_tokens": int(row["reasoning_tokens"] or 0),
+        "total_tokens": input_tokens + output_tokens,
+        "total_with_cached_tokens": input_tokens + output_tokens + cache_read + cache_write,
+        "cost_usd": recorded_cost + estimated_cost,
+        "recorded_cost": recorded_cost,
+        "estimated_cost": estimated_cost,
+        "unavailable_cost_events": repriced_events if missing_model else 0,
+        "missing_model": missing_model,
+    }
+
+
+def _chart_days_from_aggregate_rows(rows: list[dict], filters: dict[str, str | int | bool | None]) -> dict:
+    metric_keys = ("total_tokens", "total_with_cached_tokens")
+    bucket_model_map: dict[str, dict[str, dict[str, int]]] = {}
+    model_totals: dict[str, dict[str, int]] = {}
+    start_day = parse_iso_day(str(filters["start_day"])) if filters.get("start_day") else None
+    end_day = parse_iso_day(str(filters["end_day"])) if filters.get("end_day") else None
+    event_days = [dt.date.fromisoformat(str(row["day"])) for row in rows]
+    if start_day is None and event_days:
+        start_day = min(event_days)
+    if end_day is None:
+        end_day = max(dt.date.today(), max(event_days)) if event_days else dt.date.today()
+    if start_day is None:
+        start_day = end_day
+
+    granularity = chart_granularity(start_day, end_day)
+    for row in rows:
+        event_day = dt.date.fromisoformat(str(row["day"]))
+        bucket_start, _, _ = chart_bucket_for_day(event_day, granularity)
+        bucket_key = bucket_start.isoformat()
+        model = str(row["model"])
+        bucket_models = bucket_model_map.setdefault(bucket_key, {})
+        bucket_totals = bucket_models.setdefault(model, {key: 0 for key in metric_keys})
+        overall_totals = model_totals.setdefault(model, {key: 0 for key in metric_keys})
+        for key in metric_keys:
+            tokens = int(row[key])
+            bucket_totals[key] += tokens
+            overall_totals[key] += tokens
+
+    days = []
+    cursor, _, _ = chart_bucket_for_day(start_day, granularity)
+    while cursor <= end_day:
+        bucket_start, bucket_end, label = chart_bucket_for_day(cursor, granularity)
+        day_key = bucket_start.isoformat()
+        models = [
+            {"model": model, **totals}
+            for model, totals in sorted(
+                bucket_model_map.get(day_key, {}).items(), key=lambda item: item[1]["total_tokens"], reverse=True
+            )
+            if totals["total_tokens"] or totals["total_with_cached_tokens"]
+        ]
+        days.append({
+            "day": day_key,
+            "bucket_start": bucket_start.isoformat(),
+            "bucket_end": bucket_end.isoformat(),
+            "label": label,
+            "total_tokens": sum(item["total_tokens"] for item in models),
+            "total_with_cached_tokens": sum(item["total_with_cached_tokens"] for item in models),
+            "models": models,
+        })
+        if granularity == "month":
+            cursor = add_months(bucket_start, 1)
+        elif granularity == "week":
+            cursor = bucket_start + dt.timedelta(days=7)
+        else:
+            cursor = bucket_start + dt.timedelta(days=1)
+
+    models = [
+        {"model": model, **totals}
+        for model, totals in sorted(model_totals.items(), key=lambda item: item[1]["total_tokens"], reverse=True)
+        if totals["total_tokens"] or totals["total_with_cached_tokens"]
+    ]
+    return {
+        "range": filters["range"],
+        "granularity": granularity,
+        "range_start": start_day.isoformat(),
+        "range_end": end_day.isoformat(),
+        "days": days,
+        "models": models,
+    }
+
+
+def _diagnostics_from_unibase(unibase: Unibase, provider: str, groups: list[dict]) -> dict:
+    providers = ("codex", "claude", "opencode") if provider == "all" else (provider,)
+    source_rows = [row for row in unibase.sources() if row["provider"] in providers]
+    provider_breakdown = {}
+    for name in providers:
+        provider_groups = [row for row in groups if row["provider"] == name]
+        provider_sources = [row for row in source_rows if row["provider"] == name]
+        provider_breakdown[name] = {
+            "events": sum(int(row["event_count"]) for row in provider_groups),
+            "sources": len(provider_sources),
+            "stale_sources": sum(int(row["stale"]) for row in provider_sources),
+            "error_sources": sum(row["discovery_status"] == "error" for row in provider_sources),
+        }
+    with unibase.connect(readonly=True) as conn:
+        conflicts = int(
+            conn.execute(
+                "select count(*) from canonical_events where conflict_state = 'conflict' and (? = 'all' or provider = ?)",
+                (provider, provider),
+            ).fetchone()[0]
+        )
+    summary = {
+        "raw_token_events": 0,
+        "deduplicated_usage_updates": sum(int(row["event_count"]) for row in groups),
+        "replayed_events": 0,
+        "baseline_events": 0,
+        "counter_resets": sum(int(row["counter_resets"] or 0) for row in groups),
+        "unverifiable_events": sum(int(row["unverifiable_events"] or 0) for row in groups),
+        "exact_usage_events": sum(int(row["exact_usage_events"] or 0) for row in groups),
+        "fallback_usage_events": sum(int(row["fallback_usage_events"] or 0) for row in groups),
+        "reported_tokens": sum(int(row["total_with_cached_tokens"]) for row in groups),
+        "deduplicated_tokens": sum(int(row["total_with_cached_tokens"]) for row in groups),
+        "replay_rate": 0,
+        "estimated_local_overcount_tokens": 0,
+        "conflicts": conflicts,
+    }
+    safe_sources = [
+        {
+            "source_id": row["source_id"],
+            "provider": row["provider"],
+            "kind": row["kind"],
+            "label": row["label"],
+            "relative_name": row["relative_name"],
+            "enabled": bool(row["enabled"]),
+            "status": row["discovery_status"],
+            "stale": bool(row["stale"]),
+            "file_count": row["file_count"],
+            "event_count": row["event_count"],
+            "last_successful_scan": row["last_successful_scan"],
+            "error": row["error"],
+        }
+        for row in source_rows
+    ]
+    return {"summary": summary, "rows": [], "provider_breakdown": provider_breakdown, "sources": safe_sources}
+
+
+def load_unibase_usage(
+    unibase_path: Path,
+    range_name: str = "all",
+    start_day: str | None = None,
+    end_day: str | None = None,
+    ignore_auto_review: bool | None = None,
+    chart_range: str | None = "30d",
+    chart_start_day: str | None = None,
+    chart_end_day: str | None = None,
+    include_diagnostics: bool = False,
+    provider: str = "all",
+    timezone_name: str = "UTC",
+) -> dict:
+    started_at = time.perf_counter()
+    provider = normalize_provider(provider)
+    unibase = Unibase(unibase_path, migrate=False)
+    settings = unibase.settings()
+    if ignore_auto_review is None:
+        ignore_auto_review = bool(settings["ignore_codex_auto_review"])
+    filters = resolve_range(range_name, start_day, end_day, bool(ignore_auto_review))
+    chart_filters = resolve_chart_range(chart_range, chart_start_day, chart_end_day, bool(ignore_auto_review))
+    timezone = resolve_timezone(timezone_name)
+    usage_start_ts, usage_end_ts = _local_range_timestamps(filters, timezone)
+    chart_start_ts, chart_end_ts = _local_range_timestamps(chart_filters, timezone)
+    pricing = load_pricing()
+    sql_started_at = time.perf_counter()
+    envelope_start_ts = (
+        None if usage_start_ts is None or chart_start_ts is None else min(usage_start_ts, chart_start_ts)
+    )
+    envelope_end_ts = None if usage_end_ts is None or chart_end_ts is None else max(usage_end_ts, chart_end_ts)
+    with unibase.connect(readonly=True) as conn:
+        conn.execute("begin")
+        _register_local_day(conn, timezone)
+        actual_start_ts, actual_end_ts = _usage_time_bounds(
+            conn, provider, envelope_start_ts, envelope_end_ts, bool(ignore_auto_review)
+        )
+        local_day_sql = _local_day_sql(timezone, actual_start_ts, actual_end_ts)
+        raw_groups = _usage_group_rows(
+            conn, provider, usage_start_ts, usage_end_ts, bool(ignore_auto_review), local_day_sql
+        )
+        session_rows = _usage_session_rows(
+            conn, provider, usage_start_ts, usage_end_ts, bool(ignore_auto_review), local_day_sql
+        )
+        same_chart_range = (usage_start_ts, usage_end_ts) == (chart_start_ts, chart_end_ts)
+        raw_chart_rows = raw_groups if same_chart_range else _chart_group_rows(
+            conn, provider, chart_start_ts, chart_end_ts, bool(ignore_auto_review), local_day_sql
+        )
+        repriced_models = _repriced_models(
+            conn, provider, envelope_start_ts, envelope_end_ts, bool(ignore_auto_review)
+        )
+        conn.commit()
+    groups = [_price_usage_group(row, pricing, provider == "all") for row in raw_groups]
+    print(
+        f"[MeterMesh timing] usage SQL aggregates: {(time.perf_counter() - sql_started_at) * 1000:.0f} ms; "
+        f"groups={len(groups)}; sessions={len(session_rows)}; provider={provider}",
+        flush=True,
+    )
+
+    total_sessions: set[tuple[str, str]] = set()
+    daily_sessions: dict[str, set[tuple[str, str]]] = {}
+    model_sessions: dict[str, set[tuple[str, str]]] = {}
+    model_day_sessions: dict[tuple[str, str], set[tuple[str, str]]] = {}
+    provider_sessions: dict[str, set[str]] = {name: set() for name in ("codex", "claude", "opencode")}
+    for row in session_rows:
+        name = str(row["provider"])
+        session = (name, str(row["stream_key"]))
+        model_key = f'{name}:{row["native_provider_id"]}:{row["model"]}'
+        day = str(row["day"])
+        total_sessions.add(session)
+        daily_sessions.setdefault(day, set()).add(session)
+        model_sessions.setdefault(model_key, set()).add(session)
+        model_day_sessions.setdefault((model_key, day), set()).add(session)
+        provider_sessions[name].add(str(row["stream_key"]))
+
+    daily_map: dict[str, dict] = {}
+    model_map: dict[str, dict] = {}
+    provider_breakdown = {
+        name: {
+            "events": 0,
+            "sessions": 0,
+            "total_tokens": 0,
+            "total_with_cached_tokens": 0,
+            "cost": {"recorded": 0.0, "estimated": 0.0, "unavailable": 0},
+        }
+        for name in ("codex", "claude", "opencode")
+    }
+    missing_models = set()
+    for model in repriced_models:
+        if model_price_key(model, pricing["models"]) is None and model_price_key(model, pricing["fallback"]) is None:
+            missing_models.add(model)
+    cost_breakdown = {"recorded": 0.0, "estimated": 0.0, "unavailable": 0}
+    for row in groups:
+        day = str(row["day"])
+        model_key = str(row["model_key"])
+        daily = daily_map.setdefault(day, {"day": day, **{key: 0 for key in AGGREGATE_KEYS}})
+        model_row = model_map.setdefault(
+            model_key,
+            {
+                "model": row["model"],
+                "model_key": model_key,
+                "provider": row["provider"],
+                "daily_map": {},
+                "first_occurred_at": row["first_occurred_at"],
+                "first_event_id": row["first_event_id"],
+                **{key: 0 for key in AGGREGATE_KEYS},
+            },
+        )
+        model_daily = model_row["daily_map"].setdefault(
+            day, {"day": day, **{key: 0 for key in AGGREGATE_KEYS}}
+        )
+        for target in (daily, model_row, model_daily):
+            for key in AGGREGATE_KEYS:
+                target[key] += row[key]
+        name = str(row["provider"])
+        provider_row = provider_breakdown[name]
+        provider_row["events"] += int(row["event_count"])
+        provider_row["total_tokens"] += int(row["total_tokens"])
+        provider_row["total_with_cached_tokens"] += int(row["total_with_cached_tokens"])
+        provider_row["cost"]["recorded"] += float(row["recorded_cost"])
+        provider_row["cost"]["estimated"] += float(row["estimated_cost"])
+        provider_row["cost"]["unavailable"] += int(row["unavailable_cost_events"])
+        cost_breakdown["recorded"] += float(row["recorded_cost"])
+        cost_breakdown["estimated"] += float(row["estimated_cost"])
+        cost_breakdown["unavailable"] += int(row["unavailable_cost_events"])
+        if row["missing_model"]:
+            missing_models.add(str(row["missing_model"]))
+
+    daily_rows = sorted(daily_map.values(), key=lambda row: row["day"])
+    for row in daily_rows:
+        row["sessions"] = len(daily_sessions.get(str(row["day"]), set()))
+    model_rows = list(model_map.values())
+    for row in model_rows:
+        model_key = str(row["model_key"])
+        row["sessions"] = len(model_sessions.get(model_key, set()))
+        model_days = sorted(row.pop("daily_map").values(), key=lambda item: item["day"], reverse=True)
+        for item in model_days:
+            item["sessions"] = len(model_day_sessions.get((model_key, str(item["day"])), set()))
+        row["active_days"] = len(model_days)
+        row["daily"] = model_days
+    model_rows.sort(
+        key=lambda row: (
+            -int(row["total_tokens"]),
+            -int(row["sessions"]),
+            int(row["first_occurred_at"]),
+            int(row["first_event_id"]),
+        )
+    )
+    for row in model_rows:
+        row.pop("first_occurred_at")
+        row.pop("first_event_id")
+    for name, row in provider_breakdown.items():
+        row["sessions"] = len(provider_sessions[name])
+
+    days = {row["day"] for row in daily_rows}
+    peak = max(daily_rows, key=lambda row: row["total_tokens"], default=None)
+    totals = {key: sum(row[key] for row in daily_rows) for key in AGGREGATE_KEYS}
+    totals["sessions"] = len(total_sessions)
+    totals["active_days"] = len(days)
+    if same_chart_range:
+        chart_rows = [
+            {
+                "day": row["day"],
+                "model": row["model"],
+                "total_tokens": row["total_tokens"],
+                "total_with_cached_tokens": row["total_with_cached_tokens"],
+            }
+            for row in groups
+        ]
+    else:
+        chart_rows = [
+            {
+                **row,
+                "model": f'{PROVIDER_LABELS[str(row["provider"])]} · {row["model"]}'
+                if provider == "all" else str(row["model"]),
+            }
+            for row in raw_chart_rows
+        ]
+    result = {
+        "provider": provider,
+        "provider_label": PROVIDER_LABELS[provider],
+        "data_source": "Unibase",
+        "supports_diagnostics": True,
+        "generation": settings["generation"],
+        "range": filters["range"],
+        "range_start": filters["start_day"],
+        "range_end": filters["end_day"],
+        "timezone": getattr(timezone, "key", "UTC"),
+        "ignore_auto_review": bool(ignore_auto_review),
+        "generated_at": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "totals": totals,
+        "cost": cost_breakdown,
+        "provider_breakdown": provider_breakdown,
+        "daily": daily_rows,
+        "models": model_rows,
+        "chart": _chart_days_from_aggregate_rows(chart_rows, chart_filters),
+        "pricing": {
+            "source": pricing["source"], "url": pricing["url"], "loaded_at": pricing["loaded_at"],
+            "error": pricing["error"], "missing_models": sorted(missing_models),
+        },
+        "favorite_model": model_rows[0]["model"] if model_rows else "-",
+        "current_streak": current_streak(days),
+        "longest_streak": longest_streak(days),
+        "peak_day": peak["day"] if peak else "-",
+        "peak_day_tokens": peak["total_tokens"] if peak else 0,
+    }
+    if include_diagnostics:
+        result["diagnostics"] = _diagnostics_from_unibase(unibase, provider, groups)
+    print(
+        f"[MeterMesh timing] usage aggregation total: {(time.perf_counter() - started_at) * 1000:.0f} ms; "
+        f"groups={len(groups)}; chart_groups={len(chart_rows)}",
+        flush=True,
+    )
+    return result
+
+
+def _local_range_timestamps(filters: dict, timezone: ZoneInfo) -> tuple[int | None, int | None]:
+    start_day = parse_iso_day(str(filters["start_day"])) if filters.get("start_day") else None
+    end_day = parse_iso_day(str(filters["end_day"])) if filters.get("end_day") else None
+    start_ts = None
+    end_ts = None
+    if start_day:
+        start_ts = int(dt.datetime.combine(start_day, dt.time.min, timezone).timestamp())
+    if end_day:
+        end_ts = int(dt.datetime.combine(end_day + dt.timedelta(days=1), dt.time.min, timezone).timestamp())
+    return start_ts, end_ts
+
+
+def _request_item(row: dict, timezone: ZoneInfo, all_scope: bool, pricing: dict) -> dict:
+    event, _ = event_from_active_row(row, timezone, all_scope, pricing)
+    return {
+        "provider": event["provider"],
+        "timestamp": event["timestamp"],
+        "local_timestamp": dt.datetime.fromisoformat(str(event["timestamp"]).replace("Z", "+00:00")).astimezone(timezone).isoformat(),
+        "model": event["model"],
+        "input": event["input_tokens"],
+        "output": event["output_tokens"],
+        "reasoning": event["reasoning_output_tokens"],
+        "cache_read": event["cache_read_input_tokens"],
+        "cache_write": event["cache_creation_input_tokens"],
+        "cached": event["cache_read_input_tokens"],
+        "total": event["total_tokens"],
+        "total_with_cache": event["total_with_cached_tokens"],
+        "event_label": event["event_label"],
+        "classification": event["classification"],
+        "cost": event["cost_usd"] if event["cost_kind"] != "unavailable" else None,
+        "cost_kind": event["cost_kind"],
+        "cost_label": {
+            "recorded": "Recorded by OpenCode",
+            "estimated": "Estimated",
+            "unavailable": "Unavailable",
+        }[event["cost_kind"]],
+        "_internal_id": int(row["canonical_event_id"]),
+        "_occurred_at": int(row["occurred_at"]),
+    }
+
+
+def _bucket_start(timestamp: str, group: str, timezone: ZoneInfo) -> dt.datetime:
+    local = dt.datetime.fromisoformat(timestamp.replace("Z", "+00:00")).astimezone(timezone)
+    if group == "24h":
+        return local.replace(hour=0, minute=0, second=0, microsecond=0)
+    minutes = {"1m": 1, "15m": 15, "30m": 30, "1h": 60, "6h": 360, "12h": 720}[group]
+    minute_of_day = local.hour * 60 + local.minute
+    floored = minute_of_day - minute_of_day % minutes
+    return local.replace(hour=floored // 60, minute=floored % 60, second=0, microsecond=0)
+
+
+def _public_request_item(item: dict) -> dict:
+    return {key: value for key, value in item.items() if not key.startswith("_")}
+
+
+def _requests_snapshot_digest(rows) -> str:
+    digest = hashlib.sha256()
+    for row in rows:
+        digest.update(json.dumps(dict(row), sort_keys=True, separators=(",", ":")).encode())
+    return digest.hexdigest()[:20]
+
+
+class SnapshotConflict(RuntimeError):
+    pass
+
+
+def load_requests(
+    unibase_path: Path,
+    *,
+    provider: str = "all",
+    range_name: str = "all",
+    start_day: str | None = None,
+    end_day: str | None = None,
+    timezone_name: str = "UTC",
+    ignore_auto_review: bool | None = None,
+    group: str = "none",
+    page: int = 1,
+    page_size: int = 25,
+    snapshot: str | None = None,
+) -> dict:
+    started_at = time.perf_counter()
+    provider = normalize_provider(provider)
+    if group not in REQUEST_GROUPS:
+        raise ValueError("Invalid request grouping")
+    if page < 1:
+        raise ValueError("Page must be at least 1")
+    if page_size not in REQUEST_PAGE_SIZES:
+        raise ValueError("Invalid page size")
+    timezone = resolve_timezone(timezone_name)
+    unibase = Unibase(unibase_path, migrate=False)
+    with unibase.connect(readonly=True) as conn:
+        conn.execute("begin")
+        settings = conn.execute(
+            "select generation, ignore_codex_auto_review from app_settings where id = 1"
+        ).fetchone()
+        if ignore_auto_review is None:
+            ignore_auto_review = bool(settings["ignore_codex_auto_review"])
+        filters = resolve_range(range_name, start_day, end_day, bool(ignore_auto_review))
+        start_ts, end_ts = _local_range_timestamps(filters, timezone)
+        snapshot_generation = int(settings["generation"])
+        clauses = []
+        params: list[object] = []
+        if provider != "all":
+            clauses.append("provider = ?")
+            params.append(provider)
+        if start_ts is not None:
+            clauses.append("occurred_at >= ?")
+            params.append(start_ts)
+        if end_ts is not None:
+            clauses.append("occurred_at < ?")
+            params.append(end_ts)
+        if ignore_auto_review:
+            clauses.append("not (provider = 'codex' and model = ?)")
+            params.append(AUTO_REVIEW_MODEL)
+        base_where = " where " + " and ".join(clauses) if clauses else ""
+        max_event_id = int(conn.execute(
+            "select coalesce(max(canonical_event_id), 0) from active_events" + base_where,
+            params,
+        ).fetchone()[0])
+        if snapshot:
+            try:
+                snapshot_generation_text, max_event_text, expected_digest = snapshot.split(":", 2)
+                snapshot_generation = int(snapshot_generation_text)
+                max_event_id = int(max_event_text)
+            except (ValueError, AttributeError) as exc:
+                raise ValueError("Invalid snapshot") from exc
+        snapshot_clauses = [*clauses, "canonical_event_id <= ?"]
+        snapshot_params = [*params, max_event_id]
+        snapshot_where = " where " + " and ".join(snapshot_clauses)
+        digest_sql = """
+            select count(*) row_count,
+                   coalesce(sum(canonical_event_id), 0) canonical_id_sum,
+                   coalesce(sum(event_variant_id), 0) variant_id_sum,
+                   coalesce(sum(occurred_at), 0) occurred_at_sum,
+                   coalesce(sum(input_tokens), 0) input_sum,
+                   coalesce(sum(cache_read_tokens), 0) cache_read_sum,
+                   coalesce(sum(cache_write_tokens), 0) cache_write_sum,
+                   coalesce(sum(output_tokens), 0) output_sum,
+                   coalesce(sum(reasoning_tokens), 0) reasoning_sum,
+                   coalesce(sum(cost_usd), 0) cost_sum,
+                   coalesce(sum(length(model)), 0) model_length_sum,
+                   coalesce(sum(length(stream_key)), 0) stream_length_sum,
+                   sum(cost_kind = 'recorded') recorded_count,
+                   sum(cost_kind = 'estimated') estimated_count,
+                   sum(cost_kind = 'unavailable') unavailable_count
+            from active_events
+        """ + snapshot_where
+        digest_started_at = time.perf_counter()
+        snapshot_digest = _requests_snapshot_digest(conn.execute(digest_sql, snapshot_params))
+        print(
+            f"[MeterMesh timing] requests snapshot digest: "
+            f"{(time.perf_counter() - digest_started_at) * 1000:.0f} ms",
+            flush=True,
+        )
+        if snapshot and snapshot_digest != expected_digest:
+            raise SnapshotConflict("Requests snapshot changed; reload the first page")
+        if group == "none":
+            total_rows = int(conn.execute(
+                "select count(*) from active_events" + snapshot_where,
+                snapshot_params,
+            ).fetchone()[0])
+            total_pages = max((total_rows + page_size - 1) // page_size, 1)
+            page_rows = [dict(row) for row in conn.execute(
+                "select * from active_events" + snapshot_where
+                + " order by occurred_at desc, canonical_event_id desc limit ? offset ?",
+                [*snapshot_params, page_size, (page - 1) * page_size],
+            )]
+            ordered_keys = []
+            branch_rows = {}
+        else:
+            ordered_keys = []
+            seen_keys = set()
+            bucket_rows = conn.execute(
+                "select timestamp_utc from active_events" + snapshot_where
+                + " order by occurred_at desc, canonical_event_id desc",
+                snapshot_params,
+            )
+            for row in bucket_rows:
+                key = _bucket_start(row["timestamp_utc"], group, timezone).isoformat()
+                if key not in seen_keys:
+                    seen_keys.add(key)
+                    ordered_keys.append(key)
+            total_rows = len(ordered_keys)
+            total_pages = max((total_rows + page_size - 1) // page_size, 1)
+            start = (page - 1) * page_size
+            selected_keys = set(ordered_keys[start : start + page_size])
+            branch_rows = {key: [] for key in selected_keys}
+            event_rows = conn.execute(
+                "select * from active_events" + snapshot_where
+                + " order by occurred_at desc, canonical_event_id desc",
+                snapshot_params,
+            )
+            for row in event_rows:
+                key = _bucket_start(row["timestamp_utc"], group, timezone).isoformat()
+                if key in selected_keys:
+                    branch_rows[key].append(dict(row))
+        conn.commit()
+
+    snapshot_value = f"{snapshot_generation}:{max_event_id}:{snapshot_digest}"
+    pricing = load_pricing()
+    if group == "none":
+        page_items = [
+            _public_request_item(_request_item(row, timezone, provider == "all", pricing))
+            for row in page_rows
+        ]
+    else:
+        page_items = []
+        for key in ordered_keys[start : start + page_size]:
+            children = [
+                _public_request_item(_request_item(row, timezone, provider == "all", pricing))
+                for row in branch_rows[key]
+            ]
+            page_items.append({
+                "bucket_start": key,
+                "count": len(children),
+                "input": sum(item["input"] for item in children),
+                "output": sum(item["output"] for item in children),
+                "reasoning": sum(item["reasoning"] for item in children),
+                "cache_read": sum(item["cache_read"] for item in children),
+                "cache_write": sum(item["cache_write"] for item in children),
+                "total": sum(item["total"] for item in children),
+                "total_with_cache": sum(item["total_with_cache"] for item in children),
+                "children": children,
+            })
+    result = {
+        "provider": provider,
+        "group": group,
+        "timezone": getattr(timezone, "key", "UTC"),
+        "page": page,
+        "page_size": page_size,
+        "total_pages": total_pages,
+        "total_top_level_rows": total_rows,
+        "has_previous": page > 1 and page <= total_pages,
+        "has_next": page < total_pages,
+        "snapshot": snapshot_value,
+        "items": page_items,
+    }
+    print(
+        f"[MeterMesh timing] requests load total: {(time.perf_counter() - started_at) * 1000:.0f} ms; "
+        f"group={group}; page_items={len(page_items)}",
+        flush=True,
+    )
+    return result
+
+
+def display_path(path: Path) -> str:
+    try:
+        return "~/" + path.expanduser().relative_to(Path.home()).as_posix()
+    except ValueError:
+        return path.name
+
+
+def settings_payload(unibase_path: Path) -> dict:
+    database = Unibase(unibase_path, migrate=False)
+    settings = database.settings()
+    groups = {provider: [] for provider in ("codex", "claude", "opencode")}
+    for row in database.sources():
+        if row["kind"] == "live":
+            continue
+        groups[row["provider"]].append({
+            "source_id": row["source_id"],
+            "label": row["label"],
+            "relative_name": row["relative_name"],
+            "enabled": bool(row["enabled"]),
+            "layout": "Normalized" if row["kind"] == "normalized_backup" else "Legacy layout",
+            "snapshot_date": row["snapshot_date"],
+            "status": row["discovery_status"],
+            "stale": bool(row["stale"]),
+            "file_count": row["file_count"],
+            "event_count": row["event_count"],
+            "last_successful_scan": row["last_successful_scan"],
+            "error": row["error"],
+        })
+    with database.connect(readonly=True) as conn:
+        counts = {
+            "active_events": int(conn.execute("select count(*) from active_events").fetchone()[0]),
+            "retained_variants": int(conn.execute("select count(*) from event_variants").fetchone()[0]),
+            "sources": int(conn.execute("select count(*) from sources").fetchone()[0]),
+        }
+    return {
+        "revision": settings["revision"],
+        "ignore_codex_auto_review": bool(settings["ignore_codex_auto_review"]),
+        "backups": groups,
+        "unibase": {
+            "path": display_path(unibase_path),
+            "generation": settings["generation"],
+            "state": settings["state"],
+            "counts": counts,
+            "current_operation": database.active_operation(),
+        },
+    }
+
+
+def import_registered_source(database: Unibase, source: dict, opencode_live_db: Path | None = None) -> None:
+    with OPERATION_LOCKS.acquire("maintenance"):
+        if database.settings()["state"] == "reset_empty":
+            return
+        try:
+            with database.source_transaction():
+                if source["provider"] == "codex":
+                    import_codex_source(database, source, ignore_auto_review=False)
+                elif source["provider"] == "claude":
+                    import_claude_source(database, source)
+                else:
+                    override = opencode_live_db if source["kind"] == "live" else None
+                    import_opencode_source(database, source, db_override=override)
+        except Exception as exc:
+            database.mark_source_error(str(source["source_id"]), exc)
+            raise
+
+
+def refresh_enabled_sources(
+    unibase_path: Path,
+    opencode_live_db: Path | None = None,
+    *,
+    codex_root: Path | None = None,
+    claude_root: Path | None = None,
+) -> None:
+    started_at = time.perf_counter()
+    database = Unibase(unibase_path)
+    with OPERATION_LOCKS.acquire("maintenance"):
+        if database.settings()["state"] == "reset_empty" or database.active_operation():
+            print("[MeterMesh timing] source refresh skipped: Unibase maintenance state", flush=True)
+            return
+        discovery_started_at = time.perf_counter()
+        register_default_sources(
+            database,
+            codex_root=codex_root,
+            claude_root=claude_root,
+            opencode_root=opencode_live_db.parent if opencode_live_db else None,
+        )
+        sources = database.sources()
+        print(
+            f"[MeterMesh timing] source discovery: {(time.perf_counter() - discovery_started_at) * 1000:.0f} ms; "
+            f"registered={len(sources)}",
+            flush=True,
+        )
+        for source in sources:
+            if not source["enabled"] or source["discovery_status"] in {"incomplete", "ambiguous", "unavailable"}:
+                continue
+            source_started_at = time.perf_counter()
+            source_name = f'{source["provider"]}/{source["relative_name"]}'
+            try:
+                import_registered_source(database, source, opencode_live_db)
+            except Exception as exc:  # noqa: BLE001
+                print(
+                    f"[MeterMesh timing] source import {source_name}: "
+                    f"{(time.perf_counter() - source_started_at) * 1000:.0f} ms; "
+                    f"error={exc.__class__.__name__}: {exc}",
+                    flush=True,
+                )
+                continue
+            print(
+                f"[MeterMesh timing] source import {source_name}: "
+                f"{(time.perf_counter() - source_started_at) * 1000:.0f} ms; status=ok",
+                flush=True,
+            )
+    print(
+        f"[MeterMesh timing] source refresh total: {(time.perf_counter() - started_at) * 1000:.0f} ms",
+        flush=True,
+    )
+
+
+def source_refresh_running() -> bool:
+    with SOURCE_REFRESH_STATE_LOCK:
+        return SOURCE_REFRESH_RUNNING
+
+
+def schedule_enabled_sources_refresh(
+    unibase_path: Path,
+    opencode_live_db: Path | None = None,
+    *,
+    codex_root: Path | None = None,
+    claude_root: Path | None = None,
+    reason: str,
+) -> bool:
+    global SOURCE_REFRESH_LAST_STARTED, SOURCE_REFRESH_RUNNING
+
+    now = time.monotonic()
+    with SOURCE_REFRESH_STATE_LOCK:
+        if SOURCE_REFRESH_RUNNING:
+            print(f"[MeterMesh timing] source refresh not scheduled: already running; reason={reason}", flush=True)
+            return False
+        if now - SOURCE_REFRESH_LAST_STARTED < SOURCE_REFRESH_DEBOUNCE_SECONDS:
+            print(f"[MeterMesh timing] source refresh not scheduled: debounced; reason={reason}", flush=True)
+            return False
+        SOURCE_REFRESH_RUNNING = True
+        SOURCE_REFRESH_LAST_STARTED = now
+
+    def worker() -> None:
+        global SOURCE_REFRESH_LAST_STARTED, SOURCE_REFRESH_RUNNING
+        try:
+            print(f"[MeterMesh timing] source refresh started; reason={reason}", flush=True)
+            refresh_enabled_sources(
+                unibase_path,
+                opencode_live_db,
+                codex_root=codex_root,
+                claude_root=claude_root,
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"[MeterMesh timing] source refresh failed: {exc.__class__.__name__}: {exc}", flush=True)
+        finally:
+            with SOURCE_REFRESH_STATE_LOCK:
+                SOURCE_REFRESH_RUNNING = False
+                SOURCE_REFRESH_LAST_STARTED = time.monotonic()
+
+    threading.Thread(target=worker, name="metermesh-source-refresh", daemon=True).start()
+    return True
+
+
+def _checkpoint_database(path: Path) -> None:
+    with Unibase(path).connect() as conn:
+        conn.execute("pragma wal_checkpoint(truncate)")
+
+
+def reindex_worker(main_path: Path, operation_id: str, opencode_live_db: Path | None = None) -> None:
+    main = Unibase(main_path)
+    staging_path = main_path.with_name(f".{main_path.name}.{operation_id}.staging")
+    try:
+        main.update_operation(operation_id, state="running", current=0, total=0)
+        if staging_path.exists():
+            staging_path.unlink()
+        with main.connect(readonly=True) as source_conn:
+            destination = sqlite3.connect(staging_path)
+            try:
+                source_conn.backup(destination)
+            finally:
+                destination.close()
+        staging = Unibase(staging_path)
+        staging.reset(allow_active_operation=True)
+        with staging.connect() as conn:
+            conn.execute("update app_settings set state = 'ready' where id = 1")
+        enabled_sources = [source for source in staging.sources() if source["enabled"]]
+        total = len(enabled_sources)
+        main.update_operation(operation_id, state="running", current=0, total=total)
+        for index, source in enumerate(enabled_sources, 1):
+            import_registered_source(staging, source, opencode_live_db)
+            main.update_operation(operation_id, state="running", current=index, total=total)
+        if not staging.integrity_check():
+            raise RuntimeError("Staging Unibase integrity check failed")
+        generation = staging.settings()["generation"]
+        staging.update_operation(
+            operation_id, state="succeeded", current=total, total=total, generation=generation
+        )
+        _checkpoint_database(staging_path)
+        with OPERATION_LOCKS.acquire("maintenance"):
+            with sqlite3.connect(staging_path) as source_conn, sqlite3.connect(main_path) as destination:
+                source_conn.backup(destination)
+        staging_path.unlink(missing_ok=True)
+        for suffix in ("-wal", "-shm"):
+            Path(str(staging_path) + suffix).unlink(missing_ok=True)
+    except Exception as exc:  # noqa: BLE001
+        try:
+            main.update_operation(operation_id, state="failed", error=exc)
+        finally:
+            if staging_path.exists():
+                staging_path.unlink()
+
+
 def heatmap_days(
     daily: list[dict],
     range_name: str,
@@ -1078,7 +2246,7 @@ def render_dashboard(data: dict) -> str:
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{html.escape(str(provider_label))} Usage Dashboard</title>
+  <title>MeterMesh · {html.escape(str(provider_label))}</title>
   <style>
     :root {{
       color-scheme: dark;
@@ -1278,7 +2446,7 @@ def render_dashboard(data: dict) -> str:
   <main>
     <header>
       <div>
-        <h1>{html.escape(str(provider_label))} Usage</h1>
+        <h1>MeterMesh · {html.escape(str(provider_label))}</h1>
         <div class="subtle">Generated {html.escape(data["generated_at"])} from {html.escape(str(data.get("data_source", "local logs")))} · <a href="/data.json?provider={provider}&range={html.escape(data["range"])}">aggregate JSON</a></div>
         <div class="subtle">Showing {html.escape(range_summary)}</div>
       </div>
@@ -1341,14 +2509,13 @@ def render_dashboard(data: dict) -> str:
 
 
 def render_error_page(message: str, db_path: Path) -> str:
-    safe_message = html.escape(message)
-    safe_path = html.escape(str(db_path))
+    safe_message = html.escape("Unibase or provider source is temporarily unavailable.")
     return f"""<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Codex Usage Dashboard</title>
+  <title>MeterMesh</title>
   <style>
     :root {{ color-scheme: dark; }}
     body {{
@@ -1382,10 +2549,10 @@ def render_error_page(message: str, db_path: Path) -> str:
 </head>
 <body>
   <main>
-    <h1>Codex Usage</h1>
-    <p>Could not read the Codex state database.</p>
+    <h1>MeterMesh</h1>
+    <p>Could not read committed Unibase data.</p>
     <code>{safe_message}</code>
-    <p class="muted">Data source: {safe_path}</p>
+    <p class="muted">Provider source files were not modified.</p>
   </main>
 </body>
 </html>"""
@@ -1395,58 +2562,109 @@ class DashboardHandler(BaseHTTPRequestHandler):
     db_path: Path = DEFAULT_DB
     claude_projects_path: Path = DEFAULT_CLAUDE_PROJECTS
     claude_db_path: Path = DEFAULT_CLAUDE_DB
+    opencode_db_path: Path = resolve_opencode_db()
+    unibase_path: Path | None = None
 
     def do_GET(self) -> None:
+        started_at = time.perf_counter()
         parsed = urlparse(self.path)
-        if parsed.path in {"/", "/index.html"}:
-            self.serve_dashboard(parsed.query)
-            return
-        if parsed.path in {"/data.json", "/api/usage"}:
-            self.serve_json(parsed.query)
-            return
-        if parsed.path == "/favicon.ico":
-            self.send_response(204)
-            self.end_headers()
-            return
-        self.send_error(404)
+        print(f"[MeterMesh timing] request started: GET {parsed.path}", flush=True)
+        try:
+            if parsed.path in {"/", "/index.html"}:
+                self.serve_dashboard(parsed.query)
+                return
+            if parsed.path in {"/data.json", "/api/usage"}:
+                self.serve_json(parsed.query)
+                return
+            if parsed.path == "/api/requests":
+                self.serve_requests(parsed.query)
+                return
+            if parsed.path == "/api/settings":
+                self.serve_settings()
+                return
+            if parsed.path == "/api/unibase/status":
+                self.serve_unibase_status(parsed.query)
+                return
+            if parsed.path == "/favicon.ico":
+                self.send_response(204)
+                self.end_headers()
+                return
+            self.send_error(404)
+        finally:
+            print(
+                f"[MeterMesh timing] request finished: GET {parsed.path}; "
+                f"{(time.perf_counter() - started_at) * 1000:.0f} ms",
+                flush=True,
+            )
+
+    def do_POST(self) -> None:
+        started_at = time.perf_counter()
+        parsed = urlparse(self.path)
+        print(f"[MeterMesh timing] request started: POST {parsed.path}", flush=True)
+        try:
+            if parsed.path == "/api/settings":
+                self.apply_settings_request()
+                return
+            if parsed.path == "/api/unibase/reset":
+                self.reset_unibase_request()
+                return
+            if parsed.path == "/api/unibase/reindex":
+                self.reindex_unibase_request()
+                return
+            self.send_error(404)
+        finally:
+            print(
+                f"[MeterMesh timing] request finished: POST {parsed.path}; "
+                f"{(time.perf_counter() - started_at) * 1000:.0f} ms",
+                flush=True,
+            )
 
     def filters_from_query(self, query_string: str) -> dict[str, str | int | bool | None]:
         query = parse_qs(query_string)
-        provider = normalize_provider(query.get("provider", ["codex"])[0])
+        default_provider = "all" if self.unibase_path else "codex"
+        provider = normalize_provider(query.get("provider", [default_provider])[0])
+        default_ignore = False
+        if self.unibase_path:
+            try:
+                database = Unibase(self.unibase_path, migrate=False)
+                self.seed_legacy_preference(database)
+                default_ignore = bool(database.settings()["ignore_codex_auto_review"])
+            except Exception:
+                default_ignore = False
         filters = resolve_range(
             query.get("range", ["all"])[0],
             query.get("start", [None])[0],
             query.get("end", [None])[0],
-            parse_bool_flag(query.get("ignore_auto_review", [None])[0], default=False) if provider == "codex" else False,
+            parse_bool_flag(query.get("ignore_auto_review", [None])[0], default=default_ignore)
+            if provider in {"all", "codex"} else False,
         )
         filters["provider"] = provider
+        filters["timezone"] = query.get("timezone", ["UTC"])[0]
         chart_filters = resolve_chart_range(
-            query.get("chart_range", ["30d"])[0],
-            query.get("chart_start", [None])[0],
-            query.get("chart_end", [None])[0],
+            str(filters["range"]),
+            filters["start_day"],
+            filters["end_day"],
             bool(filters["ignore_auto_review"]),
         )
         filters["chart_range"] = chart_filters["range"]
         filters["chart_start_day"] = chart_filters["start_day"]
         filters["chart_end_day"] = chart_filters["end_day"]
-        filters["include_diagnostics"] = provider == "codex" and parse_bool_flag(
-            query.get("include_diagnostics", [None])[0], default=False
-        )
+        requested_diagnostics = parse_bool_flag(query.get("include_diagnostics", [None])[0], default=False)
+        filters["include_diagnostics"] = requested_diagnostics if self.unibase_path else provider == "codex" and requested_diagnostics
         return filters
 
-    def send_body(self, status: int, content_type: str, body: bytes) -> None:
-        self.send_response(status)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        self.wfile.write(body)
-
-    def serve_dashboard(self, query_string: str) -> None:
-        filters = self.filters_from_query(query_string)
-        try:
-            data = load_usage(
-                self.db_path,
+    def usage_payload(self, filters: dict) -> dict:
+        if self.unibase_path:
+            schedule_enabled_sources_refresh(
+                self.unibase_path,
+                self.opencode_db_path,
+                codex_root=self.db_path.parent,
+                claude_root=self.claude_projects_path.parent
+                if self.claude_projects_path.name == "projects" else self.claude_projects_path,
+                reason="usage request",
+            )
+            return load_unibase_usage(
+                self.unibase_path,
                 str(filters["range"]),
                 filters["start_day"],
                 filters["end_day"],
@@ -1456,9 +2674,53 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 filters["chart_end_day"],
                 bool(filters["include_diagnostics"]),
                 provider=str(filters["provider"]),
-                claude_projects_path=self.claude_projects_path,
-                claude_db_path=self.claude_db_path,
+                timezone_name=str(filters["timezone"]),
             )
+        return load_usage(
+            self.db_path,
+            str(filters["range"]),
+            filters["start_day"],
+            filters["end_day"],
+            bool(filters["ignore_auto_review"]),
+            str(filters["chart_range"]),
+            filters["chart_start_day"],
+            filters["chart_end_day"],
+            bool(filters["include_diagnostics"]),
+            provider=str(filters["provider"]),
+            claude_projects_path=self.claude_projects_path,
+            claude_db_path=self.claude_db_path,
+        )
+
+    def send_body(self, status: int, content_type: str, body: bytes) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def send_json(self, status: int, payload: dict) -> None:
+        self.send_body(status, "application/json; charset=utf-8", json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+
+    def read_json_body(self) -> dict:
+        content_type = self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+        if content_type != "application/json":
+            raise ValueError("JSON content type required")
+        try:
+            content_length = int(self.headers.get("Content-Length", "0"))
+        except ValueError as exc:
+            raise ValueError("Invalid content length") from exc
+        if content_length <= 0 or content_length > 64 * 1024:
+            raise ValueError("Invalid body size")
+        payload = json.loads(self.rfile.read(content_length))
+        if not isinstance(payload, dict):
+            raise ValueError("JSON object required")
+        return payload
+
+    def serve_dashboard(self, query_string: str) -> None:
+        filters = self.filters_from_query(query_string)
+        try:
+            data = self.usage_payload(filters)
             body = render_dashboard(data).encode("utf-8")
             self.send_body(200, "text/html; charset=utf-8", body)
         except Exception as exc:  # noqa: BLE001
@@ -1469,23 +2731,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def serve_json(self, query_string: str) -> None:
         filters = self.filters_from_query(query_string)
         try:
-            payload = load_usage(
-                self.db_path,
-                str(filters["range"]),
-                filters["start_day"],
-                filters["end_day"],
-                bool(filters["ignore_auto_review"]),
-                str(filters["chart_range"]),
-                filters["chart_start_day"],
-                filters["chart_end_day"],
-                bool(filters["include_diagnostics"]),
-                provider=str(filters["provider"]),
-                claude_projects_path=self.claude_projects_path,
-                claude_db_path=self.claude_db_path,
-            )
+            payload = self.usage_payload(filters)
             status = 200
         except Exception as exc:  # noqa: BLE001
-            provider_label = "Claude" if filters["provider"] == "claude" else "Codex"
+            provider_label = PROVIDER_LABELS[str(filters["provider"])]
             payload = {
                 "error": f"Could not read {provider_label} usage data.",
                 "provider": filters["provider"],
@@ -1502,6 +2751,166 @@ class DashboardHandler(BaseHTTPRequestHandler):
             status = 503
         body = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
         self.send_body(status, "application/json; charset=utf-8", body)
+
+    def serve_requests(self, query_string: str) -> None:
+        if not self.unibase_path:
+            self.send_body(503, "application/json; charset=utf-8", b'{"error":"Unibase is not configured"}')
+            return
+        query = parse_qs(query_string)
+        try:
+            database = Unibase(self.unibase_path, migrate=False)
+            self.seed_legacy_preference(database)
+            schedule_enabled_sources_refresh(
+                self.unibase_path,
+                self.opencode_db_path,
+                codex_root=self.db_path.parent,
+                claude_root=self.claude_projects_path.parent
+                if self.claude_projects_path.name == "projects" else self.claude_projects_path,
+                reason="requests request",
+            )
+            payload = load_requests(
+                self.unibase_path,
+                provider=query.get("provider", ["all"])[0],
+                range_name=query.get("range", ["all"])[0],
+                start_day=query.get("start", [None])[0],
+                end_day=query.get("end", [None])[0],
+                timezone_name=query.get("timezone", ["UTC"])[0],
+                ignore_auto_review=(
+                    parse_bool_flag(query["ignore_auto_review"][0]) if "ignore_auto_review" in query else None
+                ),
+                group=query.get("group", ["none"])[0],
+                page=int(query.get("page", ["1"])[0]),
+                page_size=int(query.get("page_size", ["25"])[0]),
+                snapshot=query.get("snapshot", [None])[0],
+            )
+            status = 200
+        except SnapshotConflict as exc:
+            payload = {"error": str(exc)}
+            status = 409
+        except (ValueError, TypeError):
+            payload = {"error": "Invalid Requests parameters."}
+            status = 400
+        except Exception:  # noqa: BLE001
+            payload = {"error": "Could not load Requests from Unibase."}
+            status = 503
+        self.send_body(status, "application/json; charset=utf-8", json.dumps(payload).encode("utf-8"))
+
+    def serve_settings(self) -> None:
+        if not self.unibase_path:
+            self.send_json(503, {"error": "Unibase is not configured."})
+            return
+        try:
+            refresh_running = source_refresh_running()
+            database = Unibase(self.unibase_path, migrate=not refresh_running)
+            self.seed_legacy_preference(database)
+            if not refresh_running:
+                discovery_started_at = time.perf_counter()
+                register_default_sources(
+                    database,
+                    codex_root=self.db_path.parent,
+                    claude_root=self.claude_projects_path.parent
+                    if self.claude_projects_path.name == "projects" else self.claude_projects_path,
+                    opencode_root=self.opencode_db_path.parent,
+                )
+                print(
+                    f"[MeterMesh timing] settings source discovery: "
+                    f"{(time.perf_counter() - discovery_started_at) * 1000:.0f} ms",
+                    flush=True,
+                )
+            else:
+                print("[MeterMesh timing] settings source discovery skipped: source refresh is running", flush=True)
+            self.send_json(200, settings_payload(self.unibase_path))
+        except Exception as exc:  # noqa: BLE001
+            print(f"[MeterMesh timing] settings failed: {exc.__class__.__name__}: {exc}", flush=True)
+            self.send_json(503, {"error": "Could not load MeterMesh settings."})
+
+    def seed_legacy_preference(self, database: Unibase) -> None:
+        marker = "ignore_codex_auto_review_v2="
+        headers = getattr(self, "headers", {})
+        for part in headers.get("Cookie", "").split(";"):
+            if part.strip().startswith(marker):
+                database.seed_legacy_preference(parse_bool_flag(part.strip().split("=", 1)[1]))
+                return
+
+    def apply_settings_request(self) -> None:
+        if not self.unibase_path:
+            self.send_json(503, {"error": "Unibase is not configured."})
+            return
+        try:
+            payload = self.read_json_body()
+            if set(payload) != {"revision", "ignore_codex_auto_review", "backups"}:
+                raise ValueError("Unexpected settings fields")
+            if not isinstance(payload["revision"], int) or not isinstance(payload["ignore_codex_auto_review"], bool) or not isinstance(payload["backups"], list):
+                raise ValueError("Invalid settings fields")
+            database = Unibase(self.unibase_path)
+            database.apply_settings(payload["revision"], payload["ignore_codex_auto_review"], payload["backups"])
+            schedule_enabled_sources_refresh(
+                self.unibase_path,
+                self.opencode_db_path,
+                codex_root=self.db_path.parent,
+                claude_root=self.claude_projects_path.parent
+                if self.claude_projects_path.name == "projects" else self.claude_projects_path,
+                reason="settings update",
+            )
+            self.send_json(200, settings_payload(self.unibase_path))
+        except (RevisionConflict, OperationConflict) as exc:
+            self.send_json(409, {"error": str(exc)})
+        except (ValueError, json.JSONDecodeError):
+            self.send_json(400, {"error": "Invalid settings payload."})
+        except Exception:
+            self.send_json(503, {"error": "Could not apply MeterMesh settings."})
+
+    def reset_unibase_request(self) -> None:
+        if not self.unibase_path:
+            self.send_json(503, {"error": "Unibase is not configured."})
+            return
+        try:
+            payload = self.read_json_body()
+            if payload != {"confirmation": "RESET UNIBASE"}:
+                raise ValueError("Invalid reset confirmation")
+            database = Unibase(self.unibase_path)
+            database.reset()
+            self.send_json(200, settings_payload(self.unibase_path))
+        except OperationConflict as exc:
+            self.send_json(409, {"error": str(exc)})
+        except (ValueError, json.JSONDecodeError):
+            self.send_json(400, {"error": "Type RESET UNIBASE to confirm."})
+        except Exception:
+            self.send_json(503, {"error": "Could not reset Unibase."})
+
+    def reindex_unibase_request(self) -> None:
+        if not self.unibase_path:
+            self.send_json(503, {"error": "Unibase is not configured."})
+            return
+        try:
+            payload = self.read_json_body()
+            if payload:
+                raise ValueError("Reindex body must be empty")
+            operation_id = Unibase(self.unibase_path).create_operation("full_reindex")
+            threading.Thread(
+                target=reindex_worker,
+                args=(self.unibase_path, operation_id, self.opencode_db_path),
+                name=f"metermesh-reindex-{operation_id}",
+                daemon=True,
+            ).start()
+            self.send_json(202, {"operation_id": operation_id})
+        except OperationConflict as exc:
+            self.send_json(409, {"error": str(exc)})
+        except (ValueError, json.JSONDecodeError):
+            self.send_json(400, {"error": "Invalid reindex payload."})
+        except Exception:
+            self.send_json(503, {"error": "Could not start Full reindex."})
+
+    def serve_unibase_status(self, query_string: str) -> None:
+        if not self.unibase_path:
+            self.send_json(503, {"error": "Unibase is not configured."})
+            return
+        query = parse_qs(query_string)
+        try:
+            status = Unibase(self.unibase_path, migrate=False).operation_status(query.get("operation_id", [None])[0])
+            self.send_json(200, status)
+        except Exception:
+            self.send_json(503, {"error": "Could not read Unibase operation status."})
 
     def log_message(self, format: str, *args: object) -> None:
         print(f"{self.address_string()} - {format % args}")
@@ -1579,8 +2988,39 @@ def run_check(db_path: Path) -> None:
     print(f"Smoke check passed for {db_path}")
 
 
+def bootstrap_unibase(
+    unibase_path: Path,
+    codex_db_path: Path,
+    claude_projects_path: Path,
+    opencode_db_path: Path,
+) -> Unibase:
+    started_at = time.perf_counter()
+    database = Unibase(unibase_path)
+    database.recover_interrupted_operations()
+    claude_root = claude_projects_path.parent if claude_projects_path.name == "projects" else claude_projects_path
+    register_default_sources(
+        database,
+        codex_root=codex_db_path.parent,
+        claude_root=claude_root,
+        opencode_root=opencode_db_path.parent,
+    )
+    if database.settings()["state"] == "reset_empty":
+        print(
+            f"[MeterMesh timing] Unibase bootstrap: {(time.perf_counter() - started_at) * 1000:.0f} ms; "
+            "state=reset_empty",
+            flush=True,
+        )
+        return database
+    print(
+        f"[MeterMesh timing] Unibase bootstrap: {(time.perf_counter() - started_at) * 1000:.0f} ms; "
+        "imports=deferred",
+        flush=True,
+    )
+    return database
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Serve a local Codex and Claude usage dashboard.")
+    parser = argparse.ArgumentParser(description="Serve the local MeterMesh usage dashboard.")
     parser.add_argument("--db", type=Path, default=Path(os.environ.get("CODEX_USAGE_DB", DEFAULT_DB)))
     parser.add_argument(
         "--claude-projects",
@@ -1592,27 +3032,57 @@ def main() -> None:
         type=Path,
         default=Path(os.environ.get("CLAUDE_USAGE_DB", DEFAULT_CLAUDE_DB)),
     )
+    parser.add_argument("--opencode-db", type=Path, default=resolve_opencode_db())
+    parser.add_argument("--unibase-db", type=Path, default=resolve_unibase_path())
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--check", action="store_true", help="Render all ranges once and exit.")
     args = parser.parse_args()
+    try:
+        loopback_host = args.host == "localhost" or ipaddress.ip_address(args.host).is_loopback
+    except ValueError:
+        loopback_host = False
+    if not loopback_host and not parse_bool_flag(os.environ.get("METERMESH_ALLOW_REMOTE")):
+        parser.error("MeterMesh only binds to loopback by default; set METERMESH_ALLOW_REMOTE=1 to allow remote access")
 
     DashboardHandler.db_path = args.db.expanduser()
     DashboardHandler.claude_projects_path = args.claude_projects.expanduser()
     DashboardHandler.claude_db_path = args.claude_db.expanduser()
+    DashboardHandler.opencode_db_path = args.opencode_db.expanduser()
+    DashboardHandler.unibase_path = args.unibase_db.expanduser()
+    if "--claude-db" in os.sys.argv or os.environ.get("CLAUDE_USAGE_DB"):
+        warnings.warn("--claude-db is retained for compatibility but MeterMesh stores Claude usage in Unibase", stacklevel=1)
     if args.check:
         run_check(DashboardHandler.db_path)
         return
 
+    bootstrap_unibase(
+        DashboardHandler.unibase_path,
+        DashboardHandler.db_path,
+        DashboardHandler.claude_projects_path,
+        DashboardHandler.opencode_db_path,
+    )
     server = ThreadingHTTPServer((args.host, args.port), DashboardHandler)
-    print(f"Codex + Claude usage dashboard: http://{args.host}:{args.port}")
+    print(f"MeterMesh: http://{args.host}:{args.port}")
+    print(f"Unibase: {DashboardHandler.unibase_path}")
     print(f"Codex source: {DashboardHandler.db_path}")
     print(f"Claude source: {DashboardHandler.claude_projects_path}")
-    print(f"Claude index: {DashboardHandler.claude_db_path}")
+    print(f"OpenCode source: {DashboardHandler.opencode_db_path}")
+    schedule_enabled_sources_refresh(
+        DashboardHandler.unibase_path,
+        DashboardHandler.opencode_db_path,
+        codex_root=DashboardHandler.db_path.parent,
+        claude_root=(
+            DashboardHandler.claude_projects_path.parent
+            if DashboardHandler.claude_projects_path.name == "projects"
+            else DashboardHandler.claude_projects_path
+        ),
+        reason="startup",
+    )
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("\nStopped")
+        print("\nMeterMesh stopped")
 
 
 if __name__ == "__main__":
