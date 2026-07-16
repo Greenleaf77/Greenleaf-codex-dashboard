@@ -1,6 +1,6 @@
 import "./styles.css";
 import { compactNumber } from "./format.js";
-import { chartHeightPercent } from "./chart-scale.js";
+import { chartBarSizing, chartHeightPercent } from "./chart-scale.js";
 import { normalizeProvider, providerOptions } from "./provider-state.js";
 import { paginateRows, truncateModelName, USAGE_TABLE_PAGE_SIZE } from "./usage-table.js";
 import {
@@ -421,7 +421,7 @@ function renderTokensOverTime(chart, accountingMode) {
   const maxTokens = Math.max(1, ...days.map((day) => metricValue(day, accountingMode)));
   const ticks = [1, 0.75, 0.5, 0.25, 0].map((ratio) => Math.round(maxTokens * ratio));
   const labelEvery = Math.max(1, Math.ceil(days.length / 10));
-  const { barWidth, barGap, barFill, barMax } = chartBarSizing(chart.granularity, days.length);
+  const { barGap, barFill, barMax } = chartBarSizing(chart.granularity, days.length);
 
   if (!days.length) {
     return '<div class="chart-empty">No usage in this chart range.</div>';
@@ -433,7 +433,7 @@ function renderTokensOverTime(chart, accountingMode) {
         ${ticks.map((tick) => `<span>${compactNumber(tick)}</span>`).join("")}
       </div>
       <div class="chart-scroll">
-        <div class="bar-chart" style="--bar-count: ${days.length}; --bar-width: ${barWidth}px; --bar-gap: ${barGap}px; --bar-fill: ${barFill}%; --bar-max: ${barMax}px">
+        <div class="bar-chart" style="--bar-count: ${days.length}; --bar-gap: ${barGap}px; --bar-fill: ${barFill}%; --bar-max: ${barMax}px">
           <div class="chart-grid">
             ${ticks.map(() => '<span></span>').join("")}
           </div>
@@ -448,19 +448,6 @@ function renderTokensOverTime(chart, accountingMode) {
     </div>
     ${renderChartLegend(models)}
   `;
-}
-
-function chartBarSizing(granularity, count) {
-  if (granularity === "month") {
-    return { barWidth: count <= 14 ? 96 : 64, barGap: 10, barFill: 72, barMax: 88 };
-  }
-  if (granularity === "week") {
-    return { barWidth: count <= 16 ? 82 : 52, barGap: 8, barFill: 76, barMax: 72 };
-  }
-  if (count <= 32) {
-    return { barWidth: 44, barGap: 6, barFill: 82, barMax: 38 };
-  }
-  return { barWidth: 28, barGap: 4, barFill: 76, barMax: 24 };
 }
 
 function renderChartBar(day, models, maxTokens, index, labelEvery, dayCount, accountingMode) {

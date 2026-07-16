@@ -433,7 +433,6 @@ h2.section-title {
 .bar-chart {
   position: relative;
   height: 320px;
-  min-width: max(100%, calc(var(--bar-count) * (var(--bar-width) + var(--bar-gap))));
   padding: 0 4px 20px;
 }
 
@@ -454,7 +453,7 @@ h2.section-title {
   position: absolute;
   inset: 0 4px 20px;
   display: grid;
-  grid-template-columns: repeat(var(--bar-count), minmax(var(--bar-width), 1fr));
+  grid-template-columns: repeat(var(--bar-count), minmax(0, 1fr));
   gap: var(--bar-gap);
   pointer-events: none;
 }
@@ -467,17 +466,19 @@ h2.section-title {
   position: relative;
   z-index: 1;
   display: grid;
-  grid-template-columns: repeat(var(--bar-count), minmax(var(--bar-width), 1fr));
+  grid-template-columns: repeat(var(--bar-count), minmax(0, 1fr));
   gap: var(--bar-gap);
   align-items: end;
-  height: 300px;
+  height: 320px;
+  overflow: clip;
 }
 
 .bar-slot {
+  position: relative;
   display: grid;
   grid-template-rows: 300px 20px;
   align-items: end;
-  min-width: var(--bar-width);
+  min-width: 0;
   height: 320px;
 }
 
@@ -498,12 +499,30 @@ h2.section-title {
 }
 
 .bar-label {
+  width: 100%;
+  min-width: 0;
   padding-top: 5px;
   color: var(--text-tertiary);
   font-size: 10px;
   line-height: 1.2;
   text-align: center;
   white-space: nowrap;
+}
+
+.bar-slot:first-child .bar-label {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  width: max-content;
+  text-align: left;
+}
+
+.bar-slot:last-child .bar-label {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  width: max-content;
+  text-align: right;
 }
 
 .chart-legend {
