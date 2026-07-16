@@ -1,5 +1,7 @@
 import "./styles.css";
 import { compactNumber } from "./format.js";
+import { normalizeProvider, providerOptions } from "./provider-state.js";
+import { paginateRows, truncateModelName, USAGE_TABLE_PAGE_SIZE } from "./usage-table.js";
 import {
   WITH_CACHE,
   WITHOUT_CACHE,
@@ -12,11 +14,11 @@ const app = document.querySelector("#app");
 const tooltip = document.createElement("div");
 tooltip.className = "heat-tooltip";
 document.body.appendChild(tooltip);
+const modelNameTooltip = document.createElement("div");
+modelNameTooltip.className = "heat-tooltip model-name-tooltip";
+modelNameTooltip.setAttribute("role", "tooltip");
+document.body.appendChild(modelNameTooltip);
 
-const providerOptions = [
-  { value: "codex", label: "CODEX" },
-  { value: "claude", label: "CLAUDE" }
-];
 const rangeOptions = [
   { value: "all", label: "All" },
   { value: "30d", label: "30d" },
@@ -32,14 +34,8 @@ const accountingOptions = [
   { value: WITH_CACHE, label: "With cache" },
   { value: WITHOUT_CACHE, label: "Without cache" }
 ];
-const chartRangeOptions = [
-  { value: "all", label: "All" },
-  { value: "1y", label: "1y" },
-  { value: "6m", label: "6m" },
-  { value: "90d", label: "90d" },
-  { value: "30d", label: "30d" },
-  { value: "custom", label: "Custom" }
-];
+const requestGroupOptions = ["none", "1m", "15m", "30m", "1h", "6h", "12h", "24h"];
+const requestPageSizes = [10, 25, 50, 100];
 const chartColors = ["#3b82f6", "#22c55e", "#f59e0b", "#8b5cf6", "#14b8a6", "#f05d4f", "#60a5fa", "#a3e635"];
 const iconPaths = {
   brand: '<path d="m12 3.5 7 4v9l-7 4-7-4v-9l7-4Z"/><polyline points="8.2 12 10.7 14.5 15.8 9.4"/>',
@@ -56,18 +52,22 @@ const iconPaths = {
   trophy: '<path d="M8 4h8v4.5a4 4 0 0 1-8 0V4Z"/><path d="M8 6H4v1a4 4 0 0 0 4 4"/><path d="M16 6h4v1a4 4 0 0 1-4 4"/><path d="M12 12.5V17"/><path d="M8 21h8"/><path d="M9 17h6v4H9z"/>',
   chart: '<line x1="4" y1="20" x2="20" y2="20"/><line x1="6" y1="20" x2="6" y2="12"/><line x1="11" y1="20" x2="11" y2="7"/><line x1="16" y1="20" x2="16" y2="4"/><polyline points="4 8 9 5 13 7 20 3"/>',
   database: '<rect x="4" y="4" width="16" height="16" rx="2"/><line x1="4" y1="9" x2="20" y2="9"/><line x1="4" y1="15" x2="20" y2="15"/><circle cx="8" cy="6.5" r=".8"/><circle cx="8" cy="12" r=".8"/><circle cx="8" cy="18" r=".8"/><line x1="11" y1="6.5" x2="17" y2="6.5"/><line x1="11" y1="12" x2="17" y2="12"/><line x1="11" y1="18" x2="17" y2="18"/>',
+  settings: '<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.8 2.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6V21h-4v-.1a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1L4.2 17l.1-.1a1.7 1.7 0 0 0 .3-1.9A1.7 1.7 0 0 0 3 14H3v-4h.1a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9L4.2 7 7 4.2l.1.1a1.7 1.7 0 0 0 1.9.3A1.7 1.7 0 0 0 10 3h4v.1a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1L19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.1v4H21a1.7 1.7 0 0 0-1.6 1Z"/>',
   info: '<circle cx="12" cy="12" r="9"/><line x1="12" y1="10.5" x2="12" y2="16"/><circle cx="12" cy="7.5" r=".7"/>',
   usage: '<polyline points="3 13 7 13 9.5 6 14 18 16.5 11 21 11"/>',
   models: '<rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/><line x1="10" y1="7" x2="14" y2="7"/><line x1="7" y1="10" x2="7" y2="14"/><line x1="17" y1="10" x2="17" y2="14"/>'
 };
 const providerLogoPaths = {
+  all: 'M4 7.5 8 5l4 2.5L16 5l4 2.5v5L16 15l-4-2.5L8 15l-4-2.5v-5Zm4 2.5v5m4-7.5v5m4-7.5v5m-8 5 4 2.5 4-2.5m-4-2.5V18',
   codex: 'M22.2819 9.8211a5.9847 5.9847 0 0 0-.5157-4.9108 6.0462 6.0462 0 0 0-6.5098-2.9A6.0651 6.0651 0 0 0 4.9807 4.1818a5.9847 5.9847 0 0 0-3.9977 2.9 6.0462 6.0462 0 0 0 .7427 7.0966 5.98 5.98 0 0 0 .511 4.9107 6.051 6.051 0 0 0 6.5146 2.9001A5.9847 5.9847 0 0 0 13.2599 24a6.0557 6.0557 0 0 0 5.7718-4.2058 5.9894 5.9894 0 0 0 3.9977-2.9001 6.0557 6.0557 0 0 0-.7475-7.0729zm-9.022 12.6081a4.4755 4.4755 0 0 1-2.8764-1.0408l.1419-.0804 4.7783-2.7582a.7948.7948 0 0 0 .3927-.6813v-6.7369l2.02 1.1686a.071.071 0 0 1 .038.052v5.5826a4.504 4.504 0 0 1-4.4945 4.4944zm-9.6607-4.1254a4.4708 4.4708 0 0 1-.5346-3.0137l.142.0852 4.783 2.7582a.7712.7712 0 0 0 .7806 0l5.8428-3.3685v2.3324a.0804.0804 0 0 1-.0332.0615L9.74 19.9502a4.4992 4.4992 0 0 1-6.1408-1.6464zM2.3408 7.8956a4.485 4.485 0 0 1 2.3655-1.9728V11.6a.7664.7664 0 0 0 .3879.6765l5.8144 3.3543-2.0201 1.1685a.0757.0757 0 0 1-.071 0l-4.8303-2.7865A4.504 4.504 0 0 1 2.3408 7.872zm16.5963 3.8558L13.1038 8.364 15.1192 7.2a.0757.0757 0 0 1 .071 0l4.8303 2.7913a4.4944 4.4944 0 0 1-.6765 8.1042v-5.6772a.79.79 0 0 0-.407-.667zm2.0107-3.0231l-.142-.0852-4.7735-2.7818a.7759.7759 0 0 0-.7854 0L9.409 9.2297V6.8974a.0662.0662 0 0 1 .0284-.0615l4.8303-2.7866a4.4992 4.4992 0 0 1 6.6802 4.66zM8.3065 12.863l-2.02-1.1638a.0804.0804 0 0 1-.038-.0567V6.0742a4.4992 4.4992 0 0 1 7.3757-3.4537l-.142.0805L8.704 5.459a.7948.7948 0 0 0-.3927.6813zm1.0976-2.3654 2.602-1.4998 2.6069 1.4998v2.9994l-2.5974 1.4997-2.6067-1.4997Z',
-  claude: 'm4.7144 15.9555 4.7174-2.6471.079-.2307-.079-.1275h-.2307l-.7893-.0486-2.6956-.0729-2.3375-.0971-2.2646-.1214-.5707-.1215-.5343-.7042.0546-.3522.4797-.3218.686.0608 1.5179.1032 2.2767.1578 1.6514.0972 2.4468.255h.3886l.0546-.1579-.1336-.0971-.1032-.0972L6.973 9.8356l-2.55-1.6879-1.3356-.9714-.7225-.4918-.3643-.4614-.1578-1.0078.6557-.7225.8803.0607.2246.0607.8925.686 1.9064 1.4754 2.4893 1.8336.3643.3035.1457-.1032.0182-.0728-.164-.2733-1.3539-2.4467-1.445-2.4893-.6435-1.032-.17-.6194c-.0607-.255-.1032-.4674-.1032-.7285L6.287.1335 6.6997 0l.9957.1336.419.3642.6192 1.4147 1.0018 2.2282 1.5543 3.0296.4553.8985.2429.8318.091.255h.1579v-.1457l.1275-1.706.2368-2.0947.2307-2.6957.0789-.7589.3764-.9107.7468-.4918.5828.2793.4797.686-.0668.4433-.2853 1.8517-.5586 2.9021-.3643 1.9429h.2125l.2429-.2429.9835-1.3053 1.6514-2.0643.7286-.8196.85-.9046.5464-.4311h1.0321l.759 1.1293-.34 1.1657-1.0625 1.3478-.8804 1.1414-1.2628 1.7-.7893 1.36.0729.1093.1882-.0183 2.8535-.607 1.5421-.2794 1.8396-.3157.8318.3886.091.3946-.3278.8075-1.967.4857-2.3072.4614-3.4364.8136-.0425.0304.0486.0607 1.5482.1457.6618.0364h1.621l3.0175.2247.7892.522.4736.6376-.079.4857-1.2142.6193-1.6393-.3886-3.825-.9107-1.3113-.3279h-.1822v.1093l1.0929 1.0686 2.0035 1.8092 2.5075 2.3314.1275.5768-.3218.4554-.34-.0486-2.2039-1.6575-.85-.7468-1.9246-1.621h-.1275v.17l.4432.6496 2.3436 3.5214.1214 1.0807-.17.3521-.6071.2125-.6679-.1214-1.3721-1.9246L14.38 17.959l-1.1414-1.9428-.1397.079-.674 7.2552-.3156.3703-.7286.2793-.6071-.4614-.3218-.7468.3218-1.4753.3886-1.9246.3157-1.53.2853-1.9004.17-.6314-.0121-.0425-.1397.0182-1.4328 1.9672-2.1796 2.9446-1.7243 1.8456-.4128.164-.7164-.3704.0667-.6618.4008-.5889 2.386-3.0357 1.4389-1.882.929-1.0868-.0062-.1579h-.0546l-6.3385 4.1164-1.1293.1457-.4857-.4554.0608-.7467.2307-.2429 1.9064-1.3114Z'
+  claude: 'm4.7144 15.9555 4.7174-2.6471.079-.2307-.079-.1275h-.2307l-.7893-.0486-2.6956-.0729-2.3375-.0971-2.2646-.1214-.5707-.1215-.5343-.7042.0546-.3522.4797-.3218.686.0608 1.5179.1032 2.2767.1578 1.6514.0972 2.4468.255h.3886l.0546-.1579-.1336-.0971-.1032-.0972L6.973 9.8356l-2.55-1.6879-1.3356-.9714-.7225-.4918-.3643-.4614-.1578-1.0078.6557-.7225.8803.0607.2246.0607.8925.686 1.9064 1.4754 2.4893 1.8336.3643.3035.1457-.1032.0182-.0728-.164-.2733-1.3539-2.4467-1.445-2.4893-.6435-1.032-.17-.6194c-.0607-.255-.1032-.4674-.1032-.7285L6.287.1335 6.6997 0l.9957.1336.419.3642.6192 1.4147 1.0018 2.2282 1.5543 3.0296.4553.8985.2429.8318.091.255h.1579v-.1457l.1275-1.706.2368-2.0947.2307-2.6957.0789-.7589.3764-.9107.7468-.4918.5828.2793.4797.686-.0668.4433-.2853 1.8517-.5586 2.9021-.3643 1.9429h.2125l.2429-.2429.9835-1.3053 1.6514-2.0643.7286-.8196.85-.9046.5464-.4311h1.0321l.759 1.1293-.34 1.1657-1.0625 1.3478-.8804 1.1414-1.2628 1.7-.7893 1.36.0729.1093.1882-.0183 2.8535-.607 1.5421-.2794 1.8396-.3157.8318.3886.091.3946-.3278.8075-1.967.4857-2.3072.4614-3.4364.8136-.0425.0304.0486.0607 1.5482.1457.6618.0364h1.621l3.0175.2247.7892.522.4736.6376-.079.4857-1.2142.6193-1.6393-.3886-3.825-.9107-1.3113-.3279h-.1822v.1093l1.0929 1.0686 2.0035 1.8092 2.5075 2.3314.1275.5768-.3218.4554-.34-.0486-2.2039-1.6575-.85-.7468-1.9246-1.621h-.1275v.17l.4432.6496 2.3436 3.5214.1214 1.0807-.17.3521-.6071.2125-.6679-.1214-1.3721-1.9246L14.38 17.959l-1.1414-1.9428-.1397.079-.674 7.2552-.3156.3703-.7286.2793-.6071-.4614-.3218-.7468.3218-1.4753.3886-1.9246.3157-1.53.2853-1.9004.17-.6314-.0121-.0425-.1397.0182-1.4328 1.9672-2.1796 2.9446-1.7243 1.8456-.4128.164-.7164-.3704.0667-.6618.4008-.5889 2.386-3.0357 1.4389-1.882.929-1.0868-.0062-.1579h-.0546l-6.3385 4.1164-1.1293.1457-.4857-.4554.0608-.7467.2307-.2429 1.9064-1.3114Z',
+  opencode: 'M7 4.5h10l3 7.5-3 7.5H7L4 12l3-7.5Zm2.5 4L8 12l1.5 3.5h5L16 12l-1.5-3.5h-5Z'
 };
 const autoReviewModel = "codex-auto-review";
 const ignoreAutoReviewCookie = "ignore_codex_auto_review_v2";
 
 const initialState = readUrlState();
+const legacyIgnoreCookie = readCookie(ignoreAutoReviewCookie);
 let activeProvider = initialState.provider;
 let activeRange = initialState.range;
 let customRangePending = false;
@@ -75,12 +75,10 @@ let customRangeOpen = false;
 let customStartDate = initialState.start;
 let customEndDate = initialState.end;
 let activeVisualization = initialState.visualization;
-let chartRange = initialState.chartRange;
-let chartStartDate = initialState.chartStart;
-let chartEndDate = initialState.chartEnd;
 let cacheMode = initialState.cacheMode;
-let ignoreAutoReview = resolveIgnoreAutoReview(initialState.ignoreAutoReview, readCookie(ignoreAutoReviewCookie));
-let activeTableView = "usage";
+let ignoreAutoReview = resolveIgnoreAutoReview(initialState.ignoreAutoReview, legacyIgnoreCookie);
+let legacyIgnoreOverride = initialState.ignoreAutoReview ?? legacyIgnoreCookie;
+let activeTableView = initialState.view;
 let currentData = null;
 let diagnosticsController = null;
 let diagnosticsRequestKey = null;
@@ -90,6 +88,25 @@ let usageController = null;
 const diagnosticsCache = new Map();
 const diagnosticsErrors = new Map();
 const expandedModels = new Set();
+let dailyUsagePage = 1;
+let modelUsagePage = 1;
+let usageTableScope = "";
+let modelTooltipTimer = null;
+let requestsController = null;
+let requestsPayload = null;
+let requestsError = null;
+let requestGroup = initialState.requestGroup;
+let requestPage = initialState.requestPage;
+let requestPageSize = initialState.requestPageSize;
+let requestSnapshot = null;
+let settingsOpen = false;
+let settingsLoading = false;
+let settingsData = null;
+let settingsDraft = null;
+let settingsError = null;
+let resetConfirmOpen = false;
+let resetConfirmation = "";
+let operationPollTimer = null;
 
 const numberFormatter = new Intl.NumberFormat("en-US");
 const percentageFormatter = new Intl.NumberFormat("en-US", { minimumFractionDigits: 1, maximumFractionDigits: 1 });
@@ -102,6 +119,23 @@ function full(value) {
 
 function money(value) {
   return moneyFormatter.format(Number(value || 0));
+}
+
+function resetUsageTablePages() {
+  dailyUsagePage = 1;
+  modelUsagePage = 1;
+}
+
+function usageTableScopeKey(data) {
+  return [data.provider, data.range, data.range_start || "", data.range_end || ""].join(":");
+}
+
+function modelDisplayName(data, row) {
+  const model = String(row.model || "");
+  if (data.provider !== "all") return model;
+  const providerLabel = providerOptions.find((option) => option.value === row.provider)?.label || row.provider;
+  if (model.toLowerCase().startsWith(`${providerLabel.toLowerCase()} ·`)) return model;
+  return `${providerLabel} · ${model}`;
 }
 
 function localDayKey(date) {
@@ -133,14 +167,6 @@ function normalizeCustomRange() {
   }
 }
 
-function normalizeChartCustomRange() {
-  if (!isIsoDate(chartStartDate)) chartStartDate = todayKey();
-  if (!isIsoDate(chartEndDate)) chartEndDate = chartStartDate;
-  if (chartStartDate > chartEndDate) {
-    [chartStartDate, chartEndDate] = [chartEndDate, chartStartDate];
-  }
-}
-
 function positionCustomRangeDialog(dialog, anchor) {
   const margin = 8;
   const gap = 8;
@@ -166,21 +192,22 @@ function positionCustomRangeDialog(dialog, anchor) {
 
 function readUrlState() {
   const params = new URLSearchParams(window.location.search);
-  const provider = params.get("provider") || "codex";
+  const provider = params.get("provider") || "all";
   const range = params.get("range") || "all";
   const visualization = params.get("visualization") || "heatmap";
-  const selectedChartRange = params.get("chart_range") || "30d";
+  const selectedPageSize = Number.parseInt(params.get("page_size") || "25", 10);
   return {
-    provider: providerOptions.some((option) => option.value === provider) ? provider : "codex",
+    provider: normalizeProvider(provider),
     range: rangeOptions.some((option) => option.value === range) ? range : "all",
     start: params.get("start") || "",
     end: params.get("end") || "",
     visualization: visualizationOptions.some((option) => option.value === visualization) ? visualization : "heatmap",
-    chartRange: chartRangeOptions.some((option) => option.value === selectedChartRange) ? selectedChartRange : "30d",
-    chartStart: params.get("chart_start") || "",
-    chartEnd: params.get("chart_end") || "",
     cacheMode: resolveCacheMode(params.get("cache")),
-    ignoreAutoReview: params.get("ignore_auto_review")
+    ignoreAutoReview: params.get("ignore_auto_review"),
+    view: ["usage", "diagnostics", "requests"].includes(params.get("view")) ? params.get("view") : "usage",
+    requestGroup: requestGroupOptions.includes(params.get("group")) ? params.get("group") : "none",
+    requestPage: Math.max(Number.parseInt(params.get("page") || "1", 10) || 1, 1),
+    requestPageSize: requestPageSizes.includes(selectedPageSize) ? selectedPageSize : 25
   };
 }
 
@@ -210,19 +237,20 @@ function buildQuery(rangeName, includeDiagnostics = false) {
   const params = new URLSearchParams();
   params.set("provider", activeProvider);
   params.set("range", rangeName);
-  params.set("ignore_auto_review", activeProvider === "codex" && ignoreAutoReview ? "1" : "0");
+  if (legacyIgnoreOverride !== null) params.set("ignore_auto_review", ignoreAutoReview ? "1" : "0");
   params.set("visualization", activeVisualization);
-  params.set("chart_range", chartRange);
   params.set("cache", cacheMode);
+  params.set("timezone", Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC");
+  params.set("view", activeTableView);
+  if (activeTableView === "requests") {
+    params.set("group", requestGroup);
+    params.set("page", String(requestPage));
+    params.set("page_size", String(requestPageSize));
+  }
   if (rangeName === "custom") {
     normalizeCustomRange();
     params.set("start", customStartDate);
     params.set("end", customEndDate);
-  }
-  if (chartRange === "custom") {
-    normalizeChartCustomRange();
-    params.set("chart_start", chartStartDate);
-    params.set("chart_end", chartEndDate);
   }
   if (includeDiagnostics) params.set("include_diagnostics", "1");
   return params.toString();
@@ -244,18 +272,7 @@ function describeRange(data) {
   return "All time";
 }
 
-function describeChartRange(chart) {
-  if (chart.range === "custom" && chart.range_start && chart.range_end) {
-    return `${chart.range_start} - ${chart.range_end}`;
-  }
-  if (chart.range === "1y") return "Last 1 year";
-  if (chart.range === "6m") return "Last 6 months";
-  if (chart.range === "90d") return "Last 90 days";
-  if (chart.range === "30d") return "Last 30 days";
-  return "All time";
-}
-
-function dayLabel(day, fallbackDay, rangeName) {
+function dayLabel(day, fallbackDay) {
   if (day) return day;
   const date = parseDay(fallbackDay);
   if (!date) return fallbackDay;
@@ -302,14 +319,14 @@ function heatmapCells(daily, rangeName, rangeStart, rangeEnd, accountingMode) {
 function renderVisualizationPanel(data, heat, months, heatColumns) {
   const accountingLabel = cacheMode === WITH_CACHE ? "With cache" : "Without cache";
   return `
-    <section>
+    <div class="daily-visualization">
       <div class="viz-header">
         <div>
           <div class="section-title">
             <span class="section-icon tone-cyan">${icon("usage")}</span>
             <div>
               <h2>${activeVisualization === "tokens" ? "Tokens over time" : "Daily Heatmap"}</h2>
-              <div class="viz-note">${activeVisualization === "tokens" ? `Showing ${escapeHtml(describeChartRange(data.chart))}` : "Usage intensity by day"} · ${accountingLabel}</div>
+              <div class="viz-note">${activeVisualization === "tokens" ? `Showing ${escapeHtml(describeRange(data.chart))}` : "Usage intensity by day"} · ${accountingLabel}</div>
             </div>
           </div>
         </div>
@@ -322,11 +339,10 @@ function renderVisualizationPanel(data, heat, months, heatColumns) {
               ${visualizationOptions.map((option) => `<button class="seg ${activeVisualization === option.value ? "active" : ""}" data-visualization="${option.value}">${option.label}</button>`).join("")}
             </nav>
           </div>
-          ${activeVisualization === "tokens" ? renderChartRangeControls(data.chart) : ""}
         </div>
       </div>
       ${activeVisualization === "tokens" ? renderTokensOverTime(data.chart, cacheMode) : renderHeatmap(heat, months, heatColumns, cacheMode)}
-    </section>
+    </div>
   `;
 }
 
@@ -342,29 +358,6 @@ function renderHeatmap(heat, months, heatColumns, accountingMode) {
           ${months.map((month) => `<span style="grid-column: ${month.column}">${escapeHtml(month.label)}</span>`).join("")}
         </div>
       </div>
-    </div>
-  `;
-}
-
-function renderChartRangeControls(chart) {
-  return `
-    <div class="chart-filter">
-      <nav class="segments" aria-label="Chart range">
-        ${chartRangeOptions.map((option) => `<button class="seg ${chart.range === option.value ? "active" : ""}" data-chart-range="${option.value}">${option.label}</button>`).join("")}
-      </nav>
-      ${chart.range === "custom" ? `
-        <form class="custom-range chart-custom-range" id="chart-range-form">
-          <label>
-            <span>From</span>
-            <input id="chart-start" type="date" value="${escapeHtml(chart.range_start || chartStartDate)}">
-          </label>
-          <label>
-            <span>To</span>
-            <input id="chart-end" type="date" value="${escapeHtml(chart.range_end || chartEndDate)}">
-          </label>
-          <button class="custom-apply" type="submit">Apply</button>
-        </form>
-      ` : ""}
     </div>
   `;
 }
@@ -420,7 +413,7 @@ function chartBarSizing(granularity, count) {
 function renderChartBar(day, models, maxTokens, index, labelEvery, dayCount, accountingMode) {
   const tokens = metricValue(day, accountingMode);
   const height = tokens ? Math.max(2, (tokens / maxTokens) * 100) : 0;
-  const label = index % labelEvery === 0 || index === dayCount - 1 ? dayLabel(day.label, day.day, chartRange) : "";
+  const label = index % labelEvery === 0 || index === dayCount - 1 ? dayLabel(day.label, day.day) : "";
   const title = day.bucket_start && day.bucket_end && day.bucket_start !== day.bucket_end ? `${day.bucket_start} - ${day.bucket_end}` : day.day;
   const accountingLabel = accountingMode === WITH_CACHE ? "with cache" : "without cache";
   return `
@@ -476,14 +469,22 @@ async function load(rangeName) {
   const renderLoading = () => {
     const elapsedSeconds = Math.floor((Date.now() - startedAt) / 1000);
     const elapsed = elapsedSeconds >= 2 ? `<span>${full(elapsedSeconds)}s elapsed</span>` : "";
-    app.innerHTML = `<section class="state usage-loading" aria-live="polite"><span class="diagnostics-spinner" aria-hidden="true"></span><strong>Loading usage data…</strong>${elapsed}</section>`;
+    app.innerHTML = `<section class="state usage-loading" aria-live="polite"><span class="diagnostics-spinner" aria-hidden="true"></span><strong>MeterMesh is loading Unibase…</strong>${elapsed}</section>`;
   };
   renderLoading();
   usageLoadTimer = window.setInterval(renderLoading, 1000);
+  console.info("[MeterMesh timing] usage fetch started", { range: rangeName, provider: activeProvider });
   try {
     const response = await fetch(`/data.json?${buildQuery(rangeName)}`, { cache: "no-store", signal: controller.signal });
     if (!response.ok) throw new Error(`Usage API returned HTTP ${response.status}`);
-    return response.json();
+    const data = await response.json();
+    console.info("[MeterMesh timing] usage fetch completed", { elapsedMs: Date.now() - startedAt });
+    return data;
+  } catch (error) {
+    if (error.name !== "AbortError") {
+      console.error("[MeterMesh timing] usage fetch failed", { elapsedMs: Date.now() - startedAt, error });
+    }
+    throw error;
   } finally {
     if (usageController === controller) {
       if (usageLoadTimer) window.clearInterval(usageLoadTimer);
@@ -512,42 +513,105 @@ function renderModelDetails(row) {
   `;
 }
 
+function paginationItems(page, totalPages) {
+  const pages = [...new Set([1, totalPages, page - 1, page, page + 1])]
+    .filter((item) => item >= 1 && item <= totalPages)
+    .sort((left, right) => left - right);
+  const items = [];
+  pages.forEach((item, index) => {
+    if (index > 0 && item - pages[index - 1] > 1) items.push("ellipsis");
+    items.push(item);
+  });
+  return items;
+}
+
+function renderUsagePagination(kind, page, totalPages) {
+  if (totalPages <= 1) return "";
+  const label = kind === "daily" ? "Daily usage" : "Models";
+  return `
+    <nav class="table-pagination" aria-label="${label} pages">
+      <span class="table-page-size">${USAGE_TABLE_PAGE_SIZE} / page</span>
+      <button class="table-page-arrow" type="button" data-usage-page="${kind}" data-page="${page - 1}" aria-label="Previous ${label.toLowerCase()} page" ${page <= 1 ? "disabled" : ""}>‹</button>
+      ${paginationItems(page, totalPages).map((item) => item === "ellipsis"
+        ? '<span class="table-page-ellipsis">…</span>'
+        : `<button class="table-page-number ${item === page ? "active" : ""}" type="button" data-usage-page="${kind}" data-page="${item}" ${item === page ? 'aria-current="page"' : ""}>${item}</button>`).join("")}
+      <button class="table-page-arrow" type="button" data-usage-page="${kind}" data-page="${page + 1}" aria-label="Next ${label.toLowerCase()} page" ${page >= totalPages ? "disabled" : ""}>›</button>
+    </nav>
+  `;
+}
+
 function diagnosticsKey(data) {
-  return [data.provider || "codex", data.range, data.range_start || "", data.range_end || "", data.ignore_auto_review ? "1" : "0"].join("|");
+  return [data.provider || "all", data.range, data.range_start || "", data.range_end || "", data.ignore_auto_review ? "1" : "0"].join("|");
+}
+
+function invalidateRequests() {
+  if (requestsController) requestsController.abort();
+  requestsController = null;
+  requestsPayload = null;
+  requestsError = null;
+  requestSnapshot = null;
+  requestPage = 1;
 }
 
 function renderUsageTables(data) {
   const totals = data.totals;
   const daily = [...data.daily].reverse();
+  const scope = usageTableScopeKey(data);
+  if (scope !== usageTableScope) {
+    usageTableScope = scope;
+    resetUsageTablePages();
+  }
+  const dailyPage = paginateRows(daily, dailyUsagePage);
+  const modelPage = paginateRows(data.models, modelUsagePage);
+  dailyUsagePage = dailyPage.page;
+  modelUsagePage = modelPage.page;
+  const heat = heatmapCells(data.daily, data.range, data.range_start, data.range_end, cacheMode);
+  const months = monthLabels(heat);
+  const heatColumns = Math.max(1, Math.ceil(heat.length / 7));
   return `
     <div class="tables">
-      <section>
-        <h2 class="section-title"><span class="section-icon tone-lime">${icon("usage")}</span><span>Daily Usage</span></h2>
-        <div class="table-scroll">
-          <table>
+      <section class="usage-table-panel daily-usage-panel" data-table-panel="daily">
+        <header class="usage-panel-heading">
+          <h2 class="section-title"><span class="section-icon tone-lime">${icon("usage")}</span><span>Daily Usage</span></h2>
+        </header>
+        ${renderVisualizationPanel(data, heat, months, heatColumns)}
+        <div class="usage-table-block">
+          <h3>Daily Breakdown</h3>
+          <div class="table-scroll">
+          <table class="usage-data-table daily-usage-table">
             <thead><tr><th>Date</th><th class="num">Input</th><th class="num">Output</th><th class="num">Total w/o cached</th><th class="num">Cached</th><th class="num">Total</th><th class="num">Cost</th><th class="num">Sessions</th></tr></thead>
             <tbody>
-              ${daily.map((row) => `<tr><td>${escapeHtml(row.day)}</td><td class="num">${full(row.input_tokens)}</td><td class="num">${full(row.output_tokens)}</td><td class="num">${full(row.total_tokens)}</td><td class="num">${full(row.cached_input_tokens)}</td><td class="num">${full(row.total_with_cached_tokens)}</td><td class="num">${money(row.cost_usd)}</td><td class="num">${full(row.sessions)}</td></tr>`).join("") || '<tr><td colspan="8" class="empty">No usage in this range.</td></tr>'}
+              ${dailyPage.items.map((row) => `<tr><td>${escapeHtml(row.day)}</td><td class="num">${full(row.input_tokens)}</td><td class="num">${full(row.output_tokens)}</td><td class="num">${full(row.total_tokens)}</td><td class="num">${full(row.cached_input_tokens)}</td><td class="num">${full(row.total_with_cached_tokens)}</td><td class="num">${money(row.cost_usd)}</td><td class="num">${full(row.sessions)}</td></tr>`).join("") || '<tr><td colspan="8" class="empty">No usage in this range.</td></tr>'}
             </tbody>
             <tfoot><tr><td>Total</td><td class="num">${full(totals.input_tokens)}</td><td class="num">${full(totals.output_tokens)}</td><td class="num">${full(totals.total_tokens)}</td><td class="num">${full(totals.cached_input_tokens)}</td><td class="num">${full(totals.total_with_cached_tokens)}</td><td class="num">${money(totals.cost_usd)}</td><td class="num">${full(totals.sessions)}</td></tr></tfoot>
           </table>
+          </div>
+          ${renderUsagePagination("daily", dailyPage.page, dailyPage.totalPages)}
         </div>
       </section>
 
-      <section>
-        <h2 class="section-title"><span class="section-icon tone-violet">${icon("models")}</span><span>Models</span></h2>
-        <div class="table-scroll">
-          <table>
+      <section class="usage-table-panel models-panel" data-table-panel="models">
+        <header class="usage-panel-heading">
+          <h2 class="section-title"><span class="section-icon tone-violet">${icon("models")}</span><span>Models</span></h2>
+        </header>
+        <div class="usage-table-block models-table-block">
+          <div class="table-scroll">
+          <table class="usage-data-table models-table">
             <thead><tr><th>Model</th><th class="num">Days</th><th class="num">Sessions</th><th class="num">Input</th><th class="num">Output</th><th class="num">Total w/o cached</th><th class="num">Cached</th><th class="num">Total</th><th class="num">Cost</th><th class="num">Share</th></tr></thead>
             <tbody>
-              ${data.models.map((row) => {
-                const expanded = expandedModels.has(row.model);
+              ${modelPage.items.map((row) => {
+                const modelKey = row.model_key || row.model;
+                const expanded = expandedModels.has(modelKey);
+                const displayName = modelDisplayName(data, row);
+                const shortName = truncateModelName(displayName);
+                const isTruncated = shortName !== displayName;
+                const share = (row.total_tokens / Math.max(totals.total_tokens, 1)) * 100;
                 return `
                   <tr class="model-row ${expanded ? "expanded" : ""}">
                     <td>
-                      <button class="model-toggle" type="button" data-model="${escapeHtml(row.model)}" aria-expanded="${expanded}">
+                      <button class="model-toggle" type="button" data-model="${escapeHtml(modelKey)}" ${isTruncated ? `data-model-tooltip="${escapeHtml(displayName)}"` : ""} aria-expanded="${expanded}" aria-label="${escapeHtml(displayName)}">
                         <span class="model-chevron">${expanded ? "▾" : "▸"}</span>
-                        <span>${escapeHtml(row.model)}</span>
+                        <span class="model-name">${escapeHtml(shortName)}</span>
                       </button>
                     </td>
                     <td class="num">${full(row.active_days)}</td>
@@ -558,13 +622,20 @@ function renderUsageTables(data) {
                     <td class="num">${full(row.cached_input_tokens)}</td>
                     <td class="num">${full(row.total_with_cached_tokens)}</td>
                     <td class="num">${money(row.cost_usd)}</td>
-                    <td class="num">${((row.total_tokens / Math.max(totals.total_tokens, 1)) * 100).toFixed(1)}%</td>
+                    <td class="num share-cell">
+                      <div class="share-meter" aria-label="${share.toFixed(1)}% of total usage">
+                        <span class="share-track"><span class="share-fill" style="width:${Math.min(share, 100).toFixed(1)}%"></span></span>
+                        <span class="share-value">${share.toFixed(1)}%</span>
+                      </div>
+                    </td>
                   </tr>
                   ${expanded ? `<tr class="model-detail-row"><td colspan="10">${renderModelDetails(row)}</td></tr>` : ""}
                 `;
               }).join("") || '<tr><td colspan="10" class="empty">No models in this range.</td></tr>'}
             </tbody>
           </table>
+          </div>
+          ${renderUsagePagination("models", modelPage.page, modelPage.totalPages)}
         </div>
       </section>
     </div>
@@ -612,9 +683,66 @@ function renderDiagnosticsError(message) {
   return `<section class="diagnostics-state error"><strong>Could not analyze rollout telemetry.</strong><code>${escapeHtml(message)}</code><button class="diagnostics-retry" type="button">Retry</button></section>`;
 }
 
+function renderRequestValues(item) {
+  return `<span>In ${full(item.input)}</span><span>Out ${full(item.output)}</span><span>Cache R ${full(item.cache_read)}</span><span>Cache W ${full(item.cache_write)}</span><strong>${full(item.total_with_cache)} total</strong>`;
+}
+
+function renderRequestEvent(item) {
+  return `
+    <article class="request-event">
+      <div class="request-event-main">
+        <time datetime="${escapeHtml(item.timestamp)}">${escapeHtml(item.local_timestamp || item.timestamp)}</time>
+        <strong>${escapeHtml(item.model)}</strong>
+        <span class="request-provider provider-${escapeHtml(item.provider)}">${escapeHtml(item.provider)}</span>
+      </div>
+      <div class="request-values">${renderRequestValues(item)}</div>
+      <div class="request-labels"><span>${escapeHtml(item.event_label)}</span><span>${escapeHtml(item.cost_label)}${item.cost == null ? "" : ` · ${money(item.cost)}`}</span></div>
+    </article>
+  `;
+}
+
+function renderRequests(payload) {
+  const grouped = payload.group !== "none";
+  const rows = payload.items.map((item) => grouped ? `
+    <details class="request-group">
+      <summary>
+        <span><strong>${escapeHtml(item.bucket_start)}</strong><small>${full(item.count)} requests</small></span>
+        <span class="request-values">${renderRequestValues(item)}</span>
+      </summary>
+      <div class="request-children">${item.children.map(renderRequestEvent).join("")}</div>
+    </details>
+  ` : renderRequestEvent(item)).join("");
+  return `
+    <section class="requests-panel">
+      <div class="requests-heading">
+        <div>
+          <h2 class="section-title"><span class="section-icon tone-cyan">${icon("usage")}</span><span>Requests</span></h2>
+          <p>Metadata-only usage events from Unibase. No prompts, responses, paths, tools, or raw IDs are shown.</p>
+        </div>
+        <div class="requests-controls">
+          <label>Group<select id="request-group">${requestGroupOptions.map((value) => `<option value="${value}" ${payload.group === value ? "selected" : ""}>${value === "none" ? "None" : value}</option>`).join("")}</select></label>
+          <label>Page size<select id="request-page-size">${requestPageSizes.map((value) => `<option value="${value}" ${payload.page_size === value ? "selected" : ""}>${value}</option>`).join("")}</select></label>
+        </div>
+      </div>
+      <div class="request-list">${rows || '<div class="request-empty">No requests in this range.</div>'}</div>
+      <nav class="request-pagination" aria-label="Requests pages">
+        <button type="button" data-request-page="${payload.page - 1}" ${payload.has_previous ? "" : "disabled"}>Previous</button>
+        <span>Page ${full(payload.page)} of ${full(payload.total_pages)}</span>
+        <button type="button" data-request-page="${payload.page + 1}" ${payload.has_next ? "" : "disabled"}>Next</button>
+      </nav>
+    </section>
+  `;
+}
+
+function renderRequestsState() {
+  if (requestsError) return `<section class="diagnostics-state error"><strong>Could not load Requests.</strong><code>${escapeHtml(requestsError)}</code><button class="requests-retry" type="button">Retry</button></section>`;
+  if (requestsPayload) return renderRequests(requestsPayload);
+  return `<section class="diagnostics-state" aria-live="polite"><span class="diagnostics-spinner" aria-hidden="true"></span><strong>Loading Requests from Unibase…</strong></section>`;
+}
+
 function renderTableView(data) {
   const supportsDiagnostics = Boolean(data.supports_diagnostics);
-  if (!supportsDiagnostics) activeTableView = "usage";
+  if (!supportsDiagnostics && activeTableView === "diagnostics") activeTableView = "usage";
   const key = diagnosticsKey(data);
   let workspace = renderUsageTables(data);
   if (supportsDiagnostics && activeTableView === "diagnostics") {
@@ -622,14 +750,16 @@ function renderTableView(data) {
     else if (diagnosticsErrors.has(key)) workspace = renderDiagnosticsError(diagnosticsErrors.get(key));
     else workspace = renderDiagnosticsLoading();
   }
-  const toolbar = supportsDiagnostics ? `
+  if (activeTableView === "requests") workspace = renderRequestsState();
+  const toolbar = `
     <div class="table-view-toolbar">
       <nav class="segments" aria-label="Table view">
         <button class="seg ${activeTableView === "usage" ? "active" : ""}" type="button" data-table-view="usage" aria-pressed="${activeTableView === "usage"}">Usage</button>
-        <button class="seg ${activeTableView === "diagnostics" ? "active" : ""}" type="button" data-table-view="diagnostics" aria-pressed="${activeTableView === "diagnostics"}">Diagnostics</button>
+        ${supportsDiagnostics ? `<button class="seg ${activeTableView === "diagnostics" ? "active" : ""}" type="button" data-table-view="diagnostics" aria-pressed="${activeTableView === "diagnostics"}">Diagnostics</button>` : ""}
+        <button class="seg ${activeTableView === "requests" ? "active" : ""}" type="button" data-table-view="requests" aria-pressed="${activeTableView === "requests"}">Requests</button>
       </nav>
     </div>
-  ` : "";
+  `;
   return `${toolbar}<div id="table-workspace">${workspace}</div>`;
 }
 
@@ -648,6 +778,7 @@ function cancelDiagnosticsRequest() {
 function updateTableView(data) {
   const container = document.querySelector("#table-view-container");
   if (!container) return;
+  hideModelNameTooltip();
   container.innerHTML = renderTableView(data);
   bindTableView(data);
 }
@@ -656,19 +787,65 @@ function bindTableView(data) {
   document.querySelectorAll("[data-table-view]").forEach((button) => {
     button.addEventListener("click", () => {
       activeTableView = button.dataset.tableView;
+      syncUrl();
       updateTableView(data);
       if (activeTableView === "diagnostics") ensureDiagnostics(data);
+      if (activeTableView === "requests") ensureRequests(data);
     });
   });
 
   document.querySelectorAll(".model-toggle").forEach((button) => {
     button.addEventListener("click", () => {
+      hideModelNameTooltip();
       const model = button.dataset.model;
       if (!model) return;
       if (expandedModels.has(model)) expandedModels.delete(model);
       else expandedModels.add(model);
       updateTableView(data);
     });
+    if (button.dataset.modelTooltip) {
+      button.addEventListener("mouseenter", scheduleModelNameTooltip);
+      button.addEventListener("mouseleave", hideModelNameTooltip);
+      button.addEventListener("focus", scheduleModelNameTooltip);
+      button.addEventListener("blur", hideModelNameTooltip);
+    }
+  });
+
+  document.querySelectorAll("[data-usage-page]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const page = Number(button.dataset.page);
+      if (button.dataset.usagePage === "daily") dailyUsagePage = page;
+      else modelUsagePage = page;
+      updateTableView(data);
+    });
+  });
+
+  document.querySelectorAll("[data-visualization]").forEach((button) => {
+    button.addEventListener("click", () => {
+      activeVisualization = button.dataset.visualization;
+      syncUrl();
+      render(data);
+    });
+  });
+
+  document.querySelectorAll("[data-cache-mode]").forEach((button) => {
+    button.addEventListener("click", () => {
+      cacheMode = resolveCacheMode(button.dataset.cacheMode);
+      syncUrl();
+      render(data);
+    });
+  });
+
+  document.querySelectorAll(".heat-cell").forEach((cell) => {
+    cell.addEventListener("mouseenter", showHeatTooltip);
+    cell.addEventListener("mousemove", positionHeatTooltip);
+    cell.addEventListener("mouseleave", hideHeatTooltip);
+  });
+
+  document.querySelectorAll(".stacked-bar, .bar-segment").forEach((item) => {
+    item.addEventListener("mouseenter", showChartTooltip);
+    item.addEventListener("mousemove", positionHeatTooltip);
+    item.addEventListener("mouseleave", hideHeatTooltip);
   });
 
   const retry = document.querySelector(".diagnostics-retry");
@@ -678,6 +855,244 @@ function bindTableView(data) {
       updateTableView(data);
       ensureDiagnostics(data, true);
     });
+  }
+
+  document.querySelector(".requests-retry")?.addEventListener("click", () => {
+    requestsError = null;
+    requestSnapshot = null;
+    requestPage = 1;
+    syncUrl();
+    ensureRequests(data, true);
+  });
+  document.querySelector("#request-group")?.addEventListener("change", (event) => {
+    requestGroup = event.target.value;
+    requestPage = 1;
+    requestSnapshot = null;
+    requestsPayload = null;
+    syncUrl();
+    ensureRequests(data, true);
+  });
+  document.querySelector("#request-page-size")?.addEventListener("change", (event) => {
+    requestPageSize = Number(event.target.value);
+    requestPage = 1;
+    requestSnapshot = null;
+    requestsPayload = null;
+    syncUrl();
+    ensureRequests(data, true);
+  });
+  document.querySelectorAll("[data-request-page]").forEach((button) => {
+    button.addEventListener("click", () => {
+      requestPage = Number(button.dataset.requestPage);
+      requestsPayload = null;
+      syncUrl();
+      ensureRequests(data, true);
+    });
+  });
+}
+
+async function ensureRequests(data, force = false, allowSnapshotRetry = true) {
+  if (!force && requestsPayload) {
+    updateTableView(data);
+    return;
+  }
+  if (requestsController) requestsController.abort();
+  requestsController = new AbortController();
+  const controller = requestsController;
+  requestsError = null;
+  if (activeTableView === "requests") updateTableView(data);
+  const params = new URLSearchParams();
+  params.set("provider", activeProvider);
+  params.set("range", activeRange);
+  params.set("timezone", Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC");
+  params.set("group", requestGroup);
+  params.set("page", String(requestPage));
+  params.set("page_size", String(requestPageSize));
+  if (activeRange === "custom") {
+    params.set("start", customStartDate);
+    params.set("end", customEndDate);
+  }
+  if (legacyIgnoreOverride !== null) params.set("ignore_auto_review", ignoreAutoReview ? "1" : "0");
+  if (requestSnapshot) params.set("snapshot", requestSnapshot);
+  try {
+    const response = await fetch(`/api/requests?${params}`, { cache: "no-store", signal: controller.signal });
+    if (!response.ok) {
+      if (response.status === 409 && requestSnapshot && allowSnapshotRetry) {
+        requestSnapshot = null;
+        requestPage = 1;
+        syncUrl();
+        return ensureRequests(data, true, false);
+      }
+      throw new Error(`Requests API returned HTTP ${response.status}`);
+    }
+    requestsPayload = await response.json();
+    requestSnapshot = requestsPayload.snapshot;
+    requestPage = requestsPayload.page;
+    if (activeTableView === "requests") updateTableView(data);
+  } catch (error) {
+    if (error.name === "AbortError") return;
+    requestsError = error.message;
+    if (activeTableView === "requests") updateTableView(data);
+  } finally {
+    if (requestsController === controller) requestsController = null;
+  }
+}
+
+function settingsIsDirty() {
+  if (!settingsData || !settingsDraft) return false;
+  const original = {
+    ignore_codex_auto_review: settingsData.ignore_codex_auto_review,
+    backups: Object.values(settingsData.backups).flat().map(({ source_id, enabled }) => ({ source_id, enabled }))
+  };
+  return JSON.stringify(original) !== JSON.stringify(settingsDraft);
+}
+
+function renderBackupGroup(provider, sources) {
+  const label = providerOptions.find((option) => option.value === provider)?.label || provider;
+  const operationRunning = ["queued", "running"].includes(settingsData?.unibase?.current_operation?.state);
+  return `
+    <div class="settings-source-group">
+      <h3>${escapeHtml(label)}</h3>
+      ${sources.length ? sources.map((source) => {
+        const draft = settingsDraft?.backups.find((item) => item.source_id === source.source_id);
+        return `
+          <label class="settings-source">
+            <input type="checkbox" data-settings-source="${escapeHtml(source.source_id)}" ${draft?.enabled ? "checked" : ""} ${operationRunning || ["ambiguous", "incomplete"].includes(source.status) ? "disabled" : ""}>
+            <span>
+              <strong>${escapeHtml(source.label)}</strong>
+              <small>${escapeHtml(source.relative_name)} · ${escapeHtml(source.layout)}${source.snapshot_date ? ` · ${escapeHtml(source.snapshot_date)}` : ""}</small>
+              <em class="source-status status-${escapeHtml(source.status)}">${escapeHtml(source.status)}${source.stale ? " · stale" : ""} · ${full(source.event_count)} events</em>
+            </span>
+          </label>
+        `;
+      }).join("") : '<p class="settings-empty">No backup snapshots discovered.</p>'}
+    </div>
+  `;
+}
+
+function renderSettingsDialog() {
+  if (!settingsOpen) return "";
+  if (settingsLoading) {
+    return `<dialog class="settings-dialog" id="settings-dialog" aria-labelledby="settings-title"><div class="settings-loading"><span class="diagnostics-spinner"></span><strong>Loading Settings…</strong></div></dialog>`;
+  }
+  if (!settingsData || !settingsDraft) {
+    return `<dialog class="settings-dialog" id="settings-dialog" aria-labelledby="settings-title"><div class="settings-loading"><strong id="settings-title">Could not load Settings.</strong><code>${escapeHtml(settingsError || "Unknown error")}</code><div class="settings-actions"><button class="settings-close" type="button">Close</button><button class="settings-retry" type="button">Retry</button></div></div></dialog>`;
+  }
+  const operation = settingsData.unibase.current_operation;
+  const operationRunning = operation && ["queued", "running"].includes(operation.state);
+  const dirty = settingsIsDirty();
+  return `
+    <dialog class="settings-dialog" id="settings-dialog" aria-labelledby="settings-title">
+      <form class="settings-shell" id="settings-form">
+        <div class="settings-header">
+          <div><span class="eyebrow">MeterMesh control plane</span><h2 id="settings-title">Settings</h2></div>
+          <button class="settings-close" type="button" aria-label="Close Settings">×</button>
+        </div>
+        ${settingsError ? `<div class="settings-error" role="alert">${escapeHtml(settingsError)}</div>` : ""}
+        <section class="settings-section">
+          <h3>Preferences</h3>
+          <label class="settings-preference"><input id="settings-auto-review" type="checkbox" ${settingsDraft.ignore_codex_auto_review ? "checked" : ""} ${operationRunning ? "disabled" : ""}><span><strong>Ignore "${escapeHtml(autoReviewModel)}"</strong><small>Applies only to Codex events in Codex and All views.</small></span></label>
+        </section>
+        <section class="settings-section">
+          <div class="settings-section-heading"><div><h3>Backup sources</h3><p>Unchecked snapshots stay registered but do not support active totals.</p></div></div>
+          <div class="settings-source-groups">${["codex", "claude", "opencode"].map((provider) => renderBackupGroup(provider, settingsData.backups[provider] || [])).join("")}</div>
+        </section>
+        <section class="settings-section unibase-settings">
+          <div>
+            <h3>Unibase</h3>
+            <p><code>${escapeHtml(settingsData.unibase.path)}</code> · generation ${full(settingsData.unibase.generation)} · ${escapeHtml(settingsData.unibase.state)}</p>
+            <p>${full(settingsData.unibase.counts.active_events)} active events · ${full(settingsData.unibase.counts.retained_variants)} retained variants</p>
+          </div>
+          <div class="unibase-actions">
+            <button id="full-reindex" type="button" ${dirty || operationRunning ? "disabled" : ""}>Full reindex</button>
+            <button id="reset-unibase" class="danger" type="button" ${dirty || operationRunning ? "disabled" : ""}>Reset Unibase</button>
+          </div>
+          ${operation ? `<div class="operation-progress"><div><strong>${escapeHtml(operation.kind)}</strong><span>${escapeHtml(operation.state)}</span></div><progress max="${Math.max(operation.progress_total, 1)}" value="${operation.progress_current}"></progress>${operation.error ? `<code>${escapeHtml(operation.error)}</code>` : ""}</div>` : ""}
+        </section>
+        <div class="settings-actions">
+          <button class="settings-cancel" type="button">Cancel</button>
+          <button class="settings-apply" type="submit" ${dirty && !operationRunning ? "" : "disabled"}>Apply</button>
+        </div>
+      </form>
+    </dialog>
+    ${resetConfirmOpen ? `
+      <dialog class="confirm-dialog" id="reset-confirm-dialog" aria-labelledby="reset-confirm-title">
+        <form id="reset-confirm-form">
+          <span class="eyebrow danger-text">Destructive action</span>
+          <h2 id="reset-confirm-title">Reset Unibase?</h2>
+          <p>Provider files and backup folders are untouched. Derived usage data is removed until Full reindex.</p>
+          <label>Type <strong>RESET UNIBASE</strong><input id="reset-confirm-input" autocomplete="off" value="${escapeHtml(resetConfirmation)}"></label>
+          <div class="settings-actions"><button class="reset-cancel" type="button">Cancel</button><button class="danger" id="reset-confirm-submit" type="submit" ${resetConfirmation === "RESET UNIBASE" ? "" : "disabled"}>Reset</button></div>
+        </form>
+      </dialog>
+    ` : ""}
+  `;
+}
+
+async function openSettings() {
+  const startedAt = Date.now();
+  settingsOpen = true;
+  settingsLoading = true;
+  settingsError = null;
+  render(currentData);
+  console.info("[MeterMesh timing] settings fetch started");
+  try {
+    const response = await fetch("/api/settings", { cache: "no-store" });
+    if (!response.ok) throw new Error(`Settings API returned HTTP ${response.status}`);
+    settingsData = await response.json();
+    settingsDraft = {
+      ignore_codex_auto_review: settingsData.ignore_codex_auto_review,
+      backups: Object.values(settingsData.backups).flat().map(({ source_id, enabled }) => ({ source_id, enabled }))
+    };
+    console.info("[MeterMesh timing] settings fetch completed", { elapsedMs: Date.now() - startedAt });
+  } catch (error) {
+    console.error("[MeterMesh timing] settings fetch failed", { elapsedMs: Date.now() - startedAt, error });
+    settingsError = error.message;
+  } finally {
+    settingsLoading = false;
+    render(currentData);
+    const operation = settingsData?.unibase?.current_operation;
+    if (operation && ["queued", "running"].includes(operation.state) && !operationPollTimer) {
+      pollOperation(operation.operation_id).catch((error) => {
+        settingsError = error.message;
+        render(currentData);
+      });
+    }
+  }
+}
+
+function closeSettings() {
+  settingsOpen = false;
+  resetConfirmOpen = false;
+  resetConfirmation = "";
+  settingsError = null;
+  if (operationPollTimer) window.clearTimeout(operationPollTimer);
+  operationPollTimer = null;
+  render(currentData);
+}
+
+function invalidateDashboardCaches() {
+  diagnosticsCache.clear();
+  diagnosticsErrors.clear();
+  invalidateRequests();
+}
+
+async function pollOperation(operationId) {
+  const response = await fetch(`/api/unibase/status?operation_id=${encodeURIComponent(operationId)}`, { cache: "no-store" });
+  if (!response.ok) throw new Error(`Operation status returned HTTP ${response.status}`);
+  const payload = await response.json();
+  settingsData.unibase.current_operation = payload.operation;
+  settingsData.unibase.generation = payload.generation;
+  settingsData.unibase.state = payload.state;
+  render(currentData);
+  if (payload.operation && ["queued", "running"].includes(payload.operation.state)) {
+    operationPollTimer = window.setTimeout(() => pollOperation(operationId).catch((error) => {
+      settingsError = error.message;
+      render(currentData);
+    }), 600);
+  } else if (payload.operation?.state === "succeeded") {
+    invalidateDashboardCaches();
+    await refresh();
+    await openSettings();
   }
 }
 
@@ -765,34 +1180,34 @@ function renderSparkline(values, label) {
 }
 
 function render(data) {
+  hideModelNameTooltip();
   currentData = data;
-  const provider = data.provider || "codex";
-  const providerLabel = data.provider_label || (provider === "claude" ? "Claude" : "Codex");
+  const provider = data.provider || "all";
+  const providerLabel = data.provider_label || providerOptions.find((option) => option.value === provider)?.label || "All";
   const totals = data.totals;
   const cacheShare = totals.total_with_cached_tokens > 0
     ? (totals.cached_input_tokens / totals.total_with_cached_tokens) * 100
     : 0;
-  const heat = heatmapCells(data.daily, data.range, data.range_start, data.range_end, cacheMode);
-  const months = monthLabels(heat);
-  const heatColumns = Math.max(1, Math.ceil(heat.length / 7));
   const indexingNote = data.indexing
     ? ` · ${full(data.indexing.events)} events from ${full(data.indexing.files)} JSONL files`
     : "";
   const rangeSummary = customRangePending ? "Choose custom range" : describeRange(data);
   document.documentElement.dataset.provider = provider;
   document.documentElement.classList.toggle("custom-range-modal-open", customRangeOpen);
-  document.title = `${providerLabel} Usage`;
+  document.documentElement.classList.toggle("settings-modal-open", settingsOpen);
+  document.title = `MeterMesh · ${providerLabel}`;
 
   app.innerHTML = `
     <header class="app-header">
       <div class="brand-block">
         <div class="brand-identity">
           <div class="brand-pill">
-            <span class="brand-mark">${providerLogo(provider, "brand-provider-logo")}</span>
-            <h1>${escapeHtml(providerLabel)} Usage</h1>
+            <span class="brand-mark">${icon("brand", "brand-mesh-logo")}</span>
+            <h1>MeterMesh</h1>
+            <span class="brand-scope">${escapeHtml(providerLabel)}</span>
           </div>
           <div class="brand-meta">
-            <span>Generated ${escapeHtml(data.generated_at)} from local ${escapeHtml(providerLabel)} logs${indexingNote}</span>
+            <span>Generated ${escapeHtml(data.generated_at)} from ${escapeHtml(data.data_source || "Unibase")}${indexingNote}</span>
             <strong>Showing ${escapeHtml(rangeSummary)}</strong>
           </div>
         </div>
@@ -805,13 +1220,8 @@ function render(data) {
           <nav class="segments range-switch" aria-label="Range">
             ${rangeOptions.map((range) => `<button class="seg ${activeRange === range.value ? "active" : ""}" type="button" data-range="${range.value}" ${range.value === "custom" ? `id="custom-range-trigger" aria-haspopup="dialog" aria-expanded="${customRangeOpen}"` : ""}>${range.label}</button>`).join("")}
           </nav>
+          <button class="settings-trigger" id="settings-trigger" type="button" aria-haspopup="dialog" aria-expanded="${settingsOpen}">${icon("settings")}<span>Settings</span></button>
         </div>
-        ${provider === "codex" ? `
-          <label class="toggle-option">
-            <input id="ignore-auto-review" type="checkbox" ${data.ignore_auto_review ? "checked" : ""}>
-            <span>Ignore "${escapeHtml(autoReviewModel)}" model</span>
-          </label>
-        ` : ""}
       </div>
     </header>
 
@@ -834,6 +1244,8 @@ function render(data) {
         </form>
       </dialog>
     ` : ""}
+
+    ${renderSettingsDialog()}
 
     <div class="metric-hero-grid">
       ${metricCard({
@@ -905,12 +1317,12 @@ function render(data) {
       </section>
     </div>
 
-    ${renderVisualizationPanel(data, heat, months, heatColumns)}
     <div id="table-view-container">${renderTableView(data)}</div>
   `;
 
   bindTableView(data);
   if (activeTableView === "diagnostics") ensureDiagnostics(data);
+  if (activeTableView === "requests") ensureRequests(data);
 
   document.querySelectorAll("button[data-provider]").forEach((button) => {
     button.addEventListener("click", () => {
@@ -919,11 +1331,14 @@ function render(data) {
       activeRange = data.range;
       activeProvider = button.dataset.provider;
       activeTableView = "usage";
+      invalidateRequests();
       expandedModels.clear();
       syncUrl();
       refresh();
     });
   });
+
+  document.querySelector("#settings-trigger")?.addEventListener("click", openSettings);
 
   document.querySelectorAll("[data-range]").forEach((button) => {
     button.addEventListener("click", () => {
@@ -941,52 +1356,11 @@ function render(data) {
       customRangePending = false;
       customRangeOpen = false;
       activeRange = nextRange;
+      invalidateRequests();
       syncUrl();
       refresh();
     });
   });
-
-  document.querySelectorAll("[data-visualization]").forEach((button) => {
-    button.addEventListener("click", () => {
-      activeVisualization = button.dataset.visualization;
-      syncUrl();
-      render(data);
-    });
-  });
-
-  document.querySelectorAll("[data-cache-mode]").forEach((button) => {
-    button.addEventListener("click", () => {
-      cacheMode = resolveCacheMode(button.dataset.cacheMode);
-      syncUrl();
-      render(data);
-    });
-  });
-
-  document.querySelectorAll("[data-chart-range]").forEach((button) => {
-    button.addEventListener("click", () => {
-      chartRange = button.dataset.chartRange;
-      if (chartRange === "custom") {
-        normalizeChartCustomRange();
-      }
-      activeVisualization = "tokens";
-      syncUrl();
-      refresh();
-    });
-  });
-
-  const chartRangeForm = document.querySelector("#chart-range-form");
-  if (chartRangeForm) {
-    chartRangeForm.addEventListener("submit", (event) => {
-      event.preventDefault();
-      chartStartDate = document.querySelector("#chart-start")?.value || chartStartDate;
-      chartEndDate = document.querySelector("#chart-end")?.value || chartEndDate;
-      normalizeChartCustomRange();
-      chartRange = "custom";
-      activeVisualization = "tokens";
-      syncUrl();
-      refresh();
-    });
-  }
 
   const customRangeDialog = document.querySelector("#custom-range-dialog");
   const customRangeTrigger = document.querySelector("#custom-range-trigger");
@@ -1039,6 +1413,7 @@ function render(data) {
       customEndDate = document.querySelector("#custom-end")?.value || customEndDate;
       normalizeCustomRange();
       activeRange = "custom";
+      invalidateRequests();
       customRangePending = false;
       customRangeOpen = false;
       removePositionListeners();
@@ -1049,27 +1424,133 @@ function render(data) {
     });
   }
 
-  const ignoreAutoReviewInput = document.querySelector("#ignore-auto-review");
-  if (ignoreAutoReviewInput) {
-    ignoreAutoReviewInput.addEventListener("change", () => {
-      ignoreAutoReview = ignoreAutoReviewInput.checked;
-      writeCookie(ignoreAutoReviewCookie, ignoreAutoReview ? "1" : "0");
-      syncUrl();
-      refresh();
+  const settingsDialog = document.querySelector("#settings-dialog");
+  if (settingsDialog) {
+    settingsDialog.showModal();
+    const dismissSettings = () => closeSettings();
+    settingsDialog.addEventListener("cancel", (event) => {
+      event.preventDefault();
+      dismissSettings();
+    });
+    settingsDialog.querySelector(".settings-close")?.addEventListener("click", dismissSettings);
+    settingsDialog.querySelector(".settings-retry")?.addEventListener("click", openSettings);
+    settingsDialog.querySelector(".settings-cancel")?.addEventListener("click", dismissSettings);
+    settingsDialog.addEventListener("click", (event) => {
+      if (event.target === settingsDialog) dismissSettings();
+    });
+    const syncDirtyControls = () => {
+      const dirty = settingsIsDirty();
+      settingsDialog.querySelector(".settings-apply")?.toggleAttribute("disabled", !dirty);
+      settingsDialog.querySelector("#full-reindex")?.toggleAttribute("disabled", dirty);
+      settingsDialog.querySelector("#reset-unibase")?.toggleAttribute("disabled", dirty);
+    };
+    settingsDialog.querySelector("#settings-auto-review")?.addEventListener("change", (event) => {
+      settingsDraft.ignore_codex_auto_review = event.target.checked;
+      syncDirtyControls();
+    });
+    settingsDialog.querySelectorAll("[data-settings-source]").forEach((input) => {
+      input.addEventListener("change", () => {
+        const source = settingsDraft.backups.find((item) => item.source_id === input.dataset.settingsSource);
+        if (source) source.enabled = input.checked;
+        syncDirtyControls();
+      });
+    });
+    settingsDialog.querySelector("#settings-form")?.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      settingsError = null;
+      try {
+        const response = await fetch("/api/settings", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ revision: settingsData.revision, ...settingsDraft })
+        });
+        if (!response.ok) throw new Error(response.status === 409 ? "Settings changed in another window. Reopen Settings." : `Settings API returned HTTP ${response.status}`);
+        settingsData = await response.json();
+        settingsDraft = {
+          ignore_codex_auto_review: settingsData.ignore_codex_auto_review,
+          backups: Object.values(settingsData.backups).flat().map(({ source_id, enabled }) => ({ source_id, enabled }))
+        };
+        ignoreAutoReview = settingsData.ignore_codex_auto_review;
+        legacyIgnoreOverride = null;
+        writeCookie(ignoreAutoReviewCookie, ignoreAutoReview ? "1" : "0");
+        invalidateDashboardCaches();
+        syncUrl();
+        await refresh();
+      } catch (error) {
+        settingsError = error.message;
+        render(data);
+      }
+    });
+    settingsDialog.querySelector("#reset-unibase")?.addEventListener("click", () => {
+      resetConfirmOpen = true;
+      resetConfirmation = "";
+      render(data);
+    });
+    settingsDialog.querySelector("#full-reindex")?.addEventListener("click", async () => {
+      settingsError = null;
+      try {
+        const response = await fetch("/api/unibase/reindex", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: "{}"
+        });
+        if (!response.ok) throw new Error(`Full reindex returned HTTP ${response.status}`);
+        const payload = await response.json();
+        settingsData.unibase.current_operation = { kind: "full_reindex", state: "queued", progress_current: 0, progress_total: 0 };
+        render(data);
+        await pollOperation(payload.operation_id);
+      } catch (error) {
+        settingsError = error.message;
+        render(data);
+      }
     });
   }
 
-  document.querySelectorAll(".heat-cell").forEach((cell) => {
-    cell.addEventListener("mouseenter", showHeatTooltip);
-    cell.addEventListener("mousemove", positionHeatTooltip);
-    cell.addEventListener("mouseleave", hideHeatTooltip);
-  });
+  const resetDialog = document.querySelector("#reset-confirm-dialog");
+  if (resetDialog) {
+    resetDialog.showModal();
+    const cancelReset = () => {
+      resetConfirmOpen = false;
+      resetConfirmation = "";
+      render(data);
+    };
+    resetDialog.addEventListener("cancel", (event) => {
+      event.preventDefault();
+      cancelReset();
+    });
+    resetDialog.querySelector(".reset-cancel")?.addEventListener("click", cancelReset);
+    const confirmationInput = resetDialog.querySelector("#reset-confirm-input");
+    confirmationInput?.focus();
+    confirmationInput?.addEventListener("input", () => {
+      resetConfirmation = confirmationInput.value;
+      resetDialog.querySelector("#reset-confirm-submit")?.toggleAttribute("disabled", resetConfirmation !== "RESET UNIBASE");
+    });
+    resetDialog.querySelector("#reset-confirm-form")?.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      try {
+        const response = await fetch("/api/unibase/reset", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ confirmation: resetConfirmation })
+        });
+        if (!response.ok) throw new Error(`Reset returned HTTP ${response.status}`);
+        settingsData = await response.json();
+        settingsDraft = {
+          ignore_codex_auto_review: settingsData.ignore_codex_auto_review,
+          backups: Object.values(settingsData.backups).flat().map(({ source_id, enabled }) => ({ source_id, enabled }))
+        };
+        resetConfirmOpen = false;
+        resetConfirmation = "";
+        invalidateDashboardCaches();
+        await refresh();
+      } catch (error) {
+        settingsError = error.message;
+        resetConfirmOpen = false;
+        render(data);
+      }
+    });
+  }
 
-  document.querySelectorAll(".stacked-bar, .bar-segment").forEach((item) => {
-    item.addEventListener("mouseenter", showChartTooltip);
-    item.addEventListener("mousemove", positionHeatTooltip);
-    item.addEventListener("mouseleave", hideHeatTooltip);
-  });
 }
 
 function icon(name, className = "") {
@@ -1078,7 +1559,7 @@ function icon(name, className = "") {
 }
 
 function providerLogo(provider, className = "") {
-  const path = providerLogoPaths[provider] || providerLogoPaths.codex;
+  const path = providerLogoPaths[provider] || providerLogoPaths.all;
   return `<svg class="provider-logo ${className}" aria-hidden="true" viewBox="0 0 24 24" fill="currentColor"><path d="${path}"></path></svg>`;
 }
 
@@ -1117,6 +1598,34 @@ function groupMetricItem({ label, value, iconName, tone, note = "", series = [],
       ${renderSparkline(series, `${label} trend`)}
     </div>
   `;
+}
+
+function hideModelNameTooltip() {
+  if (modelTooltipTimer) window.clearTimeout(modelTooltipTimer);
+  modelTooltipTimer = null;
+  modelNameTooltip.classList.remove("visible");
+}
+
+function scheduleModelNameTooltip(event) {
+  hideModelNameTooltip();
+  const target = event.currentTarget;
+  modelTooltipTimer = window.setTimeout(() => {
+    if (!target.isConnected || !target.matches(":hover, :focus")) return;
+    modelNameTooltip.textContent = target.dataset.modelTooltip;
+    modelNameTooltip.classList.add("visible");
+    const gap = 8;
+    const margin = 8;
+    const targetRect = target.getBoundingClientRect();
+    const tooltipRect = modelNameTooltip.getBoundingClientRect();
+    let left = targetRect.left;
+    let top = targetRect.bottom + gap;
+    left = Math.max(margin, Math.min(left, window.innerWidth - tooltipRect.width - margin));
+    if (top + tooltipRect.height > window.innerHeight - margin) {
+      top = targetRect.top - tooltipRect.height - gap;
+    }
+    modelNameTooltip.style.left = `${left}px`;
+    modelNameTooltip.style.top = `${Math.max(margin, top)}px`;
+  }, 1500);
 }
 
 function showHeatTooltip(event) {
@@ -1170,29 +1679,19 @@ async function refresh() {
       customStartDate = data.range_start || customStartDate;
       customEndDate = data.range_end || customEndDate;
     }
-    chartRange = data.chart?.range || chartRange;
-    if (data.chart?.range === "custom") {
-      chartStartDate = data.chart.range_start || chartStartDate;
-      chartEndDate = data.chart.range_end || chartEndDate;
-    }
     render(data);
   } catch (error) {
     if (error.name === "AbortError") return;
     customRangeOpen = false;
     document.documentElement.classList.remove("custom-range-modal-open");
-    const providerLabel = activeProvider === "claude" ? "Claude" : "Codex";
-    app.innerHTML = `<section class="state error"><h1>${providerLabel} Usage</h1><p>Could not load usage data.</p><code>${escapeHtml(error.message)}</code></section>`;
+    const providerLabel = providerOptions.find((option) => option.value === activeProvider)?.label || "ALL";
+    app.innerHTML = `<section class="state error"><h1>MeterMesh · ${providerLabel}</h1><p>Could not load committed Unibase data.</p><code>${escapeHtml(error.message)}</code></section>`;
   }
 }
 
 if (activeRange === "custom") {
   normalizeCustomRange();
-  syncUrl();
 }
 
-if (chartRange === "custom") {
-  normalizeChartCustomRange();
-  syncUrl();
-}
-
+syncUrl();
 refresh();

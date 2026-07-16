@@ -31,12 +31,12 @@ async function assertPortsFree() {
   const busy = checks.filter((check) => !check.free);
   if (!busy.length) return;
 
-  console.error("\nCodex Usage Dashboard cannot start because one of its ports is unavailable:");
+  console.error("\nMeterMesh cannot start because one of its ports is unavailable:");
   for (const item of busy) {
     const reason = item.code === "EADDRINUSE" ? "already in use" : item.code || "unavailable";
     console.error(`- ${item.label}: http://${host}:${item.port} (${reason})`);
   }
-  console.error("\nIf the reason is EADDRINUSE, close the previous dashboard terminal window and run this launcher again.");
+  console.error("\nIf the reason is EADDRINUSE, close the previous MeterMesh terminal window and run the launcher again.");
   process.exit(1);
 }
 
@@ -48,7 +48,7 @@ function start(name, command, args) {
   children.push(child);
   child.on("exit", (code, signal) => {
     if (!shuttingDown) {
-      console.log(`\n${name} exited (${signal ?? code}). Stopping dashboard...`);
+      console.log(`\n${name} exited (${signal ?? code}). Stopping MeterMesh...`);
       shutdown(code ?? 1);
     }
   });

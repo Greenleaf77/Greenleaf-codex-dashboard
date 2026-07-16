@@ -1,0 +1,135 @@
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+import dashboard_api
+import unibase
+
+
+class AllProviderTests(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.path = Path(self.temp_dir.name) / "unibase.sqlite3"
+        self.db = unibase.Unibase(self.path)
+        for provider in ("codex", "claude", "opencode"):
+            self.db.register_source(unibase.DiscoveredSource(
+                f"{provider}-live", provider, "live", Path("/unused"), "live", f"Live {provider}",
+                True, 1000, None, None, "ready",
+            ))
+        self.add_event("codex", 10, 2, 0, 4, None, "unavailable")
+        self.add_event("claude", 20, 3, 5, 6, None, "unavailable")
+        self.add_event("opencode", 30, 7, 11, 8, 0.5, "recorded")
+        self.db.rebuild_active_events()
+        self.pricing = {
+            "source": "test", "url": "", "loaded_at": "now",
+            "models": dashboard_api.FALLBACK_PRICING,
+            "fallback": dashboard_api.FALLBACK_PRICING,
+            "error": None,
+        }
+
+    def add_event(self, provider, input_tokens, cache_read, cache_write, output, cost, cost_kind):
+        self.db.add_event(f"{provider}-live", None, {
+            "provider": provider,
+            "event_key": "same-native-id",
+            "stream_key": "same-session-id",
+            "timestamp_utc": "2026-07-16T12:00:00Z",
+            "occurred_at": 1784203200,
+            "model": "gpt-5.5",
+            "native_provider_id": "same-provider-id",
+            "semantics": "opencode_recorded" if provider == "opencode" else "claude_metadata" if provider == "claude" else "exact",
+            "classification": "usage_update",
+            "input_tokens": input_tokens,
+            "cache_read_tokens": cache_read,
+            "cache_write_tokens": cache_write,
+            "output_tokens": output,
+            "reasoning_tokens": 0,
+            "cost_usd": cost,
+            "cost_kind": cost_kind,
+        }, 1)
+
+    def load(self, provider="all"):
+        with patch.object(dashboard_api, "load_pricing", return_value=self.pricing):
+            return dashboard_api.load_unibase_usage(self.path, "all", chart_range="all", provider=provider)
+
+    def test_all_equals_provider_sum_without_cross_provider_collisions(self):
+        all_data = self.load("all")
+        scopes = [self.load(provider) for provider in ("codex", "claude", "opencode")]
+
+        self.assertEqual(all_data["totals"]["total_tokens"], sum(scope["totals"]["total_tokens"] for scope in scopes))
+        self.assertEqual(all_data["totals"]["total_with_cached_tokens"], sum(scope["totals"]["total_with_cached_tokens"] for scope in scopes))
+        self.assertEqual(all_data["totals"]["sessions"], 3)
+        self.assertEqual(len(all_data["models"]), 3)
+        self.assertEqual({row["model"] for row in all_data["models"]}, {"Codex · gpt-5.5", "Claude · gpt-5.5", "OpenCode · gpt-5.5"})
+        self.assertEqual(all_data["cost"]["recorded"], 0.5)
+        self.assertGreater(all_data["cost"]["estimated"], 0)
+
+    def test_missing_and_invalid_provider_default_to_all(self):
+        self.assertEqual(dashboard_api.normalize_provider(None), "all")
+        self.assertEqual(dashboard_api.normalize_provider("invalid"), "all")
+        handler = object.__new__(dashboard_api.DashboardHandler)
+        handler.unibase_path = self.path
+        self.assertEqual(handler.filters_from_query("")["provider"], "all")
+        self.assertEqual(handler.filters_from_query("provider=invalid")["provider"], "all")
+
+    def test_chart_range_always_matches_global_range(self):
+        handler = object.__new__(dashboard_api.DashboardHandler)
+        handler.unibase_path = self.path
+        filters = handler.filters_from_query("range=7d&chart_range=all")
+        self.assertEqual(filters["chart_range"], "7d")
+        self.assertEqual(filters["chart_start_day"], filters["start_day"])
+        self.assertEqual(filters["chart_end_day"], filters["end_day"])
+
+        custom = handler.filters_from_query(
+            "range=custom&start=2026-07-10&end=2026-07-12&chart_start=2020-01-01&chart_end=2020-01-02"
+        )
+        self.assertEqual(custom["chart_range"], "custom")
+        self.assertEqual(custom["chart_start_day"], "2026-07-10")
+        self.assertEqual(custom["chart_end_day"], "2026-07-12")
+
+    def test_production_usage_payload_does_not_call_provider_scanners(self):
+        handler = object.__new__(dashboard_api.DashboardHandler)
+        handler.unibase_path = self.path
+        source_root = Path(self.temp_dir.name) / "sources"
+        handler.db_path = source_root / ".codex" / "state_5.sqlite"
+        handler.claude_projects_path = source_root / ".claude" / "projects"
+        handler.opencode_db_path = source_root / "opencode" / "opencode.db"
+        filters = handler.filters_from_query("provider=all&range=all&chart_range=all")
+        with patch.object(dashboard_api, "scan_token_telemetry", side_effect=AssertionError("scanner called")), patch.object(
+            dashboard_api, "index_claude_usage", side_effect=AssertionError("scanner called")
+        ), patch.object(dashboard_api, "schedule_enabled_sources_refresh"), patch.object(
+            dashboard_api, "load_pricing", return_value=self.pricing
+        ):
+            payload = handler.usage_payload(filters)
+        self.assertEqual(payload["provider"], "all")
+
+    def test_production_usage_payload_schedules_source_refresh_without_waiting(self):
+        handler = object.__new__(dashboard_api.DashboardHandler)
+        handler.unibase_path = self.path
+        source_root = Path(self.temp_dir.name) / "sources"
+        handler.db_path = source_root / ".codex" / "state_5.sqlite"
+        handler.claude_projects_path = source_root / ".claude" / "projects"
+        handler.opencode_db_path = source_root / "opencode" / "opencode.db"
+        filters = handler.filters_from_query("provider=all&range=all&chart_range=all")
+        with patch.object(dashboard_api, "schedule_enabled_sources_refresh") as refresh, patch.object(
+            dashboard_api, "load_pricing", return_value=self.pricing
+        ):
+            handler.usage_payload(filters)
+        refresh.assert_called_once_with(
+            self.path,
+            handler.opencode_db_path,
+            codex_root=handler.db_path.parent,
+            claude_root=handler.claude_projects_path.parent,
+            reason="usage request",
+        )
+
+    def test_cache_alias_does_not_double_count(self):
+        data = self.load("all")
+        totals = data["totals"]
+        self.assertEqual(totals["cached_input_tokens"], totals["cache_read_input_tokens"] + totals["cache_creation_input_tokens"])
+        self.assertEqual(totals["total_with_cached_tokens"], totals["total_tokens"] + totals["cached_input_tokens"])
+
+
+if __name__ == "__main__":
+    unittest.main()

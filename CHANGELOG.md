@@ -1,5 +1,15 @@
 # Changelog
 
+## 2.0.0 - 2026-07-16
+
+- Renamed the product to MeterMesh and introduced the app-owned Unibase SQLite index.
+- Added provider-neutral source/provenance tables, deterministic conflict selection, retained occurrences, and active SQL projections.
+- Added live and backup adapters for Codex, Claude, and OpenCode with read-only provider access and privacy allowlists.
+- Added the default All scope, provider-qualified models and sessions, and recorded/estimated/unavailable cost breakdowns.
+- Added privacy-safe Requests with numbered pagination, stable snapshots, timezone grouping, and complete grouped children.
+- Added Settings for backup sources, Codex auto-review filtering, Reset Unibase, and atomic staging Full reindex.
+- Moved production Usage and Diagnostics reads to committed Unibase SQL instead of synchronous provider scans.
+
 ## 1.3.0 - 2026-07-15
 
 - Added one shared `With cache` / `Without cache` accounting control for Daily heatmap and Tokens over time.

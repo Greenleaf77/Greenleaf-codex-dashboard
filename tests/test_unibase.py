@@ -1,0 +1,258 @@
+import json
+import sqlite3
+import tempfile
+import threading
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+import unibase
+
+
+class UnibaseFoundationTests(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.root = Path(self.temp_dir.name)
+        self.db_path = self.root / "app" / "unibase.sqlite3"
+        self.db = unibase.Unibase(self.db_path)
+
+    def test_path_precedence_and_pragmas(self):
+        self.assertEqual(unibase.resolve_unibase_path("/tmp/cli.sqlite", {"METERMESH_UNIBASE_DB": "/tmp/env.sqlite"}), Path("/tmp/cli.sqlite"))
+        self.assertEqual(unibase.resolve_unibase_path(None, {"METERMESH_UNIBASE_DB": "/tmp/env.sqlite"}), Path("/tmp/env.sqlite"))
+        with self.db.connect() as conn:
+            self.assertEqual(conn.execute("pragma user_version").fetchone()[0], unibase.SCHEMA_VERSION)
+            self.assertEqual(conn.execute("pragma journal_mode").fetchone()[0], "wal")
+            self.assertEqual(conn.execute("pragma foreign_keys").fetchone()[0], 1)
+            self.assertEqual(conn.execute("pragma busy_timeout").fetchone()[0], 30000)
+
+    def test_existing_database_can_skip_migration_for_read_paths(self):
+        with patch.object(unibase.Unibase, "migrate") as migrate:
+            database = unibase.Unibase(self.db_path, migrate=False)
+
+        migrate.assert_not_called()
+        self.assertEqual(database.settings()["state"], "ready")
+
+    def test_settings_revision_conflict_and_reset_preserves_registry(self):
+        codex = self.root / ".codex"
+        claude = self.root / ".claude"
+        opencode = self.root / "opencode"
+        unibase.register_default_sources(self.db, codex_root=codex, claude_root=claude, opencode_root=opencode)
+        settings = self.db.update_settings(1, True)
+        self.assertEqual(settings["revision"], 2)
+        with self.assertRaises(unibase.RevisionConflict):
+            self.db.update_settings(1, False)
+        source_ids = [row["source_id"] for row in self.db.sources()]
+        self.db.reset()
+        self.assertEqual(self.db.settings()["state"], "reset_empty")
+        self.assertTrue(self.db.settings()["ignore_codex_auto_review"])
+        self.assertEqual([row["source_id"] for row in self.db.sources()], source_ids)
+
+    def test_normalized_and_legacy_discovery(self):
+        add_stat = self.root / "add_stat"
+        normalized = add_stat / "normalized"
+        rollout = normalized / "root" / "sessions" / "2026" / "07" / "16" / "rollout-a.jsonl"
+        rollout.parent.mkdir(parents=True)
+        rollout.write_text("{}\n", encoding="utf-8")
+        (normalized / "snapshot.json").write_text(json.dumps({
+            "format": unibase.SNAPSHOT_FORMAT,
+            "version": 1,
+            "id": "snapshot-1",
+            "provider": "codex",
+            "created_at": "2026-07-16T00:00:00Z",
+            "label": "Before reset",
+            "root": "root",
+        }), encoding="utf-8")
+        legacy = add_stat / "legacy" / ".codex" / "sessions" / "2026" / "07" / "16"
+        legacy.mkdir(parents=True)
+        (legacy / "rollout-b.jsonl").write_text("{}\n", encoding="utf-8")
+
+        sources = unibase.discover_backup_sources("codex", add_stat)
+
+        self.assertEqual([source.kind for source in sources], ["legacy_backup", "normalized_backup"])
+        self.assertEqual(sources[0].status, "ready")
+        self.assertEqual(sources[1].status, "ready")
+        self.assertFalse(any(source.enabled for source in sources))
+
+    def test_manifest_path_traversal_is_incomplete(self):
+        child = self.root / "add_stat" / "bad"
+        child.mkdir(parents=True)
+        (child / "snapshot.json").write_text(json.dumps({
+            "format": unibase.SNAPSHOT_FORMAT,
+            "version": 1,
+            "id": "bad",
+            "provider": "claude",
+            "root": "../outside",
+        }), encoding="utf-8")
+        source = unibase.discover_backup_sources("claude", child.parent)[0]
+        self.assertEqual(source.status, "incomplete")
+
+    def test_source_sqlite_is_query_only(self):
+        source = self.root / "source.sqlite"
+        conn = sqlite3.connect(source)
+        try:
+            conn.execute("create table data(value text)")
+            conn.commit()
+        finally:
+            conn.close()
+        with unibase.open_source_sqlite_readonly(source) as conn:
+            self.assertEqual(conn.execute("pragma query_only").fetchone()[0], 1)
+            with self.assertRaises(sqlite3.OperationalError):
+                conn.execute("insert into data values ('no')")
+
+    def test_provenance_survives_source_toggle(self):
+        now = "2026-07-16T12:00:00Z"
+        for name, priority in (("live", 1000), ("backup", 500)):
+            self.db.register_source(unibase.DiscoveredSource(name, "claude", "live" if name == "live" else "normalized_backup", self.root, name, name, True, priority, None, None, "ready"))
+            self.db.add_event(name, None, {
+                "provider": "claude", "event_key": "event-1", "stream_key": "session-1",
+                "timestamp_utc": now, "occurred_at": 1784203200, "model": "claude-test",
+                "native_provider_id": "anthropic", "semantics": "metadata", "classification": "usage_update",
+                "input_tokens": 10, "cache_read_tokens": 2, "cache_write_tokens": 3,
+                "output_tokens": 4, "reasoning_tokens": 0, "cost_usd": None, "cost_kind": "estimated",
+            }, 1)
+        self.db.rebuild_active_events()
+        self.assertEqual(len(self.db.active_event_rows()), 1)
+        self.db.set_source_enabled("backup", False)
+        self.assertEqual(len(self.db.active_event_rows()), 1)
+        self.db.set_source_enabled("live", True)
+        self.assertEqual(len(self.db.active_event_rows()), 1)
+
+    def test_failed_atomic_file_replacement_keeps_previous_occurrence(self):
+        self.db.register_source(unibase.DiscoveredSource(
+            "backup", "claude", "normalized_backup", self.root, "backup", "backup",
+            True, 500, None, None, "ready",
+        ))
+        source_file_id = self.db.upsert_source_file("backup", "session.jsonl", "transcript", size=1, mtime_ns=1)
+        valid = {
+            "provider": "claude", "event_key": "event-1", "stream_key": "stream-1",
+            "timestamp_utc": "2026-07-16T12:00:00Z", "occurred_at": 1784203200,
+            "model": "claude-test", "native_provider_id": "anthropic", "semantics": "claude_metadata",
+            "classification": "usage_update", "input_tokens": 10, "cache_read_tokens": 0,
+            "cache_write_tokens": 0, "output_tokens": 1, "reasoning_tokens": 0,
+            "cost_usd": None, "cost_kind": "unavailable",
+        }
+        self.db.add_event("backup", source_file_id, valid, 1)
+        self.db.rebuild_active_events()
+
+        with self.assertRaises(KeyError):
+            self.db.replace_source_file_events("backup", source_file_id, [{"provider": "claude"}], 2)
+        self.db.rebuild_active_events()
+
+        self.assertEqual(len(self.db.active_event_rows("claude")), 1)
+
+    def test_failed_source_transaction_rolls_back_partial_projection(self):
+        self.db.register_source(unibase.DiscoveredSource(
+            "backup", "claude", "normalized_backup", self.root, "backup", "backup",
+            True, 500, None, None, "ready",
+        ))
+        original = {
+            "provider": "claude", "event_key": "event-1", "stream_key": "stream-1",
+            "timestamp_utc": "2026-07-16T12:00:00Z", "occurred_at": 1784203200,
+            "model": "claude-test", "native_provider_id": "anthropic", "semantics": "metadata",
+            "classification": "usage_update", "input_tokens": 1, "cache_read_tokens": 0,
+            "cache_write_tokens": 0, "output_tokens": 1, "reasoning_tokens": 0,
+            "cost_usd": None, "cost_kind": "unavailable",
+        }
+        self.db.add_event("backup", None, original, 1)
+        self.db.rebuild_active_events()
+
+        with self.assertRaises(RuntimeError):
+            with self.db.source_transaction():
+                self.db.add_event("backup", None, {**original, "input_tokens": 9}, 2)
+                self.db.rebuild_active_events()
+                raise RuntimeError("failed scan")
+
+        self.assertEqual(self.db.active_event_rows("claude")[0]["input_tokens"], 1)
+
+    def test_only_one_concurrent_operation_can_be_claimed(self):
+        barrier = threading.Barrier(8)
+        outcomes = []
+
+        def claim():
+            barrier.wait()
+            try:
+                outcomes.append(self.db.create_operation("full_reindex"))
+            except unibase.OperationConflict:
+                outcomes.append(None)
+
+        threads = [threading.Thread(target=claim) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(sum(value is not None for value in outcomes), 1)
+
+    def test_corrected_normalized_manifest_reuses_registry_row(self):
+        add_stat = self.root / "add_stat"
+        child = add_stat / "snapshot"
+        child.mkdir(parents=True)
+        (child / "snapshot.json").write_text("{}", encoding="utf-8")
+        first = unibase.discover_backup_sources("codex", add_stat)[0]
+        self.db.register_source(first)
+        rollout = child / "root" / "sessions" / "2026" / "07" / "16" / "rollout-a.jsonl"
+        rollout.parent.mkdir(parents=True)
+        rollout.write_text("{}\n", encoding="utf-8")
+        (child / "snapshot.json").write_text(json.dumps({
+            "format": unibase.SNAPSHOT_FORMAT, "version": 1, "id": "fixed",
+            "provider": "codex", "root": "root",
+        }), encoding="utf-8")
+        corrected = unibase.discover_backup_sources("codex", add_stat)[0]
+
+        self.db.register_source(corrected)
+
+        sources = self.db.sources("codex")
+        self.assertEqual(len(sources), 1)
+        self.assertEqual(sources[0]["discovery_status"], "ready")
+
+    def test_version_one_database_migrates_operation_constraint(self):
+        with self.db.connect() as conn:
+            conn.execute("drop index one_active_operation")
+            conn.execute("pragma user_version = 1")
+        reopened = unibase.Unibase(self.db_path)
+        with reopened.connect(readonly=True) as conn:
+            self.assertEqual(conn.execute("pragma user_version").fetchone()[0], unibase.SCHEMA_VERSION)
+            indexes = {row[1] for row in conn.execute("pragma index_list(operations)")}
+        self.assertIn("one_active_operation", indexes)
+
+    def test_version_two_database_hashes_stored_source_paths(self):
+        self.db.register_source(unibase.DiscoveredSource(
+            "backup", "claude", "normalized_backup", self.root, "backup", "backup",
+            True, 500, None, None, "ready",
+        ))
+        with self.db.connect() as conn:
+            conn.execute(
+                "insert into source_files(source_id, relative_path, file_kind) values (?, ?, ?)",
+                ("backup", "private-project/private-session.jsonl", "transcript"),
+            )
+            conn.execute("pragma user_version = 2")
+
+        reopened = unibase.Unibase(self.db_path)
+
+        with reopened.connect(readonly=True) as conn:
+            stored = conn.execute("select relative_path from source_files where source_id = 'backup'").fetchone()[0]
+        self.assertTrue(stored.startswith("file:"))
+        self.assertNotIn("private-project", stored)
+
+    def test_version_three_database_hashes_opencode_cursor_ids(self):
+        self.db.register_source(unibase.DiscoveredSource(
+            "opencode-live", "opencode", "live", self.root, "live", "Live OpenCode",
+            True, 1000, None, None, "ready",
+        ))
+        with self.db.connect() as conn:
+            conn.execute(
+                "insert into source_files(source_id, relative_path, file_kind, change_cursor) values (?, ?, ?, ?)",
+                ("opencode-live", "file:abc", "opencode_sqlite", json.dumps((123, "raw-private-message-id"))),
+            )
+            conn.execute("pragma user_version = 3")
+
+        reopened = unibase.Unibase(self.db_path)
+
+        with reopened.connect(readonly=True) as conn:
+            cursor = conn.execute("select change_cursor from source_files where source_id = 'opencode-live'").fetchone()[0]
+        self.assertNotIn("raw-private-message-id", cursor)
+        self.assertIn("cursor:", cursor)
+
+
+if __name__ == "__main__":
+    unittest.main()
