@@ -1048,7 +1048,7 @@ def event_from_active_row(row: dict, timezone: ZoneInfo, all_scope: bool, pricin
         "hour": local.strftime("%Y-%m-%d %H:00"),
         "day": local.date().isoformat(),
         "model": model_label,
-        "model_key": f'{provider}:{row.get("native_provider_id") or provider}:{model}',
+        "model_key": f"{provider}:{model}",
         "source": row["semantics"],
         "classification": row["classification"],
         "input_tokens": input_tokens,
@@ -1323,7 +1323,7 @@ def _price_usage_group(row: dict, pricing: dict, all_scope: bool) -> dict:
         **row,
         "model": model_label,
         "raw_model": model,
-        "model_key": f'{provider}:{row["native_provider_id"]}:{model}',
+        "model_key": f"{provider}:{model}",
         "input_tokens": input_tokens,
         "cache_creation_input_tokens": cache_write,
         "cache_read_input_tokens": cache_read,
@@ -1543,7 +1543,7 @@ def load_unibase_usage(
     for row in session_rows:
         name = str(row["provider"])
         session = (name, str(row["stream_key"]))
-        model_key = f'{name}:{row["native_provider_id"]}:{row["model"]}'
+        model_key = f'{name}:{row["model"]}'
         day = str(row["day"])
         total_sessions.add(session)
         daily_sessions.setdefault(day, set()).add(session)

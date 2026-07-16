@@ -65,6 +65,41 @@ class AllProviderTests(unittest.TestCase):
         self.assertEqual(all_data["cost"]["recorded"], 0.5)
         self.assertGreater(all_data["cost"]["estimated"], 0)
 
+    def test_opencode_endpoints_share_one_model_row(self):
+        self.db.add_event("opencode-live", None, {
+            "provider": "opencode",
+            "event_key": "second-endpoint-event",
+            "stream_key": "second-endpoint-session",
+            "timestamp_utc": "2026-07-16T13:00:00Z",
+            "occurred_at": 1784206800,
+            "model": "gpt-5.5",
+            "native_provider_id": "second-endpoint",
+            "semantics": "opencode_recorded",
+            "classification": "usage_update",
+            "input_tokens": 10,
+            "cache_read_tokens": 0,
+            "cache_write_tokens": 0,
+            "output_tokens": 3,
+            "reasoning_tokens": 0,
+            "cost_usd": 0.25,
+            "cost_kind": "recorded",
+        }, 1)
+        self.db.rebuild_active_events()
+
+        opencode = self.load("opencode")
+        self.assertEqual(len(opencode["models"]), 1)
+        model = opencode["models"][0]
+        self.assertEqual(model["model"], "gpt-5.5")
+        self.assertEqual(model["model_key"], "opencode:gpt-5.5")
+        self.assertEqual(model["sessions"], 2)
+        self.assertEqual(model["input_tokens"], 40)
+        self.assertEqual(model["output_tokens"], 11)
+        self.assertEqual(model["cost_usd"], 0.75)
+
+        all_data = self.load("all")
+        self.assertEqual(len(all_data["models"]), 3)
+        self.assertEqual(sum(row["model"] == "OpenCode · gpt-5.5" for row in all_data["models"]), 1)
+
     def test_missing_and_invalid_provider_default_to_all(self):
         self.assertEqual(dashboard_api.normalize_provider(None), "all")
         self.assertEqual(dashboard_api.normalize_provider("invalid"), "all")
