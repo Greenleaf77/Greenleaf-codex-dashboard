@@ -142,10 +142,6 @@ npm run check
 
 `npm run check` uses configured local provider data. Unit tests use synthetic privacy-safe fixtures.
 
-## Repository Rename
-
-The source is branded MeterMesh, but renaming the external GitHub repository, local directory, and remotes is a separate release operation and is not performed automatically.
-
 ## License
 
 MIT. See [LICENSE](LICENSE).
