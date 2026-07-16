@@ -188,6 +188,16 @@ class SettingsApiTests(unittest.TestCase):
         self.assertTrue(settings["ignore_codex_auto_review"])
         self.assertTrue(settings["legacy_preference_migrated"])
 
+    def test_committed_preference_cannot_be_overridden_by_query(self):
+        self.db.update_settings(1, True)
+        handler = object.__new__(dashboard_api.DashboardHandler)
+        handler.unibase_path = self.path
+        handler.headers = {}
+
+        filters = handler.filters_from_query("provider=all&ignore_auto_review=0")
+
+        self.assertTrue(filters["ignore_auto_review"])
+
     def test_settings_discovers_new_backup_without_restart(self):
         snapshot = self.codex_root / "add_stat" / "new-snapshot"
         rollout = snapshot / "root" / "sessions" / "2026" / "07" / "16" / "rollout-a.jsonl"

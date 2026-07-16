@@ -62,6 +62,8 @@ class AllProviderTests(unittest.TestCase):
         self.assertEqual(all_data["totals"]["sessions"], 3)
         self.assertEqual(len(all_data["models"]), 3)
         self.assertEqual({row["model"] for row in all_data["models"]}, {"Codex · gpt-5.5", "Claude · gpt-5.5", "OpenCode · gpt-5.5"})
+        self.assertEqual(all_data["activity"]["total_seconds"], 10 * 60)
+        self.assertEqual(sum(scope["activity"]["total_seconds"] for scope in scopes), 30 * 60)
         self.assertEqual(all_data["cost"]["recorded"], 0.5)
         self.assertGreater(all_data["cost"]["estimated"], 0)
 

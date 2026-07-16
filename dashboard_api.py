@@ -41,6 +41,7 @@ RANGES = {"all", "30d", "7d", "1d", "custom"}
 CHART_RANGES = {"all", "1y", "6m", "90d", "30d", "7d", "1d", "custom"}
 REQUEST_GROUPS = {"none", "1m", "15m", "30m", "1h", "6h", "12h", "24h"}
 REQUEST_PAGE_SIZES = {10, 25, 50, 100}
+ACTIVITY_IDLE_TIMEOUT_SECONDS = 10 * 60
 AUTO_REVIEW_MODEL = "codex-auto-review"
 PRICING_URL = "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
 PRICING_CACHE_SECONDS = 600
@@ -666,6 +667,112 @@ def chart_bucket_for_day(day: dt.date, granularity: str) -> tuple[dt.date, dt.da
     return day, day, f"{day.strftime('%b')} {day.day}"
 
 
+def activity_from_timestamps(
+    timestamps: list[int],
+    filters: dict[str, str | int | bool | None],
+    timezone: ZoneInfo,
+    idle_timeout_seconds: int = ACTIVITY_IDLE_TIMEOUT_SECONDS,
+) -> dict:
+    ordered = sorted(int(value) for value in timestamps)
+    start_day = parse_iso_day(str(filters["start_day"])) if filters.get("start_day") else None
+    end_day = parse_iso_day(str(filters["end_day"])) if filters.get("end_day") else None
+    today = parse_iso_day(str(filters.get("today_day") or "")) or dt.datetime.now(timezone).date()
+    if start_day is None and ordered:
+        start_day = dt.datetime.fromtimestamp(ordered[0], timezone).date()
+    if end_day is None:
+        last_day = dt.datetime.fromtimestamp(ordered[-1], timezone).date() if ordered else today
+        end_day = max(today, last_day)
+    if start_day is None:
+        start_day = end_day
+
+    range_start = int(dt.datetime.combine(start_day, dt.time.min, timezone).timestamp())
+    range_end = int(
+        dt.datetime.combine(end_day + dt.timedelta(days=1), dt.time.min, timezone).timestamp()
+    )
+    intervals: list[list[int]] = []
+    request_count = 0
+    request_days: dict[str, int] = {}
+    for timestamp in ordered:
+        if range_start <= timestamp < range_end:
+            request_count += 1
+            day = dt.datetime.fromtimestamp(timestamp, timezone).date().isoformat()
+            request_days[day] = request_days.get(day, 0) + 1
+        interval_start = max(timestamp, range_start)
+        interval_end = min(timestamp + idle_timeout_seconds, range_end)
+        if interval_end <= interval_start:
+            continue
+        if intervals and interval_start <= intervals[-1][1]:
+            intervals[-1][1] = max(intervals[-1][1], interval_end)
+        else:
+            intervals.append([interval_start, interval_end])
+
+    daily_seconds: dict[str, int] = {}
+    for interval_start, interval_end in intervals:
+        cursor = interval_start
+        while cursor < interval_end:
+            local_day = dt.datetime.fromtimestamp(cursor, timezone).date()
+            next_day = local_day + dt.timedelta(days=1)
+            next_day_start = int(dt.datetime.combine(next_day, dt.time.min, timezone).timestamp())
+            segment_end = min(interval_end, next_day_start)
+            day_key = local_day.isoformat()
+            daily_seconds[day_key] = daily_seconds.get(day_key, 0) + segment_end - cursor
+            cursor = segment_end
+
+    granularity = chart_granularity(start_day, end_day)
+    days = []
+    cursor, _, _ = chart_bucket_for_day(start_day, granularity)
+    while cursor <= end_day:
+        bucket_start, bucket_end, label = chart_bucket_for_day(cursor, granularity)
+        visible_start = max(bucket_start, start_day)
+        visible_end = min(bucket_end, end_day)
+        bucket_seconds = 0
+        bucket_requests = 0
+        day_cursor = visible_start
+        while day_cursor <= visible_end:
+            day_key = day_cursor.isoformat()
+            bucket_seconds += daily_seconds.get(day_key, 0)
+            bucket_requests += request_days.get(day_key, 0)
+            day_cursor += dt.timedelta(days=1)
+        days.append(
+            {
+                "day": bucket_start.isoformat(),
+                "bucket_start": visible_start.isoformat(),
+                "bucket_end": visible_end.isoformat(),
+                "label": label,
+                "active_seconds": bucket_seconds,
+                "request_count": bucket_requests,
+            }
+        )
+        if granularity == "month":
+            cursor = add_months(bucket_start, 1)
+        elif granularity == "week":
+            cursor = bucket_start + dt.timedelta(days=7)
+        else:
+            cursor = bucket_start + dt.timedelta(days=1)
+
+    total_seconds = sum(daily_seconds.values())
+    active_days = len(daily_seconds)
+    period_days = (end_day - start_day).days + 1
+    peak_day, peak_day_seconds = max(daily_seconds.items(), key=lambda item: item[1], default=("-", 0))
+    return {
+        "range": filters["range"],
+        "granularity": granularity,
+        "range_start": start_day.isoformat(),
+        "range_end": end_day.isoformat(),
+        "idle_timeout_minutes": idle_timeout_seconds // 60,
+        "total_seconds": total_seconds,
+        "average_seconds_per_day": total_seconds / max(period_days, 1),
+        "average_seconds_per_active_day": total_seconds / max(active_days, 1),
+        "period_days": period_days,
+        "active_days": active_days,
+        "focus_blocks": len(intervals),
+        "request_count": request_count,
+        "peak_day": peak_day,
+        "peak_day_seconds": peak_day_seconds,
+        "days": days,
+    }
+
+
 def chart_days_from_events(events: list[dict], filters: dict[str, str | int | bool | None]) -> dict:
     metric_keys = ("total_tokens", "total_with_cached_tokens")
     bucket_model_map: dict[str, dict[str, dict[str, int]]] = {}
@@ -1278,6 +1385,25 @@ def _chart_group_rows(
     return [dict(row) for row in rows]
 
 
+def _activity_timestamps(
+    conn: sqlite3.Connection,
+    provider: str,
+    start_ts: int | None,
+    end_ts: int | None,
+    ignore_auto_review: bool,
+) -> list[int]:
+    query_start = start_ts - ACTIVITY_IDLE_TIMEOUT_SECONDS if start_ts is not None else None
+    where, params = _usage_where(provider, query_start, end_ts, ignore_auto_review)
+    return [
+        int(row["occurred_at"])
+        for row in conn.execute(
+            "select occurred_at from active_events" + where
+            + " order by occurred_at, canonical_event_id",
+            params,
+        ).fetchall()
+    ]
+
+
 def _repriced_models(
     conn: sqlite3.Connection,
     provider: str,
@@ -1524,6 +1650,9 @@ def load_unibase_usage(
         raw_chart_rows = raw_groups if same_chart_range else _chart_group_rows(
             conn, provider, chart_start_ts, chart_end_ts, bool(ignore_auto_review), local_day_sql
         )
+        activity_timestamps = _activity_timestamps(
+            conn, provider, chart_start_ts, chart_end_ts, bool(ignore_auto_review)
+        )
         repriced_models = _repriced_models(
             conn, provider, envelope_start_ts, envelope_end_ts, bool(ignore_auto_review)
         )
@@ -1654,6 +1783,7 @@ def load_unibase_usage(
             }
             for row in raw_chart_rows
         ]
+    chart = _chart_days_from_aggregate_rows(chart_rows, chart_filters)
     result = {
         "provider": provider,
         "provider_label": PROVIDER_LABELS[provider],
@@ -1671,7 +1801,8 @@ def load_unibase_usage(
         "provider_breakdown": provider_breakdown,
         "daily": daily_rows,
         "models": model_rows,
-        "chart": _chart_days_from_aggregate_rows(chart_rows, chart_filters),
+        "chart": chart,
+        "activity": activity_from_timestamps(activity_timestamps, chart_filters, timezone),
         "pricing": {
             "source": pricing["source"], "url": pricing["url"], "loaded_at": pricing["loaded_at"],
             "error": pricing["error"], "missing_models": sorted(missing_models),
@@ -1771,6 +1902,8 @@ def load_requests(
     page: int = 1,
     page_size: int = 25,
     snapshot: str | None = None,
+    bucket_start: str | None = None,
+    child_page: int = 1,
 ) -> dict:
     started_at = time.perf_counter()
     provider = normalize_provider(provider)
@@ -1780,6 +1913,10 @@ def load_requests(
         raise ValueError("Page must be at least 1")
     if page_size not in REQUEST_PAGE_SIZES:
         raise ValueError("Invalid page size")
+    if child_page < 1:
+        raise ValueError("Child page must be at least 1")
+    if bucket_start and group == "none":
+        raise ValueError("Bucket pagination requires grouping")
     timezone = resolve_timezone(timezone_name)
     unibase = Unibase(unibase_path, migrate=False)
     with unibase.connect(readonly=True) as conn:
@@ -1866,7 +2003,8 @@ def load_requests(
                 [*snapshot_params, page_size, (page - 1) * page_size],
             )]
             ordered_keys = []
-            branch_rows = {}
+            page_keys = []
+            branch_data = {}
         else:
             ordered_keys = []
             seen_keys = set()
@@ -1883,8 +2021,23 @@ def load_requests(
             total_rows = len(ordered_keys)
             total_pages = max((total_rows + page_size - 1) // page_size, 1)
             start = (page - 1) * page_size
-            selected_keys = set(ordered_keys[start : start + page_size])
-            branch_rows = {key: [] for key in selected_keys}
+            page_keys = [bucket_start] if bucket_start in seen_keys else []
+            if not bucket_start:
+                page_keys = ordered_keys[start : start + page_size]
+            selected_keys = set(page_keys)
+            branch_data = {
+                key: {
+                    "count": 0,
+                    "input": 0,
+                    "output": 0,
+                    "reasoning": 0,
+                    "cache_read": 0,
+                    "cache_write": 0,
+                    "children_rows": [],
+                }
+                for key in page_keys
+            }
+            child_offset = (child_page - 1) * page_size
             event_rows = conn.execute(
                 "select * from active_events" + snapshot_where
                 + " order by occurred_at desc, canonical_event_id desc",
@@ -1893,11 +2046,20 @@ def load_requests(
             for row in event_rows:
                 key = _bucket_start(row["timestamp_utc"], group, timezone).isoformat()
                 if key in selected_keys:
-                    branch_rows[key].append(dict(row))
+                    branch = branch_data[key]
+                    child_index = branch["count"]
+                    branch["count"] += 1
+                    branch["input"] += int(row["input_tokens"] or 0)
+                    branch["output"] += int(row["output_tokens"] or 0)
+                    branch["reasoning"] += int(row["reasoning_tokens"] or 0)
+                    branch["cache_read"] += int(row["cache_read_tokens"] or 0)
+                    branch["cache_write"] += int(row["cache_write_tokens"] or 0)
+                    if bucket_start and child_offset <= child_index < child_offset + page_size:
+                        branch["children_rows"].append(dict(row))
         conn.commit()
 
     snapshot_value = f"{snapshot_generation}:{max_event_id}:{snapshot_digest}"
-    pricing = load_pricing()
+    pricing = load_pricing() if group == "none" or bucket_start else None
     if group == "none":
         page_items = [
             _public_request_item(_request_item(row, timezone, provider == "all", pricing))
@@ -1905,22 +2067,32 @@ def load_requests(
         ]
     else:
         page_items = []
-        for key in ordered_keys[start : start + page_size]:
+        for key in page_keys:
+            branch = branch_data[key]
             children = [
                 _public_request_item(_request_item(row, timezone, provider == "all", pricing))
-                for row in branch_rows[key]
+                for row in branch["children_rows"]
             ]
+            child_total_pages = max((branch["count"] + page_size - 1) // page_size, 1)
             page_items.append({
                 "bucket_start": key,
-                "count": len(children),
-                "input": sum(item["input"] for item in children),
-                "output": sum(item["output"] for item in children),
-                "reasoning": sum(item["reasoning"] for item in children),
-                "cache_read": sum(item["cache_read"] for item in children),
-                "cache_write": sum(item["cache_write"] for item in children),
-                "total": sum(item["total"] for item in children),
-                "total_with_cache": sum(item["total_with_cache"] for item in children),
+                "count": branch["count"],
+                "input": branch["input"],
+                "output": branch["output"],
+                "reasoning": branch["reasoning"],
+                "cache_read": branch["cache_read"],
+                "cache_write": branch["cache_write"],
+                "total": branch["input"] + branch["output"],
+                "total_with_cache": (
+                    branch["input"] + branch["output"]
+                    + branch["cache_read"] + branch["cache_write"]
+                ),
                 "children": children,
+                "child_page": child_page if bucket_start else 0,
+                "child_page_size": page_size,
+                "child_total_pages": child_total_pages,
+                "child_has_previous": bool(bucket_start and child_page > 1),
+                "child_has_next": bool(bucket_start and child_page < child_total_pages),
             })
     result = {
         "provider": provider,
@@ -2702,12 +2874,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 default_ignore = False
         timezone_name = query.get("timezone", ["UTC"])[0]
         today = dt.datetime.now(resolve_timezone(timezone_name)).date()
+        ignore_auto_review = default_ignore if self.unibase_path else parse_bool_flag(
+            query.get("ignore_auto_review", [None])[0], default=False
+        )
         filters = resolve_range(
             query.get("range", ["all"])[0],
             query.get("start", [None])[0],
             query.get("end", [None])[0],
-            parse_bool_flag(query.get("ignore_auto_review", [None])[0], default=default_ignore)
-            if provider in {"all", "codex"} else False,
+            ignore_auto_review if provider in {"all", "codex"} else False,
             today=today,
         )
         filters["provider"] = provider
@@ -2853,13 +3027,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 start_day=query.get("start", [None])[0],
                 end_day=query.get("end", [None])[0],
                 timezone_name=query.get("timezone", ["UTC"])[0],
-                ignore_auto_review=(
-                    parse_bool_flag(query["ignore_auto_review"][0]) if "ignore_auto_review" in query else None
-                ),
                 group=query.get("group", ["none"])[0],
                 page=int(query.get("page", ["1"])[0]),
                 page_size=int(query.get("page_size", ["25"])[0]),
                 snapshot=query.get("snapshot", [None])[0],
+                bucket_start=query.get("bucket_start", [None])[0],
+                child_page=int(query.get("child_page", ["1"])[0]),
             )
             status = 200
         except SnapshotConflict as exc:

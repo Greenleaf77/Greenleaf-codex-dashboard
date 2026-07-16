@@ -1,5 +1,5 @@
 import "./styles.css";
-import { compactNumber } from "./format.js";
+import { compactNumber, formatDuration } from "./format.js";
 import { chartBarSizing, chartHeightPercent } from "./chart-scale.js";
 import { normalizeProvider, providerOptions } from "./provider-state.js";
 import { paginateRows, truncateModelName, USAGE_TABLE_PAGE_SIZE } from "./usage-table.js";
@@ -7,8 +7,7 @@ import {
   WITH_CACHE,
   WITHOUT_CACHE,
   metricValue,
-  resolveCacheMode,
-  resolveIgnoreAutoReview
+  resolveCacheMode
 } from "./visualization-accounting.js";
 
 const app = document.querySelector("#app");
@@ -37,9 +36,10 @@ const chartRangeOptions = [
 ];
 const visualizationOptions = [
   { value: "heatmap", label: "Daily heatmap" },
-  { value: "tokens", label: "Tokens over time" }
+  { value: "tokens", label: "Tokens over time" },
+  { value: "activity", label: "Active time" }
 ];
-const chartRangeDefaults = { heatmap: "all", tokens: "30d" };
+const chartRangeDefaults = { heatmap: "all", tokens: "30d", activity: "30d" };
 const accountingOptions = [
   { value: WITH_CACHE, label: "With cache" },
   { value: WITHOUT_CACHE, label: "Without cache" }
@@ -74,10 +74,8 @@ const providerLogoPaths = {
   opencode: 'M7 4.5h10l3 7.5-3 7.5H7L4 12l3-7.5Zm2.5 4L8 12l1.5 3.5h5L16 12l-1.5-3.5h-5Z'
 };
 const autoReviewModel = "codex-auto-review";
-const ignoreAutoReviewCookie = "ignore_codex_auto_review_v2";
 
 const initialState = readUrlState();
-const legacyIgnoreCookie = readCookie(ignoreAutoReviewCookie);
 let activeProvider = initialState.provider;
 let activeRange = initialState.range;
 let customRangePending = false;
@@ -85,9 +83,12 @@ let customRangeOpen = false;
 let customStartDate = initialState.start;
 let customEndDate = initialState.end;
 let activeChartRange = initialState.chartRange;
+let chartCustomRangePending = false;
+let chartCustomRangeOpen = false;
 const chartStateByVisualization = {
   heatmap: { range: chartRangeDefaults.heatmap, start: "", end: "" },
   tokens: { range: chartRangeDefaults.tokens, start: "", end: "" },
+  activity: { range: chartRangeDefaults.activity, start: "", end: "" },
   [initialState.visualization]: {
     range: initialState.chartRange,
     start: initialState.chartStart,
@@ -98,8 +99,6 @@ let chartStartDate = initialState.chartStart;
 let chartEndDate = initialState.chartEnd;
 let activeVisualization = initialState.visualization;
 let cacheMode = initialState.cacheMode;
-let ignoreAutoReview = resolveIgnoreAutoReview(initialState.ignoreAutoReview, legacyIgnoreCookie);
-let legacyIgnoreOverride = initialState.ignoreAutoReview ?? legacyIgnoreCookie;
 let activeTableView = initialState.view;
 let currentData = null;
 let diagnosticsController = null;
@@ -121,6 +120,10 @@ let requestGroup = initialState.requestGroup;
 let requestPage = initialState.requestPage;
 let requestPageSize = initialState.requestPageSize;
 let requestSnapshot = null;
+const expandedRequestGroups = new Set();
+const requestChildrenLoading = new Set();
+const requestChildrenErrors = new Map();
+const requestChildrenControllers = new Map();
 let settingsOpen = false;
 let settingsLoading = false;
 let settingsData = null;
@@ -255,25 +258,11 @@ function readUrlState() {
     chartEnd: params.get("chart_end") || "",
     visualization: normalizedVisualization,
     cacheMode: resolveCacheMode(params.get("cache")),
-    ignoreAutoReview: params.get("ignore_auto_review"),
     view: ["usage", "diagnostics", "requests"].includes(params.get("view")) ? params.get("view") : "usage",
     requestGroup: requestGroupOptions.includes(params.get("group")) ? params.get("group") : "none",
     requestPage: Math.max(Number.parseInt(params.get("page") || "1", 10) || 1, 1),
     requestPageSize: requestPageSizes.includes(selectedPageSize) ? selectedPageSize : 25
   };
-}
-
-function readCookie(name) {
-  const encodedName = `${encodeURIComponent(name)}=`;
-  const parts = document.cookie.split(";").map((part) => part.trim());
-  const match = parts.find((part) => part.startsWith(encodedName));
-  if (!match) return null;
-  return decodeURIComponent(match.slice(encodedName.length));
-}
-
-function writeCookie(name, value, days = 365) {
-  const expires = new Date(Date.now() + days * 24 * 60 * 60 * 1000).toUTCString();
-  document.cookie = `${encodeURIComponent(name)}=${encodeURIComponent(value)}; expires=${expires}; path=/; SameSite=Lax`;
 }
 
 function escapeHtml(value) {
@@ -290,7 +279,6 @@ function buildQuery(rangeName, includeDiagnostics = false) {
   params.set("provider", activeProvider);
   params.set("range", rangeName);
   params.set("chart_range", activeChartRange);
-  if (legacyIgnoreOverride !== null) params.set("ignore_auto_review", ignoreAutoReview ? "1" : "0");
   params.set("visualization", activeVisualization);
   params.set("cache", cacheMode);
   params.set("timezone", Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC");
@@ -387,6 +375,15 @@ function heatmapCells(daily, rangeName, rangeStart, rangeEnd, accountingMode) {
 
 function renderVisualizationPanel(data, heat, months, heatColumns) {
   const accountingLabel = cacheMode === WITH_CACHE ? "With cache" : "Without cache";
+  const activityMode = activeVisualization === "activity";
+  const title = {
+    heatmap: "Daily Heatmap",
+    tokens: "Tokens over time",
+    activity: "Active time"
+  }[activeVisualization];
+  const note = activityMode
+    ? `Showing ${escapeHtml(describeChartRange(data.chart))} · ${full(data.activity?.idle_timeout_minutes || 10)}-minute inactivity timeout · all models combined`
+    : `Showing ${escapeHtml(describeChartRange(data.chart))} · ${accountingLabel}`;
   return `
     <div class="daily-visualization">
       <div class="viz-header">
@@ -394,35 +391,48 @@ function renderVisualizationPanel(data, heat, months, heatColumns) {
           <div class="section-title">
             <span class="section-icon tone-cyan">${icon("usage")}</span>
             <div>
-              <h2>${activeVisualization === "tokens" ? "Tokens over time" : "Daily Heatmap"}</h2>
-              <div class="viz-note">Showing ${escapeHtml(describeChartRange(data.chart))} · ${accountingLabel}</div>
+              <h2>${title}</h2>
+              <div class="viz-note">${note}</div>
             </div>
           </div>
         </div>
         <div class="viz-controls">
-          <div class="viz-primary-controls">
+          ${activityMode ? "" : `<div class="viz-primary-controls">
             <nav class="segments accounting-tabs" aria-label="Token accounting">
               ${accountingOptions.map((option) => `<button class="seg ${cacheMode === option.value ? "active" : ""}" type="button" data-cache-mode="${option.value}" aria-pressed="${cacheMode === option.value}">${option.label}</button>`).join("")}
             </nav>
-            <nav class="segments viz-tabs" aria-label="Visualization">
-              ${visualizationOptions.map((option) => `<button class="seg ${activeVisualization === option.value ? "active" : ""}" type="button" data-visualization="${option.value}" aria-pressed="${activeVisualization === option.value}">${option.label}</button>`).join("")}
-            </nav>
-          </div>
+          </div>`}
           <div class="chart-filter">
             <nav class="segments chart-range-tabs" aria-label="Visualization range">
-              ${chartRangeOptions.map((option) => `<button class="seg ${activeChartRange === option.value ? "active" : ""}" type="button" data-chart-range="${option.value}" aria-pressed="${activeChartRange === option.value}">${option.label}</button>`).join("")}
+              ${chartRangeOptions.map((option) => `<button class="seg ${activeChartRange === option.value ? "active" : ""}" type="button" data-chart-range="${option.value}" aria-pressed="${activeChartRange === option.value}" ${option.value === "custom" ? `id="chart-range-trigger" aria-haspopup="dialog" aria-expanded="${chartCustomRangeOpen}"` : ""}>${option.label}</button>`).join("")}
             </nav>
-            ${activeChartRange === "custom" ? `
-              <form class="custom-range chart-custom-range" id="chart-range-form">
-                <label>From<input type="date" name="chart_start" value="${escapeHtml(chartStartDate)}" required></label>
-                <label>To<input type="date" name="chart_end" value="${escapeHtml(chartEndDate)}" required></label>
-                <button class="custom-apply" type="submit">Apply</button>
-              </form>
-            ` : ""}
           </div>
         </div>
       </div>
-      ${activeVisualization === "tokens" ? renderTokensOverTime(data.chart, cacheMode) : renderHeatmap(heat, months, heatColumns, cacheMode)}
+      ${chartCustomRangeOpen ? `
+        <dialog class="custom-range-dialog" id="chart-range-dialog" aria-labelledby="chart-range-title">
+          <form class="custom-range" id="chart-range-form">
+            <div class="custom-range-heading">
+              <strong id="chart-range-title">Custom visualization range</strong>
+              <button class="custom-range-close" type="button" aria-label="Close custom visualization range">×</button>
+            </div>
+            <label>
+              <span>From</span>
+              <input id="chart-custom-start" type="date" name="chart_start" value="${escapeHtml(chartStartDate)}" required>
+            </label>
+            <label>
+              <span>To</span>
+              <input id="chart-custom-end" type="date" name="chart_end" value="${escapeHtml(chartEndDate)}" required>
+            </label>
+            <button class="custom-apply" type="submit">Apply</button>
+          </form>
+        </dialog>
+      ` : ""}
+      ${activeVisualization === "activity"
+        ? renderActiveTime(data.activity)
+        : activeVisualization === "tokens"
+          ? renderTokensOverTime(data.chart, cacheMode)
+          : renderHeatmap(heat, months, heatColumns, cacheMode)}
     </div>
   `;
 }
@@ -475,6 +485,57 @@ function renderTokensOverTime(chart, accountingMode) {
       </div>
     </div>
     ${renderChartLegend(models)}
+  `;
+}
+
+function renderActiveTime(activity) {
+  if (!activity) {
+    return '<div class="chart-empty">Active-time data is unavailable.</div>';
+  }
+  const days = activity.days || [];
+  const maxSeconds = Math.max(1, ...days.map((day) => Number(day.active_seconds || 0)));
+  const ticks = [1, 0.75, 0.5, 0.25, 0].map((ratio) => Math.round(maxSeconds * ratio));
+  const labelEvery = Math.max(1, Math.ceil(days.length / 10));
+  const { barGap, barFill, barMax } = chartBarSizing(activity.granularity, days.length);
+  const activitySummary = `${full(activity.focus_blocks)} sessions`;
+  return `
+    <div class="activity-summary" aria-label="Active time summary">
+      <div><span>Total active time</span><strong>${formatDuration(activity.total_seconds)}</strong><small>${full(activity.request_count)} requests</small></div>
+      <div><span>Average per day</span><strong>${formatDuration(activity.average_seconds_per_day)}</strong><small>Across the selected period</small></div>
+      <div><span>Average active day</span><strong>${formatDuration(activity.average_seconds_per_active_day)}</strong><small>Days with recorded activity</small></div>
+      <div><span>Activity coverage</span><strong>${full(activity.active_days)} / ${full(activity.period_days)} days</strong><small>${activitySummary}</small></div>
+    </div>
+    ${days.length ? `
+      <div class="chart-shell activity-chart-shell">
+        <div class="chart-y-axis">
+          ${ticks.map((tick) => `<span>${formatDuration(tick)}</span>`).join("")}
+        </div>
+        <div class="chart-scroll">
+          <div class="bar-chart" style="--bar-count: ${days.length}; --bar-gap: ${barGap}px; --bar-fill: ${barFill}%; --bar-max: ${barMax}px">
+            <div class="chart-grid">${ticks.map(() => '<span></span>').join("")}</div>
+            <div class="chart-v-grid">${days.map(() => "<span></span>").join("")}</div>
+            <div class="chart-bars">
+              ${days.map((day, index) => renderActivityBar(day, maxSeconds, index, labelEvery, days.length)).join("")}
+            </div>
+          </div>
+        </div>
+      </div>
+    ` : '<div class="chart-empty">No requests in this chart range.</div>'}
+  `;
+}
+
+function renderActivityBar(day, maxSeconds, index, labelEvery, dayCount) {
+  const seconds = Number(day.active_seconds || 0);
+  const height = chartHeightPercent(seconds, maxSeconds);
+  const label = index % labelEvery === 0 || index === dayCount - 1 ? dayLabel(day.label, day.day) : "";
+  const title = day.bucket_start && day.bucket_end && day.bucket_start !== day.bucket_end
+    ? `${day.bucket_start} - ${day.bucket_end}`
+    : day.day;
+  return `
+    <div class="bar-slot" data-tooltip-title="${escapeHtml(title)}" data-tooltip-body="${formatDuration(seconds)} active · ${full(day.request_count)} requests">
+      <div class="stacked-bar activity-time-bar ${seconds ? "" : "empty"}" style="height: ${height}%"></div>
+      <div class="bar-label">${escapeHtml(label)}</div>
+    </div>
   `;
 }
 
@@ -614,11 +675,16 @@ function diagnosticsKey(data) {
 
 function invalidateRequests() {
   if (requestsController) requestsController.abort();
+  requestChildrenControllers.forEach((controller) => controller.abort());
   requestsController = null;
+  requestChildrenControllers.clear();
   requestsPayload = null;
   requestsError = null;
   requestSnapshot = null;
   requestPage = 1;
+  expandedRequestGroups.clear();
+  requestChildrenLoading.clear();
+  requestChildrenErrors.clear();
 }
 
 function renderUsageTables(data) {
@@ -637,11 +703,68 @@ function renderUsageTables(data) {
   const heat = heatmapCells(chartDaily, data.chart.range, data.chart.range_start, data.chart.range_end, cacheMode);
   const months = monthLabels(heat);
   const heatColumns = Math.max(1, Math.ceil(heat.length / 7));
+  const supportsDiagnostics = Boolean(data.supports_diagnostics);
+  if (!supportsDiagnostics && activeTableView === "diagnostics") activeTableView = "usage";
+  const diagnosticsCacheKey = diagnosticsKey(data);
+  let rightPanelContent = `
+    <div class="usage-table-block models-table-block">
+      <div class="table-scroll">
+      <table class="usage-data-table models-table">
+        <thead><tr><th>Model</th><th class="num">Days</th><th class="num">Sessions</th><th class="num">Input</th><th class="num">Output</th><th class="num">Total w/o cached</th><th class="num">Cached</th><th class="num">Total</th><th class="num">Cost</th><th class="num">Share</th></tr></thead>
+        <tbody>
+          ${modelPage.items.map((row) => {
+            const modelKey = row.model_key || row.model;
+            const expanded = expandedModels.has(modelKey);
+            const displayName = modelDisplayName(data, row);
+            const shortName = truncateModelName(displayName);
+            const isTruncated = shortName !== displayName;
+            const share = (row.total_tokens / Math.max(totals.total_tokens, 1)) * 100;
+            return `
+              <tr class="model-row ${expanded ? "expanded" : ""}">
+                <td>
+                  <button class="model-toggle" type="button" data-model="${escapeHtml(modelKey)}" ${isTruncated ? `data-model-tooltip="${escapeHtml(displayName)}"` : ""} aria-expanded="${expanded}" aria-label="${escapeHtml(displayName)}">
+                    <span class="model-chevron">${expanded ? "▾" : "▸"}</span>
+                    <span class="model-name">${escapeHtml(shortName)}</span>
+                  </button>
+                </td>
+                <td class="num">${full(row.active_days)}</td>
+                <td class="num">${full(row.sessions)}</td>
+                <td class="num">${full(row.input_tokens)}</td>
+                <td class="num">${full(row.output_tokens)}</td>
+                <td class="num">${full(row.total_tokens)}</td>
+                <td class="num">${full(row.cached_input_tokens)}</td>
+                <td class="num">${full(row.total_with_cached_tokens)}</td>
+                <td class="num">${money(row.cost_usd)}</td>
+                <td class="num share-cell">
+                  <div class="share-meter" aria-label="${share.toFixed(1)}% of total usage">
+                    <span class="share-track"><span class="share-fill" style="width:${Math.min(share, 100).toFixed(1)}%"></span></span>
+                    <span class="share-value">${share.toFixed(1)}%</span>
+                  </div>
+                </td>
+              </tr>
+              ${expanded ? `<tr class="model-detail-row"><td colspan="10">${renderModelDetails(row)}</td></tr>` : ""}
+            `;
+          }).join("") || '<tr><td colspan="10" class="empty">No models in this range.</td></tr>'}
+        </tbody>
+      </table>
+      </div>
+      ${renderUsagePagination("models", modelPage.page, modelPage.totalPages)}
+    </div>
+  `;
+  if (activeTableView === "diagnostics") {
+    if (diagnosticsCache.has(diagnosticsCacheKey)) rightPanelContent = renderDiagnostics(diagnosticsCache.get(diagnosticsCacheKey));
+    else if (diagnosticsErrors.has(diagnosticsCacheKey)) rightPanelContent = renderDiagnosticsError(diagnosticsErrors.get(diagnosticsCacheKey));
+    else rightPanelContent = renderDiagnosticsLoading();
+  }
+  if (activeTableView === "requests") rightPanelContent = renderRequestsState();
   return `
     <div class="tables">
       <section class="usage-table-panel daily-usage-panel" data-table-panel="daily">
-        <header class="usage-panel-heading">
+        <header class="usage-panel-heading daily-panel-heading">
           <h2 class="section-title"><span class="section-icon tone-lime">${icon("usage")}</span><span>Daily Usage</span></h2>
+          <nav class="segments viz-tabs" aria-label="Visualization">
+            ${visualizationOptions.map((option) => `<button class="seg ${activeVisualization === option.value ? "active" : ""}" type="button" data-visualization="${option.value}" aria-pressed="${activeVisualization === option.value}">${option.label}</button>`).join("")}
+          </nav>
         </header>
         ${renderVisualizationPanel(data, heat, months, heatColumns)}
         <div class="usage-table-block">
@@ -660,52 +783,15 @@ function renderUsageTables(data) {
       </section>
 
       <section class="usage-table-panel models-panel" data-table-panel="models">
-        <header class="usage-panel-heading">
-          <h2 class="section-title"><span class="section-icon tone-violet">${icon("models")}</span><span>Models</span></h2>
+        <header class="usage-panel-heading workspace-panel-heading">
+          <h2 class="section-title"><span class="section-icon tone-violet">${icon("models")}</span><span>Usage Details</span></h2>
+          <nav class="segments workspace-panel-tabs" aria-label="Details view">
+            <button class="seg ${activeTableView === "usage" ? "active" : ""}" type="button" data-table-view="usage" aria-pressed="${activeTableView === "usage"}">Models</button>
+            ${supportsDiagnostics ? `<button class="seg ${activeTableView === "diagnostics" ? "active" : ""}" type="button" data-table-view="diagnostics" aria-pressed="${activeTableView === "diagnostics"}">Diagnostics</button>` : ""}
+            <button class="seg ${activeTableView === "requests" ? "active" : ""}" type="button" data-table-view="requests" aria-pressed="${activeTableView === "requests"}">Requests</button>
+          </nav>
         </header>
-        <div class="usage-table-block models-table-block">
-          <div class="table-scroll">
-          <table class="usage-data-table models-table">
-            <thead><tr><th>Model</th><th class="num">Days</th><th class="num">Sessions</th><th class="num">Input</th><th class="num">Output</th><th class="num">Total w/o cached</th><th class="num">Cached</th><th class="num">Total</th><th class="num">Cost</th><th class="num">Share</th></tr></thead>
-            <tbody>
-              ${modelPage.items.map((row) => {
-                const modelKey = row.model_key || row.model;
-                const expanded = expandedModels.has(modelKey);
-                const displayName = modelDisplayName(data, row);
-                const shortName = truncateModelName(displayName);
-                const isTruncated = shortName !== displayName;
-                const share = (row.total_tokens / Math.max(totals.total_tokens, 1)) * 100;
-                return `
-                  <tr class="model-row ${expanded ? "expanded" : ""}">
-                    <td>
-                      <button class="model-toggle" type="button" data-model="${escapeHtml(modelKey)}" ${isTruncated ? `data-model-tooltip="${escapeHtml(displayName)}"` : ""} aria-expanded="${expanded}" aria-label="${escapeHtml(displayName)}">
-                        <span class="model-chevron">${expanded ? "▾" : "▸"}</span>
-                        <span class="model-name">${escapeHtml(shortName)}</span>
-                      </button>
-                    </td>
-                    <td class="num">${full(row.active_days)}</td>
-                    <td class="num">${full(row.sessions)}</td>
-                    <td class="num">${full(row.input_tokens)}</td>
-                    <td class="num">${full(row.output_tokens)}</td>
-                    <td class="num">${full(row.total_tokens)}</td>
-                    <td class="num">${full(row.cached_input_tokens)}</td>
-                    <td class="num">${full(row.total_with_cached_tokens)}</td>
-                    <td class="num">${money(row.cost_usd)}</td>
-                    <td class="num share-cell">
-                      <div class="share-meter" aria-label="${share.toFixed(1)}% of total usage">
-                        <span class="share-track"><span class="share-fill" style="width:${Math.min(share, 100).toFixed(1)}%"></span></span>
-                        <span class="share-value">${share.toFixed(1)}%</span>
-                      </div>
-                    </td>
-                  </tr>
-                  ${expanded ? `<tr class="model-detail-row"><td colspan="10">${renderModelDetails(row)}</td></tr>` : ""}
-                `;
-              }).join("") || '<tr><td colspan="10" class="empty">No models in this range.</td></tr>'}
-            </tbody>
-          </table>
-          </div>
-          ${renderUsagePagination("models", modelPage.page, modelPage.totalPages)}
-        </div>
+        <div class="workspace-panel-content" id="right-panel-content">${rightPanelContent}</div>
       </section>
     </div>
   `;
@@ -714,7 +800,7 @@ function renderUsageTables(data) {
 function renderDiagnostics(diagnostics) {
   const summary = diagnostics.summary;
   return `
-    <section class="diagnostics-panel">
+    <div class="diagnostics-panel">
       <div class="diagnostics-heading">
         <div>
           <h2 class="section-title"><span class="section-icon tone-cyan">${icon("usage")}</span><span>Telemetry Diagnostics</span></h2>
@@ -739,17 +825,17 @@ function renderDiagnostics(diagnostics) {
           </tbody>
         </table>
       </div>
-    </section>
+    </div>
   `;
 }
 
 function renderDiagnosticsLoading(elapsedSeconds = 0) {
   const elapsed = elapsedSeconds >= 2 ? `<span>${full(elapsedSeconds)}s elapsed</span>` : "";
-  return `<section class="diagnostics-state" aria-live="polite"><span class="diagnostics-spinner" aria-hidden="true"></span><strong>Analyzing rollout telemetry…</strong>${elapsed}</section>`;
+  return `<div class="diagnostics-state" aria-live="polite"><span class="diagnostics-spinner" aria-hidden="true"></span><strong>Analyzing rollout telemetry…</strong>${elapsed}</div>`;
 }
 
 function renderDiagnosticsError(message) {
-  return `<section class="diagnostics-state error"><strong>Could not analyze rollout telemetry.</strong><code>${escapeHtml(message)}</code><button class="diagnostics-retry" type="button">Retry</button></section>`;
+  return `<div class="diagnostics-state error"><strong>Could not analyze rollout telemetry.</strong><code>${escapeHtml(message)}</code><button class="diagnostics-retry" type="button">Retry</button></div>`;
 }
 
 function renderRequestValues(item) {
@@ -770,19 +856,39 @@ function renderRequestEvent(item) {
   `;
 }
 
+function renderRequestChildren(item) {
+  const bucket = escapeHtml(item.bucket_start);
+  const loading = requestChildrenLoading.has(item.bucket_start);
+  const error = requestChildrenErrors.get(item.bucket_start);
+  const children = item.children.map(renderRequestEvent).join("");
+  const status = loading
+    ? '<div class="request-child-state"><span class="diagnostics-spinner" aria-hidden="true"></span><span>Loading requests…</span></div>'
+    : error
+      ? `<div class="request-child-state error"><span>${escapeHtml(error)}</span><button type="button" data-request-child-retry="${bucket}">Retry</button></div>`
+      : "";
+  const pagination = item.child_page > 0 ? `
+    <nav class="request-pagination request-child-pagination" aria-label="Requests in ${bucket}">
+      <button type="button" data-request-bucket="${bucket}" data-request-child-page="${item.child_page - 1}" ${item.child_has_previous && !loading ? "" : "disabled"}>Previous</button>
+      <span>Page ${full(item.child_page)} of ${full(item.child_total_pages)}</span>
+      <button type="button" data-request-bucket="${bucket}" data-request-child-page="${item.child_page + 1}" ${item.child_has_next && !loading ? "" : "disabled"}>Next</button>
+    </nav>
+  ` : "";
+  return `<div class="request-children">${status}${children}${pagination}</div>`;
+}
+
 function renderRequests(payload) {
   const grouped = payload.group !== "none";
   const rows = payload.items.map((item) => grouped ? `
-    <details class="request-group">
+    <details class="request-group" data-request-group="${escapeHtml(item.bucket_start)}" ${expandedRequestGroups.has(item.bucket_start) ? "open" : ""}>
       <summary>
         <span><strong>${escapeHtml(item.bucket_start)}</strong><small>${full(item.count)} requests</small></span>
         <span class="request-values">${renderRequestValues(item)}</span>
       </summary>
-      <div class="request-children">${item.children.map(renderRequestEvent).join("")}</div>
+      ${renderRequestChildren(item)}
     </details>
   ` : renderRequestEvent(item)).join("");
   return `
-    <section class="requests-panel">
+    <div class="requests-panel">
       <div class="requests-heading">
         <div>
           <h2 class="section-title"><span class="section-icon tone-cyan">${icon("usage")}</span><span>Requests</span></h2>
@@ -799,37 +905,18 @@ function renderRequests(payload) {
         <span>Page ${full(payload.page)} of ${full(payload.total_pages)}</span>
         <button type="button" data-request-page="${payload.page + 1}" ${payload.has_next ? "" : "disabled"}>Next</button>
       </nav>
-    </section>
+    </div>
   `;
 }
 
 function renderRequestsState() {
-  if (requestsError) return `<section class="diagnostics-state error"><strong>Could not load Requests.</strong><code>${escapeHtml(requestsError)}</code><button class="requests-retry" type="button">Retry</button></section>`;
+  if (requestsError) return `<div class="diagnostics-state error"><strong>Could not load Requests.</strong><code>${escapeHtml(requestsError)}</code><button class="requests-retry" type="button">Retry</button></div>`;
   if (requestsPayload) return renderRequests(requestsPayload);
-  return `<section class="diagnostics-state" aria-live="polite"><span class="diagnostics-spinner" aria-hidden="true"></span><strong>Loading Requests from Unibase…</strong></section>`;
+  return `<div class="diagnostics-state" aria-live="polite"><span class="diagnostics-spinner" aria-hidden="true"></span><strong>Loading Requests from Unibase…</strong></div>`;
 }
 
 function renderTableView(data) {
-  const supportsDiagnostics = Boolean(data.supports_diagnostics);
-  if (!supportsDiagnostics && activeTableView === "diagnostics") activeTableView = "usage";
-  const key = diagnosticsKey(data);
-  let workspace = renderUsageTables(data);
-  if (supportsDiagnostics && activeTableView === "diagnostics") {
-    if (diagnosticsCache.has(key)) workspace = renderDiagnostics(diagnosticsCache.get(key));
-    else if (diagnosticsErrors.has(key)) workspace = renderDiagnosticsError(diagnosticsErrors.get(key));
-    else workspace = renderDiagnosticsLoading();
-  }
-  if (activeTableView === "requests") workspace = renderRequestsState();
-  const toolbar = `
-    <div class="table-view-toolbar">
-      <nav class="segments" aria-label="Table view">
-        <button class="seg ${activeTableView === "usage" ? "active" : ""}" type="button" data-table-view="usage" aria-pressed="${activeTableView === "usage"}">Usage</button>
-        ${supportsDiagnostics ? `<button class="seg ${activeTableView === "diagnostics" ? "active" : ""}" type="button" data-table-view="diagnostics" aria-pressed="${activeTableView === "diagnostics"}">Diagnostics</button>` : ""}
-        <button class="seg ${activeTableView === "requests" ? "active" : ""}" type="button" data-table-view="requests" aria-pressed="${activeTableView === "requests"}">Requests</button>
-      </nav>
-    </div>
-  `;
-  return `${toolbar}<div id="table-workspace">${workspace}</div>`;
+  return `<div id="table-workspace">${renderUsageTables(data)}</div>`;
 }
 
 function clearDiagnosticsTimer() {
@@ -912,27 +999,81 @@ function bindTableView(data) {
         chartStartDate = isIsoDate(chartStartDate) ? chartStartDate : data.chart.range_start || todayKey();
         chartEndDate = isIsoDate(chartEndDate) ? chartEndDate : data.chart.range_end || chartStartDate;
         normalizeChartCustomRange();
-        saveActiveChartState();
+        chartCustomRangePending = data.chart?.range !== "custom";
+        chartCustomRangeOpen = true;
         render(data);
         return;
       }
+      chartCustomRangePending = false;
+      chartCustomRangeOpen = false;
       saveActiveChartState();
       syncUrl();
       refresh();
     });
   });
 
-  document.querySelector("#chart-range-form")?.addEventListener("submit", (event) => {
-    event.preventDefault();
-    const form = new FormData(event.currentTarget);
-    chartStartDate = String(form.get("chart_start") || "");
-    chartEndDate = String(form.get("chart_end") || "");
-    normalizeChartCustomRange();
-    activeChartRange = "custom";
-    saveActiveChartState();
-    syncUrl();
-    refresh();
-  });
+  const chartRangeDialog = document.querySelector("#chart-range-dialog");
+  const chartRangeTrigger = document.querySelector("#chart-range-trigger");
+  const chartRangeForm = document.querySelector("#chart-range-form");
+  if (chartRangeDialog && chartRangeTrigger && chartRangeForm) {
+    let listenersAttached = true;
+    const repositionDialog = () => positionCustomRangeDialog(chartRangeDialog, chartRangeTrigger);
+    const removePositionListeners = () => {
+      if (!listenersAttached) return;
+      listenersAttached = false;
+      window.removeEventListener("resize", repositionDialog);
+      window.visualViewport?.removeEventListener("resize", repositionDialog);
+      window.visualViewport?.removeEventListener("scroll", repositionDialog);
+    };
+    const dismissDialog = () => {
+      removePositionListeners();
+      chartCustomRangeOpen = false;
+      if (chartCustomRangePending) {
+        restoreChartState(activeVisualization);
+        chartCustomRangePending = false;
+      }
+      document.documentElement.classList.toggle("custom-range-modal-open", customRangeOpen);
+      chartRangeDialog.close();
+      render(data);
+    };
+
+    chartRangeDialog.showModal();
+    repositionDialog();
+    chartRangeDialog.classList.add("positioned");
+    document.querySelector("#chart-custom-start")?.focus();
+    window.addEventListener("resize", repositionDialog);
+    window.visualViewport?.addEventListener("resize", repositionDialog);
+    window.visualViewport?.addEventListener("scroll", repositionDialog);
+    chartRangeDialog.addEventListener("close", removePositionListeners, { once: true });
+    chartRangeDialog.addEventListener("cancel", (event) => {
+      event.preventDefault();
+      dismissDialog();
+    });
+    chartRangeDialog.addEventListener("click", (event) => {
+      if (event.target !== chartRangeDialog) return;
+      const rect = chartRangeDialog.getBoundingClientRect();
+      const inside = event.clientX >= rect.left && event.clientX <= rect.right
+        && event.clientY >= rect.top && event.clientY <= rect.bottom;
+      if (!inside) dismissDialog();
+    });
+    chartRangeDialog.querySelector(".custom-range-close")?.addEventListener("click", dismissDialog);
+    chartRangeForm.addEventListener("submit", (event) => {
+      event.preventDefault();
+      const form = new FormData(chartRangeForm);
+      chartStartDate = String(form.get("chart_start") || "");
+      chartEndDate = String(form.get("chart_end") || "");
+      normalizeChartCustomRange();
+      activeChartRange = "custom";
+      chartCustomRangePending = false;
+      chartCustomRangeOpen = false;
+      saveActiveChartState();
+      removePositionListeners();
+      document.documentElement.classList.toggle("custom-range-modal-open", customRangeOpen);
+      chartRangeDialog.close();
+      syncUrl();
+      refresh();
+    });
+  }
 
   document.querySelectorAll("[data-cache-mode]").forEach((button) => {
     button.addEventListener("click", () => {
@@ -971,29 +1112,84 @@ function bindTableView(data) {
     ensureRequests(data, true);
   });
   document.querySelector("#request-group")?.addEventListener("change", (event) => {
+    requestChildrenControllers.forEach((controller) => controller.abort());
+    requestChildrenControllers.clear();
     requestGroup = event.target.value;
     requestPage = 1;
     requestSnapshot = null;
     requestsPayload = null;
+    expandedRequestGroups.clear();
+    requestChildrenLoading.clear();
+    requestChildrenErrors.clear();
     syncUrl();
     ensureRequests(data, true);
   });
   document.querySelector("#request-page-size")?.addEventListener("change", (event) => {
+    requestChildrenControllers.forEach((controller) => controller.abort());
+    requestChildrenControllers.clear();
     requestPageSize = Number(event.target.value);
     requestPage = 1;
     requestSnapshot = null;
     requestsPayload = null;
+    expandedRequestGroups.clear();
+    requestChildrenLoading.clear();
+    requestChildrenErrors.clear();
     syncUrl();
     ensureRequests(data, true);
   });
   document.querySelectorAll("[data-request-page]").forEach((button) => {
     button.addEventListener("click", () => {
+      requestChildrenControllers.forEach((controller) => controller.abort());
+      requestChildrenControllers.clear();
       requestPage = Number(button.dataset.requestPage);
       requestsPayload = null;
+      expandedRequestGroups.clear();
+      requestChildrenLoading.clear();
+      requestChildrenErrors.clear();
       syncUrl();
       ensureRequests(data, true);
     });
   });
+  document.querySelectorAll("[data-request-group]").forEach((details) => {
+    details.addEventListener("toggle", () => {
+      const bucket = details.dataset.requestGroup;
+      if (!details.open) {
+        expandedRequestGroups.delete(bucket);
+        return;
+      }
+      expandedRequestGroups.add(bucket);
+      const item = requestsPayload?.items.find((candidate) => candidate.bucket_start === bucket);
+      if (item?.child_page === 0 && !requestChildrenLoading.has(bucket)) loadRequestChildren(data, bucket, 1);
+    });
+  });
+  document.querySelectorAll("[data-request-child-page]").forEach((button) => {
+    button.addEventListener("click", () => {
+      loadRequestChildren(data, button.dataset.requestBucket, Number(button.dataset.requestChildPage));
+    });
+  });
+  document.querySelectorAll("[data-request-child-retry]").forEach((button) => {
+    button.addEventListener("click", () => loadRequestChildren(data, button.dataset.requestChildRetry, 1));
+  });
+}
+
+function requestsParams(bucketStart = null, childPage = 1) {
+  const params = new URLSearchParams();
+  params.set("provider", activeProvider);
+  params.set("range", activeRange);
+  params.set("timezone", Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC");
+  params.set("group", requestGroup);
+  params.set("page", String(requestPage));
+  params.set("page_size", String(requestPageSize));
+  if (activeRange === "custom") {
+    params.set("start", customStartDate);
+    params.set("end", customEndDate);
+  }
+  if (requestSnapshot) params.set("snapshot", requestSnapshot);
+  if (bucketStart) {
+    params.set("bucket_start", bucketStart);
+    params.set("child_page", String(childPage));
+  }
+  return params;
 }
 
 async function ensureRequests(data, force = false, allowSnapshotRetry = true) {
@@ -1006,19 +1202,7 @@ async function ensureRequests(data, force = false, allowSnapshotRetry = true) {
   const controller = requestsController;
   requestsError = null;
   if (activeTableView === "requests") updateTableView(data);
-  const params = new URLSearchParams();
-  params.set("provider", activeProvider);
-  params.set("range", activeRange);
-  params.set("timezone", Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC");
-  params.set("group", requestGroup);
-  params.set("page", String(requestPage));
-  params.set("page_size", String(requestPageSize));
-  if (activeRange === "custom") {
-    params.set("start", customStartDate);
-    params.set("end", customEndDate);
-  }
-  if (legacyIgnoreOverride !== null) params.set("ignore_auto_review", ignoreAutoReview ? "1" : "0");
-  if (requestSnapshot) params.set("snapshot", requestSnapshot);
+  const params = requestsParams();
   try {
     const response = await fetch(`/api/requests?${params}`, { cache: "no-store", signal: controller.signal });
     if (!response.ok) {
@@ -1040,6 +1224,46 @@ async function ensureRequests(data, force = false, allowSnapshotRetry = true) {
     if (activeTableView === "requests") updateTableView(data);
   } finally {
     if (requestsController === controller) requestsController = null;
+  }
+}
+
+async function loadRequestChildren(data, bucket, childPage) {
+  if (!requestsPayload || requestGroup === "none" || childPage < 1) return;
+  requestChildrenControllers.get(bucket)?.abort();
+  const controller = new AbortController();
+  requestChildrenControllers.set(bucket, controller);
+  requestChildrenErrors.delete(bucket);
+  requestChildrenLoading.add(bucket);
+  if (activeTableView === "requests") updateTableView(data);
+  try {
+    const response = await fetch(`/api/requests?${requestsParams(bucket, childPage)}`, {
+      cache: "no-store",
+      signal: controller.signal
+    });
+    if (!response.ok) {
+      if (response.status === 409 && requestSnapshot) {
+        invalidateRequests();
+        syncUrl();
+        return ensureRequests(data, true, false);
+      }
+      throw new Error(`Requests API returned HTTP ${response.status}`);
+    }
+    const payload = await response.json();
+    const nextItem = payload.items[0];
+    if (!nextItem || !requestsPayload || payload.snapshot !== requestSnapshot) return;
+    requestsPayload = {
+      ...requestsPayload,
+      items: requestsPayload.items.map((item) => item.bucket_start === bucket ? nextItem : item)
+    };
+  } catch (error) {
+    if (error.name === "AbortError") return;
+    requestChildrenErrors.set(bucket, error.message);
+  } finally {
+    if (requestChildrenControllers.get(bucket) === controller) {
+      requestChildrenLoading.delete(bucket);
+      requestChildrenControllers.delete(bucket);
+      if (activeTableView === "requests") updateTableView(data);
+    }
   }
 }
 
@@ -1220,8 +1444,8 @@ async function ensureDiagnostics(data, force = false) {
   if (activeTableView === "diagnostics") updateTableView(data);
   diagnosticsTimer = window.setInterval(() => {
     if (activeTableView !== "diagnostics" || diagnosticsKey(currentData || data) !== key) return;
-    const workspace = document.querySelector("#table-workspace");
-    if (workspace) workspace.innerHTML = renderDiagnosticsLoading(Math.floor((Date.now() - startedAt) / 1000));
+      const panel = document.querySelector("#right-panel-content");
+      if (panel) panel.innerHTML = renderDiagnosticsLoading(Math.floor((Date.now() - startedAt) / 1000));
   }, 1000);
 
   try {
@@ -1299,7 +1523,7 @@ function render(data) {
     : "";
   const rangeSummary = customRangePending ? "Choose custom range" : describeRange(data);
   document.documentElement.dataset.provider = provider;
-  document.documentElement.classList.toggle("custom-range-modal-open", customRangeOpen);
+  document.documentElement.classList.toggle("custom-range-modal-open", customRangeOpen || chartCustomRangeOpen);
   document.documentElement.classList.toggle("settings-modal-open", settingsOpen);
   document.title = `MeterMesh · ${providerLabel}`;
 
@@ -1576,9 +1800,6 @@ function render(data) {
           ignore_codex_auto_review: settingsData.ignore_codex_auto_review,
           backups: Object.values(settingsData.backups).flat().map(({ source_id, enabled }) => ({ source_id, enabled }))
         };
-        ignoreAutoReview = settingsData.ignore_codex_auto_review;
-        legacyIgnoreOverride = null;
-        writeCookie(ignoreAutoReviewCookie, ignoreAutoReview ? "1" : "0");
         invalidateDashboardCaches();
         syncUrl();
         await refresh();
@@ -1793,7 +2014,8 @@ async function refresh() {
     activeChartRange = data.chart?.range || activeChartRange;
     customRangePending = false;
     customRangeOpen = false;
-    ignoreAutoReview = Boolean(data.ignore_auto_review);
+    chartCustomRangePending = false;
+    chartCustomRangeOpen = false;
     if (data.range === "custom") {
       customStartDate = data.range_start || customStartDate;
       customEndDate = data.range_end || customEndDate;
@@ -1807,6 +2029,7 @@ async function refresh() {
   } catch (error) {
     if (error.name === "AbortError") return;
     customRangeOpen = false;
+    chartCustomRangeOpen = false;
     document.documentElement.classList.remove("custom-range-modal-open");
     const providerLabel = providerOptions.find((option) => option.value === activeProvider)?.label || "ALL";
     app.innerHTML = `<section class="state error"><h1>MeterMesh · ${providerLabel}</h1><p>Could not load committed Unibase data.</p><code>${escapeHtml(error.message)}</code></section>`;

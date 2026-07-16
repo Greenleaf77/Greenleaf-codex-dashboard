@@ -337,11 +337,8 @@ h2.section-title {
   gap: 8px;
 }
 
-.chart-custom-range {
-  padding: 8px;
-}
-
 .viz-tabs {
+  flex-wrap: nowrap;
   justify-content: flex-end;
 }
 
@@ -555,6 +552,49 @@ h2.section-title {
   text-align: center;
 }
 
+.activity-summary {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 1px;
+  margin: 18px 0 14px;
+  overflow: hidden;
+  border: 1px solid var(--border-soft);
+  border-radius: 12px;
+  background: var(--border-soft);
+}
+
+.activity-summary > div {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  padding: 12px 14px;
+  background: var(--surface-inset);
+}
+
+.activity-summary span,
+.activity-summary small {
+  color: var(--text-tertiary);
+  font-size: 11px;
+}
+
+.activity-summary strong {
+  color: var(--text-primary);
+  font-size: 20px;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.025em;
+}
+
+.activity-summary small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.activity-time-bar {
+  background: linear-gradient(180deg, var(--cyan), color-mix(in srgb, var(--cyan) 58%, var(--blue)));
+  box-shadow: 0 0 18px color-mix(in srgb, var(--cyan) 18%, transparent);
+}
+
 .tables {
   display: grid;
   grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.1fr);
@@ -580,13 +620,52 @@ h2.section-title {
   margin: 0;
 }
 
+.daily-panel-heading {
+  display: flex;
+  min-height: 60px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+}
+
+.daily-panel-heading .viz-tabs {
+  margin-left: auto;
+}
+
+.workspace-panel-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  min-height: 60px;
+}
+
+.workspace-panel-heading h2.section-title {
+  flex: 0 0 auto;
+}
+
+.workspace-panel-tabs {
+  flex-wrap: nowrap;
+  margin-left: auto;
+}
+
+.workspace-panel-content {
+  min-width: 0;
+}
+
+.workspace-panel-content > .diagnostics-panel,
+.workspace-panel-content > .requests-panel,
+.workspace-panel-content > .diagnostics-state {
+  padding: 16px 18px 14px;
+}
+
 .daily-visualization {
   padding: 16px 18px 18px;
   border-bottom: 1px solid var(--border-soft);
 }
 
 .daily-visualization .viz-header {
-  align-items: center;
+  align-items: flex-start;
 }
 
 .daily-visualization .section-icon {
@@ -773,12 +852,6 @@ h2.section-title {
 
 .table-page-ellipsis {
   color: var(--text-muted);
-}
-
-.table-view-toolbar {
-  display: flex;
-  justify-content: flex-end;
-  margin-top: 16px;
 }
 
 .diagnostics-panel {
@@ -1027,6 +1100,29 @@ h2.section-title {
   background: var(--surface-1);
 }
 
+.request-child-state {
+  display: flex;
+  min-height: 52px;
+  align-items: center;
+  justify-content: center;
+  gap: 9px;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.request-child-state.error {
+  color: var(--coral);
+}
+
+.request-child-state button {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 5px 10px;
+  background: var(--surface-2);
+  color: var(--text-primary);
+  cursor: pointer;
+}
+
 .request-pagination {
   display: flex;
   align-items: center;
@@ -1045,6 +1141,11 @@ h2.section-title {
 .request-pagination button:disabled {
   opacity: .45;
   cursor: not-allowed;
+}
+
+.request-child-pagination {
+  margin: 4px 0 2px;
+  padding: 4px 0;
 }
 
 .request-empty {
@@ -2149,6 +2250,10 @@ tbody tr:hover td {
   .diagnostics-summary {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
+
+  .activity-summary {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
 }
 
 @media (max-width: 820px) {
@@ -2294,6 +2399,36 @@ tbody tr:hover td {
     flex: 1;
   }
 
+  .activity-summary {
+    grid-template-columns: 1fr;
+  }
+
+  .workspace-panel-heading {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .daily-panel-heading {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .daily-panel-heading .viz-tabs {
+    width: 100%;
+    margin-left: 0;
+    overflow-x: auto;
+    justify-content: flex-start;
+  }
+
+  .workspace-panel-tabs {
+    width: 100%;
+    margin-left: 0;
+  }
+
+  .workspace-panel-tabs .seg {
+    flex: 1;
+  }
+
   .custom-range label,
   .custom-apply {
     width: 100%;
@@ -2306,18 +2441,6 @@ tbody tr:hover td {
   .custom-range input,
   .custom-apply {
     min-height: 44px;
-  }
-
-  .table-view-toolbar {
-    justify-content: stretch;
-  }
-
-  .table-view-toolbar .segments {
-    width: 100%;
-  }
-
-  .table-view-toolbar .seg {
-    flex: 1;
   }
 
   .diagnostics-heading {

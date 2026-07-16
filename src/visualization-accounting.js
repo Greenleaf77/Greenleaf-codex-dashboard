@@ -12,9 +12,3 @@ export function metricValue(row, mode) {
   const inclusive = rawInclusive === null || rawInclusive === undefined ? Number.NaN : Number(rawInclusive);
   return Number.isFinite(inclusive) ? inclusive : fallback;
 }
-
-export function resolveIgnoreAutoReview(urlValue, cookieValue) {
-  if (urlValue === "1" || urlValue === "0") return urlValue === "1";
-  if (cookieValue === "1" || cookieValue === "0") return cookieValue === "1";
-  return false;
-}
