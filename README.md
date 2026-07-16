@@ -8,6 +8,7 @@ MeterMesh is a local, privacy-conscious usage dashboard for Codex, Claude Code, 
 
 - Provider selector: All, Codex, Claude, OpenCode.
 - Usage charts and provider-qualified model totals.
+- Independent visualization ranges with daily, weekly, and monthly token buckets.
 - Provider-aware Diagnostics and source health.
 - Privacy-safe Requests with numbered pagination and grouping from 1 minute to 24 hours.
 - Settings for backup snapshots, Codex auto-review filtering, reset, and Full reindex.
@@ -24,7 +25,7 @@ The default database is:
 
 Override it with `METERMESH_UNIBASE_DB` or `--unibase-db`. Unibase is a rebuildable index. Provider files remain the source of truth and are opened read-only.
 
-MeterMesh never resets or migrates `~/.codex/state_5.sqlite` or OpenCode's `opencode.db`. The old Claude `~/.claude/usage-dashboard.sqlite` is left untouched and is not used by MeterMesh 2.0.
+MeterMesh never resets or migrates `~/.codex/state_5.sqlite` or OpenCode's `opencode.db`. The old Claude `~/.claude/usage-dashboard.sqlite` is left untouched and is not used by MeterMesh 2.x.
 
 ## Data Sources
 
@@ -36,6 +37,8 @@ Claude:   ~/.claude/projects/**/*.jsonl
 OpenCode: $XDG_DATA_HOME/opencode/opencode.db
           or ~/.local/share/opencode/opencode.db
 ```
+
+For the live Codex source, MeterMesh also imports valid absolute rollout paths registered in `state_5.sqlite`. This automatically includes additional Codex profiles such as `~/.codex-work/sessions` without storing their raw paths in Unibase.
 
 Compatibility overrides:
 

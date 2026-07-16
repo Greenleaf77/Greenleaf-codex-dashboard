@@ -65,6 +65,41 @@ class AllProviderTests(unittest.TestCase):
         self.assertEqual(all_data["cost"]["recorded"], 0.5)
         self.assertGreater(all_data["cost"]["estimated"], 0)
 
+    def test_opencode_endpoints_share_one_model_row(self):
+        self.db.add_event("opencode-live", None, {
+            "provider": "opencode",
+            "event_key": "second-endpoint-event",
+            "stream_key": "second-endpoint-session",
+            "timestamp_utc": "2026-07-16T13:00:00Z",
+            "occurred_at": 1784206800,
+            "model": "gpt-5.5",
+            "native_provider_id": "second-endpoint",
+            "semantics": "opencode_recorded",
+            "classification": "usage_update",
+            "input_tokens": 10,
+            "cache_read_tokens": 0,
+            "cache_write_tokens": 0,
+            "output_tokens": 3,
+            "reasoning_tokens": 0,
+            "cost_usd": 0.25,
+            "cost_kind": "recorded",
+        }, 1)
+        self.db.rebuild_active_events()
+
+        opencode = self.load("opencode")
+        self.assertEqual(len(opencode["models"]), 1)
+        model = opencode["models"][0]
+        self.assertEqual(model["model"], "gpt-5.5")
+        self.assertEqual(model["model_key"], "opencode:gpt-5.5")
+        self.assertEqual(model["sessions"], 2)
+        self.assertEqual(model["input_tokens"], 40)
+        self.assertEqual(model["output_tokens"], 11)
+        self.assertEqual(model["cost_usd"], 0.75)
+
+        all_data = self.load("all")
+        self.assertEqual(len(all_data["models"]), 3)
+        self.assertEqual(sum(row["model"] == "OpenCode · gpt-5.5" for row in all_data["models"]), 1)
+
     def test_missing_and_invalid_provider_default_to_all(self):
         self.assertEqual(dashboard_api.normalize_provider(None), "all")
         self.assertEqual(dashboard_api.normalize_provider("invalid"), "all")
@@ -73,20 +108,39 @@ class AllProviderTests(unittest.TestCase):
         self.assertEqual(handler.filters_from_query("")["provider"], "all")
         self.assertEqual(handler.filters_from_query("provider=invalid")["provider"], "all")
 
-    def test_chart_range_always_matches_global_range(self):
+    def test_chart_range_is_independent_from_global_range(self):
         handler = object.__new__(dashboard_api.DashboardHandler)
         handler.unibase_path = self.path
         filters = handler.filters_from_query("range=7d&chart_range=all")
-        self.assertEqual(filters["chart_range"], "7d")
-        self.assertEqual(filters["chart_start_day"], filters["start_day"])
-        self.assertEqual(filters["chart_end_day"], filters["end_day"])
+        self.assertEqual(filters["chart_range"], "all")
+        self.assertIsNone(filters["chart_start_day"])
+        self.assertIsNone(filters["chart_end_day"])
 
         custom = handler.filters_from_query(
-            "range=custom&start=2026-07-10&end=2026-07-12&chart_start=2020-01-01&chart_end=2020-01-02"
+            "range=custom&start=2026-07-10&end=2026-07-12&chart_range=custom&chart_start=2020-01-01&chart_end=2020-01-02"
         )
         self.assertEqual(custom["chart_range"], "custom")
-        self.assertEqual(custom["chart_start_day"], "2026-07-10")
-        self.assertEqual(custom["chart_end_day"], "2026-07-12")
+        self.assertEqual(custom["chart_start_day"], "2020-01-01")
+        self.assertEqual(custom["chart_end_day"], "2020-01-02")
+
+    def test_chart_granularity_uses_requested_boundaries(self):
+        self.assertEqual(dashboard_api.chart_granularity(
+            dashboard_api.dt.date(2026, 1, 1), dashboard_api.dt.date(2026, 3, 31)
+        ), "day")
+        self.assertEqual(dashboard_api.chart_granularity(
+            dashboard_api.dt.date(2026, 1, 1), dashboard_api.dt.date(2026, 4, 1)
+        ), "week")
+        self.assertEqual(dashboard_api.chart_granularity(
+            dashboard_api.dt.date(2026, 1, 16), dashboard_api.dt.date(2026, 7, 16)
+        ), "week")
+        self.assertEqual(dashboard_api.chart_granularity(
+            dashboard_api.dt.date(2026, 1, 16), dashboard_api.dt.date(2026, 7, 17)
+        ), "month")
+        timezone_day = dashboard_api.resolve_chart_range(
+            "1d", today=dashboard_api.dt.date(2026, 7, 17)
+        )
+        self.assertEqual(timezone_day["start_day"], "2026-07-17")
+        self.assertEqual(timezone_day["end_day"], "2026-07-17")
 
     def test_production_usage_payload_does_not_call_provider_scanners(self):
         handler = object.__new__(dashboard_api.DashboardHandler)
@@ -104,7 +158,7 @@ class AllProviderTests(unittest.TestCase):
             payload = handler.usage_payload(filters)
         self.assertEqual(payload["provider"], "all")
 
-    def test_production_usage_payload_schedules_source_refresh_without_waiting(self):
+    def test_production_usage_payload_waits_for_refresh_before_reading(self):
         handler = object.__new__(dashboard_api.DashboardHandler)
         handler.unibase_path = self.path
         source_root = Path(self.temp_dir.name) / "sources"
@@ -113,6 +167,8 @@ class AllProviderTests(unittest.TestCase):
         handler.opencode_db_path = source_root / "opencode" / "opencode.db"
         filters = handler.filters_from_query("provider=all&range=all&chart_range=all")
         with patch.object(dashboard_api, "schedule_enabled_sources_refresh") as refresh, patch.object(
+            dashboard_api, "wait_for_source_refresh", return_value=True
+        ) as wait, patch.object(
             dashboard_api, "load_pricing", return_value=self.pricing
         ):
             handler.usage_payload(filters)
@@ -120,9 +176,11 @@ class AllProviderTests(unittest.TestCase):
             self.path,
             handler.opencode_db_path,
             codex_root=handler.db_path.parent,
+            codex_state_db=handler.db_path,
             claude_root=handler.claude_projects_path.parent,
             reason="usage request",
         )
+        wait.assert_called_once_with()
 
     def test_cache_alias_does_not_double_count(self):
         data = self.load("all")

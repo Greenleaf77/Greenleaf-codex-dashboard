@@ -47,6 +47,7 @@ PRICING_CACHE_SECONDS = 600
 PRICING_CACHE: dict[str, object] = {"loaded_at": 0.0, "pricing": None}
 SOURCE_REFRESH_DEBOUNCE_SECONDS = 300.0
 SOURCE_REFRESH_STATE_LOCK = threading.Lock()
+SOURCE_REFRESH_CONDITION = threading.Condition(SOURCE_REFRESH_STATE_LOCK)
 SOURCE_REFRESH_RUNNING = False
 SOURCE_REFRESH_LAST_STARTED = 0.0
 FALLBACK_PRICING = {
@@ -194,7 +195,7 @@ def load_pricing() -> dict:
 
     started_at = time.perf_counter()
     try:
-        request = Request(PRICING_URL, headers={"User-Agent": "MeterMesh/2.0"})
+        request = Request(PRICING_URL, headers={"User-Agent": "MeterMesh/2.1"})
         with urlopen(request, timeout=2.5) as response:
             live_pricing = json.loads(response.read().decode("utf-8"))
         pricing = {
@@ -276,9 +277,10 @@ def resolve_range(
     start_day: str | None = None,
     end_day: str | None = None,
     ignore_auto_review: bool = False,
+    today: dt.date | None = None,
 ) -> dict[str, str | int | bool | None]:
     range_name = normalize_range(range_name)
-    today = dt.date.today()
+    today = today or dt.date.today()
     start_date: dt.date | None = None
     end_date: dt.date | None = None
 
@@ -311,9 +313,10 @@ def resolve_chart_range(
     start_day: str | None = None,
     end_day: str | None = None,
     ignore_auto_review: bool = False,
+    today: dt.date | None = None,
 ) -> dict[str, str | int | bool | None]:
     range_name = normalize_chart_range(range_name)
-    today = dt.date.today()
+    today = today or dt.date.today()
     start_date: dt.date | None = None
     end_date: dt.date | None = None
 
@@ -346,6 +349,7 @@ def resolve_chart_range(
         "start_day": start_date.isoformat() if start_date else None,
         "end_day": end_date.isoformat() if end_date else None,
         "start_ts": day_start_timestamp(start_date) if start_date else None,
+        "today_day": today.isoformat(),
         "ignore_auto_review": ignore_auto_review,
     }
 
@@ -641,9 +645,9 @@ def token_events(db_path: Path, filters: dict[str, str | int | bool | None]) -> 
 
 def chart_granularity(start_day: dt.date, end_day: dt.date) -> str:
     span_days = (end_day - start_day).days + 1
-    if span_days <= 60:
+    if span_days <= 90:
         return "day"
-    if span_days <= 183:
+    if end_day <= add_months(start_day, 6):
         return "week"
     return "month"
 
@@ -666,23 +670,28 @@ def chart_days_from_events(events: list[dict], filters: dict[str, str | int | bo
     metric_keys = ("total_tokens", "total_with_cached_tokens")
     bucket_model_map: dict[str, dict[str, dict[str, int]]] = {}
     model_totals: dict[str, dict[str, int]] = {}
+    daily_map: dict[str, dict] = {}
     start_day = parse_iso_day(str(filters["start_day"])) if filters.get("start_day") else None
     end_day = parse_iso_day(str(filters["end_day"])) if filters.get("end_day") else None
 
     event_days = [dt.date.fromisoformat(event["day"]) for event in events]
     if start_day is None and event_days:
         start_day = min(event_days)
+    today = parse_iso_day(str(filters.get("today_day") or "")) or dt.date.today()
     if end_day is None:
         if event_days:
-            end_day = max(dt.date.today(), max(event_days))
+            end_day = max(today, max(event_days))
         else:
-            end_day = dt.date.today()
+            end_day = today
     if start_day is None:
         start_day = end_day
 
     granularity = chart_granularity(start_day, end_day)
     for event in events:
         event_day = dt.date.fromisoformat(event["day"])
+        daily = daily_map.setdefault(event["day"], {"day": event["day"], **{key: 0 for key in metric_keys}})
+        for key in metric_keys:
+            daily[key] += int(event[key])
         bucket_start, _, _ = chart_bucket_for_day(event_day, granularity)
         bucket_key = bucket_start.isoformat()
         model = event["model"]
@@ -735,6 +744,7 @@ def chart_days_from_events(events: list[dict], filters: dict[str, str | int | bo
         "range_start": start_day.isoformat() if start_day else None,
         "range_end": end_day.isoformat() if end_day else None,
         "days": days,
+        "daily": sorted(daily_map.values(), key=lambda item: item["day"]),
         "models": models,
     }
 
@@ -820,13 +830,16 @@ def load_usage(
     provider: str = "codex",
     claude_projects_path: Path = DEFAULT_CLAUDE_PROJECTS,
     claude_db_path: Path = DEFAULT_CLAUDE_DB,
+    today: dt.date | None = None,
 ) -> dict:
     provider = normalize_provider(provider)
     if provider == "claude":
         ignore_auto_review = False
         include_diagnostics = False
-    filters = resolve_range(range_name, start_day, end_day, ignore_auto_review)
-    chart_filters = resolve_chart_range(chart_range, chart_start_day, chart_end_day, ignore_auto_review)
+    filters = resolve_range(range_name, start_day, end_day, ignore_auto_review, today=today)
+    chart_filters = resolve_chart_range(
+        chart_range, chart_start_day, chart_end_day, ignore_auto_review, today=today
+    )
     start_timestamps = [filters["start_ts"], chart_filters["start_ts"]]
     scan_start_ts = None if any(value is None for value in start_timestamps) else min(int(value) for value in start_timestamps)
     indexing = None
@@ -1035,7 +1048,7 @@ def event_from_active_row(row: dict, timezone: ZoneInfo, all_scope: bool, pricin
         "hour": local.strftime("%Y-%m-%d %H:00"),
         "day": local.date().isoformat(),
         "model": model_label,
-        "model_key": f'{provider}:{row.get("native_provider_id") or provider}:{model}',
+        "model_key": f"{provider}:{model}",
         "source": row["semantics"],
         "classification": row["classification"],
         "input_tokens": input_tokens,
@@ -1310,7 +1323,7 @@ def _price_usage_group(row: dict, pricing: dict, all_scope: bool) -> dict:
         **row,
         "model": model_label,
         "raw_model": model,
-        "model_key": f'{provider}:{row["native_provider_id"]}:{model}',
+        "model_key": f"{provider}:{model}",
         "input_tokens": input_tokens,
         "cache_creation_input_tokens": cache_write,
         "cache_read_input_tokens": cache_read,
@@ -1332,19 +1345,25 @@ def _chart_days_from_aggregate_rows(rows: list[dict], filters: dict[str, str | i
     metric_keys = ("total_tokens", "total_with_cached_tokens")
     bucket_model_map: dict[str, dict[str, dict[str, int]]] = {}
     model_totals: dict[str, dict[str, int]] = {}
+    daily_map: dict[str, dict] = {}
     start_day = parse_iso_day(str(filters["start_day"])) if filters.get("start_day") else None
     end_day = parse_iso_day(str(filters["end_day"])) if filters.get("end_day") else None
     event_days = [dt.date.fromisoformat(str(row["day"])) for row in rows]
     if start_day is None and event_days:
         start_day = min(event_days)
+    today = parse_iso_day(str(filters.get("today_day") or "")) or dt.date.today()
     if end_day is None:
-        end_day = max(dt.date.today(), max(event_days)) if event_days else dt.date.today()
+        end_day = max(today, max(event_days)) if event_days else today
     if start_day is None:
         start_day = end_day
 
     granularity = chart_granularity(start_day, end_day)
     for row in rows:
         event_day = dt.date.fromisoformat(str(row["day"]))
+        day_key = str(row["day"])
+        daily = daily_map.setdefault(day_key, {"day": day_key, **{key: 0 for key in metric_keys}})
+        for key in metric_keys:
+            daily[key] += int(row[key])
         bucket_start, _, _ = chart_bucket_for_day(event_day, granularity)
         bucket_key = bucket_start.isoformat()
         model = str(row["model"])
@@ -1395,6 +1414,7 @@ def _chart_days_from_aggregate_rows(rows: list[dict], filters: dict[str, str | i
         "range_start": start_day.isoformat(),
         "range_end": end_day.isoformat(),
         "days": days,
+        "daily": sorted(daily_map.values(), key=lambda item: item["day"]),
         "models": models,
     }
 
@@ -1473,9 +1493,12 @@ def load_unibase_usage(
     settings = unibase.settings()
     if ignore_auto_review is None:
         ignore_auto_review = bool(settings["ignore_codex_auto_review"])
-    filters = resolve_range(range_name, start_day, end_day, bool(ignore_auto_review))
-    chart_filters = resolve_chart_range(chart_range, chart_start_day, chart_end_day, bool(ignore_auto_review))
     timezone = resolve_timezone(timezone_name)
+    today = dt.datetime.now(timezone).date()
+    filters = resolve_range(range_name, start_day, end_day, bool(ignore_auto_review), today=today)
+    chart_filters = resolve_chart_range(
+        chart_range, chart_start_day, chart_end_day, bool(ignore_auto_review), today=today
+    )
     usage_start_ts, usage_end_ts = _local_range_timestamps(filters, timezone)
     chart_start_ts, chart_end_ts = _local_range_timestamps(chart_filters, timezone)
     pricing = load_pricing()
@@ -1520,7 +1543,7 @@ def load_unibase_usage(
     for row in session_rows:
         name = str(row["provider"])
         session = (name, str(row["stream_key"]))
-        model_key = f'{name}:{row["native_provider_id"]}:{row["model"]}'
+        model_key = f'{name}:{row["model"]}'
         day = str(row["day"])
         total_sessions.add(session)
         daily_sessions.setdefault(day, set()).add(session)
@@ -1766,7 +1789,13 @@ def load_requests(
         ).fetchone()
         if ignore_auto_review is None:
             ignore_auto_review = bool(settings["ignore_codex_auto_review"])
-        filters = resolve_range(range_name, start_day, end_day, bool(ignore_auto_review))
+        filters = resolve_range(
+            range_name,
+            start_day,
+            end_day,
+            bool(ignore_auto_review),
+            today=dt.datetime.now(timezone).date(),
+        )
         start_ts, end_ts = _local_range_timestamps(filters, timezone)
         snapshot_generation = int(settings["generation"])
         clauses = []
@@ -1962,14 +1991,27 @@ def settings_payload(unibase_path: Path) -> dict:
     }
 
 
-def import_registered_source(database: Unibase, source: dict, opencode_live_db: Path | None = None) -> None:
+def import_registered_source(
+    database: Unibase,
+    source: dict,
+    opencode_live_db: Path | None = None,
+    codex_state_db: Path | None = None,
+    require_codex_state_inventory: bool = False,
+) -> None:
     with OPERATION_LOCKS.acquire("maintenance"):
         if database.settings()["state"] == "reset_empty":
             return
         try:
             with database.source_transaction():
                 if source["provider"] == "codex":
-                    import_codex_source(database, source, ignore_auto_review=False)
+                    state_path = codex_state_db if source["kind"] == "live" else None
+                    import_codex_source(
+                        database,
+                        source,
+                        ignore_auto_review=False,
+                        state_path=state_path,
+                        require_state_inventory=require_codex_state_inventory and source["kind"] == "live",
+                    )
                 elif source["provider"] == "claude":
                     import_claude_source(database, source)
                 else:
@@ -1985,6 +2027,7 @@ def refresh_enabled_sources(
     opencode_live_db: Path | None = None,
     *,
     codex_root: Path | None = None,
+    codex_state_db: Path | None = None,
     claude_root: Path | None = None,
 ) -> None:
     started_at = time.perf_counter()
@@ -2012,7 +2055,7 @@ def refresh_enabled_sources(
             source_started_at = time.perf_counter()
             source_name = f'{source["provider"]}/{source["relative_name"]}'
             try:
-                import_registered_source(database, source, opencode_live_db)
+                import_registered_source(database, source, opencode_live_db, codex_state_db)
             except Exception as exc:  # noqa: BLE001
                 print(
                     f"[MeterMesh timing] source import {source_name}: "
@@ -2037,11 +2080,23 @@ def source_refresh_running() -> bool:
         return SOURCE_REFRESH_RUNNING
 
 
+def wait_for_source_refresh(timeout: float = 120.0) -> bool:
+    deadline = time.monotonic() + timeout
+    with SOURCE_REFRESH_CONDITION:
+        while SOURCE_REFRESH_RUNNING:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            SOURCE_REFRESH_CONDITION.wait(remaining)
+    return True
+
+
 def schedule_enabled_sources_refresh(
     unibase_path: Path,
     opencode_live_db: Path | None = None,
     *,
     codex_root: Path | None = None,
+    codex_state_db: Path | None = None,
     claude_root: Path | None = None,
     reason: str,
 ) -> bool:
@@ -2066,14 +2121,16 @@ def schedule_enabled_sources_refresh(
                 unibase_path,
                 opencode_live_db,
                 codex_root=codex_root,
+                codex_state_db=codex_state_db,
                 claude_root=claude_root,
             )
         except Exception as exc:  # noqa: BLE001
             print(f"[MeterMesh timing] source refresh failed: {exc.__class__.__name__}: {exc}", flush=True)
         finally:
-            with SOURCE_REFRESH_STATE_LOCK:
+            with SOURCE_REFRESH_CONDITION:
                 SOURCE_REFRESH_RUNNING = False
                 SOURCE_REFRESH_LAST_STARTED = time.monotonic()
+                SOURCE_REFRESH_CONDITION.notify_all()
 
     threading.Thread(target=worker, name="metermesh-source-refresh", daemon=True).start()
     return True
@@ -2084,11 +2141,17 @@ def _checkpoint_database(path: Path) -> None:
         conn.execute("pragma wal_checkpoint(truncate)")
 
 
-def reindex_worker(main_path: Path, operation_id: str, opencode_live_db: Path | None = None) -> None:
+def reindex_worker(
+    main_path: Path,
+    operation_id: str,
+    opencode_live_db: Path | None = None,
+    codex_state_db: Path | None = None,
+) -> None:
     main = Unibase(main_path)
     staging_path = main_path.with_name(f".{main_path.name}.{operation_id}.staging")
     try:
         main.update_operation(operation_id, state="running", current=0, total=0)
+        codex_live_requires_state = codex_state_db is not None
         if staging_path.exists():
             staging_path.unlink()
         with main.connect(readonly=True) as source_conn:
@@ -2105,7 +2168,13 @@ def reindex_worker(main_path: Path, operation_id: str, opencode_live_db: Path | 
         total = len(enabled_sources)
         main.update_operation(operation_id, state="running", current=0, total=total)
         for index, source in enumerate(enabled_sources, 1):
-            import_registered_source(staging, source, opencode_live_db)
+            import_registered_source(
+                staging,
+                source,
+                opencode_live_db,
+                codex_state_db,
+                require_codex_state_inventory=codex_live_requires_state,
+            )
             main.update_operation(operation_id, state="running", current=index, total=total)
         if not staging.integrity_check():
             raise RuntimeError("Staging Unibase integrity check failed")
@@ -2631,20 +2700,24 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 default_ignore = bool(database.settings()["ignore_codex_auto_review"])
             except Exception:
                 default_ignore = False
+        timezone_name = query.get("timezone", ["UTC"])[0]
+        today = dt.datetime.now(resolve_timezone(timezone_name)).date()
         filters = resolve_range(
             query.get("range", ["all"])[0],
             query.get("start", [None])[0],
             query.get("end", [None])[0],
             parse_bool_flag(query.get("ignore_auto_review", [None])[0], default=default_ignore)
             if provider in {"all", "codex"} else False,
+            today=today,
         )
         filters["provider"] = provider
-        filters["timezone"] = query.get("timezone", ["UTC"])[0]
+        filters["timezone"] = timezone_name
         chart_filters = resolve_chart_range(
-            str(filters["range"]),
-            filters["start_day"],
-            filters["end_day"],
+            query.get("chart_range", ["30d"])[0],
+            query.get("chart_start", [None])[0],
+            query.get("chart_end", [None])[0],
             bool(filters["ignore_auto_review"]),
+            today=today,
         )
         filters["chart_range"] = chart_filters["range"]
         filters["chart_start_day"] = chart_filters["start_day"]
@@ -2659,10 +2732,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self.unibase_path,
                 self.opencode_db_path,
                 codex_root=self.db_path.parent,
+                codex_state_db=self.db_path,
                 claude_root=self.claude_projects_path.parent
                 if self.claude_projects_path.name == "projects" else self.claude_projects_path,
                 reason="usage request",
             )
+            if not wait_for_source_refresh():
+                raise TimeoutError("Timed out waiting for Unibase source refresh")
             return load_unibase_usage(
                 self.unibase_path,
                 str(filters["range"]),
@@ -2689,6 +2765,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             provider=str(filters["provider"]),
             claude_projects_path=self.claude_projects_path,
             claude_db_path=self.claude_db_path,
+            today=dt.datetime.now(resolve_timezone(str(filters["timezone"]))).date(),
         )
 
     def send_body(self, status: int, content_type: str, body: bytes) -> None:
@@ -2764,6 +2841,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self.unibase_path,
                 self.opencode_db_path,
                 codex_root=self.db_path.parent,
+                codex_state_db=self.db_path,
                 claude_root=self.claude_projects_path.parent
                 if self.claude_projects_path.name == "projects" else self.claude_projects_path,
                 reason="requests request",
@@ -2848,6 +2926,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self.unibase_path,
                 self.opencode_db_path,
                 codex_root=self.db_path.parent,
+                codex_state_db=self.db_path,
                 claude_root=self.claude_projects_path.parent
                 if self.claude_projects_path.name == "projects" else self.claude_projects_path,
                 reason="settings update",
@@ -2889,7 +2968,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             operation_id = Unibase(self.unibase_path).create_operation("full_reindex")
             threading.Thread(
                 target=reindex_worker,
-                args=(self.unibase_path, operation_id, self.opencode_db_path),
+                args=(self.unibase_path, operation_id, self.opencode_db_path, self.db_path),
                 name=f"metermesh-reindex-{operation_id}",
                 daemon=True,
             ).start()
@@ -2931,13 +3010,14 @@ def run_check(db_path: Path) -> None:
 
     checks = [
         ("all", None, None, False, "30d", None, None, "day"),
-        ("30d", None, None, False, "90d", None, None, "week"),
+        ("30d", None, None, False, "90d", None, None, "day"),
         ("30d", None, None, False, "6m", None, None, "week"),
         ("30d", None, None, False, "1y", None, None, "month"),
         ("7d", None, None, False, "all", None, None, None),
         ("1d", None, None, False, "custom", "2026-01-01", "2026-01-03", "day"),
         ("1d", None, None, False, "custom", "2026-01-01", "2026-03-01", "day"),
-        ("1d", None, None, False, "custom", "2026-01-01", "2026-03-02", "week"),
+        ("1d", None, None, False, "custom", "2026-01-01", "2026-03-31", "day"),
+        ("1d", None, None, False, "custom", "2026-01-01", "2026-04-01", "week"),
         ("1d", None, None, False, "custom", "2026-01-01", "2026-05-01", "week"),
         ("1d", None, None, False, "custom", "2026-01-01", "2026-12-31", "month"),
         ("custom", "2026-01-01", "2026-01-03", False, "30d", None, None, "day"),
@@ -3072,6 +3152,7 @@ def main() -> None:
         DashboardHandler.unibase_path,
         DashboardHandler.opencode_db_path,
         codex_root=DashboardHandler.db_path.parent,
+        codex_state_db=DashboardHandler.db_path,
         claude_root=(
             DashboardHandler.claude_projects_path.parent
             if DashboardHandler.claude_projects_path.name == "projects"

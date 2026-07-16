@@ -120,6 +120,31 @@ class SettingsApiTests(unittest.TestCase):
         self.assertEqual(reader.execute("select generation from app_settings where id = 1").fetchone()[0], before)
         self.assertEqual(unibase.Unibase(self.path).operation_status(operation_id)["operation"]["state"], "succeeded")
 
+    def test_reindex_keeps_main_database_when_external_codex_inventory_is_unavailable(self):
+        self.db.upsert_source_file(
+            "codex-live",
+            "external:root:file",
+            "codex_rollout",
+            size=1,
+            mtime_ns=1,
+        )
+        operation_id = self.db.create_operation("full_reindex")
+
+        dashboard_api.reindex_worker(self.path, operation_id, codex_state_db=self.codex_root / "missing.sqlite")
+
+        database = unibase.Unibase(self.path)
+        self.assertEqual(database.operation_status(operation_id)["operation"]["state"], "failed")
+        self.assertIn("external:root:file", database.source_file_keys("codex-live"))
+
+    def test_reindex_requires_provided_state_inventory_before_external_checkpoints_exist(self):
+        operation_id = self.db.create_operation("full_reindex")
+
+        dashboard_api.reindex_worker(self.path, operation_id, codex_state_db=self.codex_root / "missing.sqlite")
+
+        database = unibase.Unibase(self.path)
+        self.assertEqual(database.operation_status(operation_id)["operation"]["state"], "failed")
+        self.assertEqual(len(database.sources("codex")), 2)
+
     def test_mutations_conflict_with_running_operation(self):
         self.db.create_operation("full_reindex")
         settings = dashboard_api.settings_payload(self.path)

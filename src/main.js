@@ -1,5 +1,6 @@
 import "./styles.css";
 import { compactNumber } from "./format.js";
+import { chartBarSizing, chartHeightPercent } from "./chart-scale.js";
 import { normalizeProvider, providerOptions } from "./provider-state.js";
 import { paginateRows, truncateModelName, USAGE_TABLE_PAGE_SIZE } from "./usage-table.js";
 import {
@@ -26,10 +27,19 @@ const rangeOptions = [
   { value: "1d", label: "1d" },
   { value: "custom", label: "Custom" }
 ];
+const chartRangeOptions = [
+  { value: "30d", label: "30d" },
+  { value: "90d", label: "90d" },
+  { value: "6m", label: "6m" },
+  { value: "1y", label: "1y" },
+  { value: "all", label: "All" },
+  { value: "custom", label: "Custom" }
+];
 const visualizationOptions = [
   { value: "heatmap", label: "Daily heatmap" },
   { value: "tokens", label: "Tokens over time" }
 ];
+const chartRangeDefaults = { heatmap: "all", tokens: "30d" };
 const accountingOptions = [
   { value: WITH_CACHE, label: "With cache" },
   { value: WITHOUT_CACHE, label: "Without cache" }
@@ -74,6 +84,18 @@ let customRangePending = false;
 let customRangeOpen = false;
 let customStartDate = initialState.start;
 let customEndDate = initialState.end;
+let activeChartRange = initialState.chartRange;
+const chartStateByVisualization = {
+  heatmap: { range: chartRangeDefaults.heatmap, start: "", end: "" },
+  tokens: { range: chartRangeDefaults.tokens, start: "", end: "" },
+  [initialState.visualization]: {
+    range: initialState.chartRange,
+    start: initialState.chartStart,
+    end: initialState.chartEnd
+  }
+};
+let chartStartDate = initialState.chartStart;
+let chartEndDate = initialState.chartEnd;
 let activeVisualization = initialState.visualization;
 let cacheMode = initialState.cacheMode;
 let ignoreAutoReview = resolveIgnoreAutoReview(initialState.ignoreAutoReview, legacyIgnoreCookie);
@@ -167,6 +189,29 @@ function normalizeCustomRange() {
   }
 }
 
+function normalizeChartCustomRange() {
+  if (!isIsoDate(chartStartDate)) chartStartDate = todayKey();
+  if (!isIsoDate(chartEndDate)) chartEndDate = chartStartDate;
+  if (chartStartDate > chartEndDate) {
+    [chartStartDate, chartEndDate] = [chartEndDate, chartStartDate];
+  }
+}
+
+function saveActiveChartState() {
+  chartStateByVisualization[activeVisualization] = {
+    range: activeChartRange,
+    start: chartStartDate,
+    end: chartEndDate
+  };
+}
+
+function restoreChartState(visualization) {
+  const state = chartStateByVisualization[visualization];
+  activeChartRange = state.range;
+  chartStartDate = state.start;
+  chartEndDate = state.end;
+}
+
 function positionCustomRangeDialog(dialog, anchor) {
   const margin = 8;
   const gap = 8;
@@ -195,13 +240,20 @@ function readUrlState() {
   const provider = params.get("provider") || "all";
   const range = params.get("range") || "all";
   const visualization = params.get("visualization") || "heatmap";
+  const normalizedVisualization = visualizationOptions.some((option) => option.value === visualization) ? visualization : "heatmap";
+  const chartRange = params.get("chart_range") || chartRangeDefaults[normalizedVisualization];
   const selectedPageSize = Number.parseInt(params.get("page_size") || "25", 10);
   return {
     provider: normalizeProvider(provider),
     range: rangeOptions.some((option) => option.value === range) ? range : "all",
     start: params.get("start") || "",
     end: params.get("end") || "",
-    visualization: visualizationOptions.some((option) => option.value === visualization) ? visualization : "heatmap",
+    chartRange: chartRangeOptions.some((option) => option.value === chartRange)
+      ? chartRange
+      : chartRangeDefaults[normalizedVisualization],
+    chartStart: params.get("chart_start") || "",
+    chartEnd: params.get("chart_end") || "",
+    visualization: normalizedVisualization,
     cacheMode: resolveCacheMode(params.get("cache")),
     ignoreAutoReview: params.get("ignore_auto_review"),
     view: ["usage", "diagnostics", "requests"].includes(params.get("view")) ? params.get("view") : "usage",
@@ -237,6 +289,7 @@ function buildQuery(rangeName, includeDiagnostics = false) {
   const params = new URLSearchParams();
   params.set("provider", activeProvider);
   params.set("range", rangeName);
+  params.set("chart_range", activeChartRange);
   if (legacyIgnoreOverride !== null) params.set("ignore_auto_review", ignoreAutoReview ? "1" : "0");
   params.set("visualization", activeVisualization);
   params.set("cache", cacheMode);
@@ -251,6 +304,11 @@ function buildQuery(rangeName, includeDiagnostics = false) {
     normalizeCustomRange();
     params.set("start", customStartDate);
     params.set("end", customEndDate);
+  }
+  if (activeChartRange === "custom") {
+    normalizeChartCustomRange();
+    params.set("chart_start", chartStartDate);
+    params.set("chart_end", chartEndDate);
   }
   if (includeDiagnostics) params.set("include_diagnostics", "1");
   return params.toString();
@@ -269,6 +327,17 @@ function describeRange(data) {
   }
   if (data.range === "7d") return "Last 7 days";
   if (data.range === "30d") return "Last 30 days";
+  return "All time";
+}
+
+function describeChartRange(chart) {
+  if (chart.range === "custom" && chart.range_start && chart.range_end) {
+    return `${chart.range_start} - ${chart.range_end}`;
+  }
+  if (chart.range === "30d") return "Last 30 days";
+  if (chart.range === "90d") return "Last 90 days";
+  if (chart.range === "6m") return "Last 6 months";
+  if (chart.range === "1y") return "Last year";
   return "All time";
 }
 
@@ -326,18 +395,30 @@ function renderVisualizationPanel(data, heat, months, heatColumns) {
             <span class="section-icon tone-cyan">${icon("usage")}</span>
             <div>
               <h2>${activeVisualization === "tokens" ? "Tokens over time" : "Daily Heatmap"}</h2>
-              <div class="viz-note">${activeVisualization === "tokens" ? `Showing ${escapeHtml(describeRange(data.chart))}` : "Usage intensity by day"} · ${accountingLabel}</div>
+              <div class="viz-note">Showing ${escapeHtml(describeChartRange(data.chart))} · ${accountingLabel}</div>
             </div>
           </div>
         </div>
         <div class="viz-controls">
           <div class="viz-primary-controls">
             <nav class="segments accounting-tabs" aria-label="Token accounting">
-              ${accountingOptions.map((option) => `<button class="seg ${cacheMode === option.value ? "active" : ""}" data-cache-mode="${option.value}" aria-pressed="${cacheMode === option.value}">${option.label}</button>`).join("")}
+              ${accountingOptions.map((option) => `<button class="seg ${cacheMode === option.value ? "active" : ""}" type="button" data-cache-mode="${option.value}" aria-pressed="${cacheMode === option.value}">${option.label}</button>`).join("")}
             </nav>
             <nav class="segments viz-tabs" aria-label="Visualization">
-              ${visualizationOptions.map((option) => `<button class="seg ${activeVisualization === option.value ? "active" : ""}" data-visualization="${option.value}">${option.label}</button>`).join("")}
+              ${visualizationOptions.map((option) => `<button class="seg ${activeVisualization === option.value ? "active" : ""}" type="button" data-visualization="${option.value}" aria-pressed="${activeVisualization === option.value}">${option.label}</button>`).join("")}
             </nav>
+          </div>
+          <div class="chart-filter">
+            <nav class="segments chart-range-tabs" aria-label="Visualization range">
+              ${chartRangeOptions.map((option) => `<button class="seg ${activeChartRange === option.value ? "active" : ""}" type="button" data-chart-range="${option.value}" aria-pressed="${activeChartRange === option.value}">${option.label}</button>`).join("")}
+            </nav>
+            ${activeChartRange === "custom" ? `
+              <form class="custom-range chart-custom-range" id="chart-range-form">
+                <label>From<input type="date" name="chart_start" value="${escapeHtml(chartStartDate)}" required></label>
+                <label>To<input type="date" name="chart_end" value="${escapeHtml(chartEndDate)}" required></label>
+                <button class="custom-apply" type="submit">Apply</button>
+              </form>
+            ` : ""}
           </div>
         </div>
       </div>
@@ -368,7 +449,7 @@ function renderTokensOverTime(chart, accountingMode) {
   const maxTokens = Math.max(1, ...days.map((day) => metricValue(day, accountingMode)));
   const ticks = [1, 0.75, 0.5, 0.25, 0].map((ratio) => Math.round(maxTokens * ratio));
   const labelEvery = Math.max(1, Math.ceil(days.length / 10));
-  const { barWidth, barGap, barFill, barMax } = chartBarSizing(chart.granularity, days.length);
+  const { barGap, barFill, barMax } = chartBarSizing(chart.granularity, days.length);
 
   if (!days.length) {
     return '<div class="chart-empty">No usage in this chart range.</div>';
@@ -380,7 +461,7 @@ function renderTokensOverTime(chart, accountingMode) {
         ${ticks.map((tick) => `<span>${compactNumber(tick)}</span>`).join("")}
       </div>
       <div class="chart-scroll">
-        <div class="bar-chart" style="--bar-count: ${days.length}; --bar-width: ${barWidth}px; --bar-gap: ${barGap}px; --bar-fill: ${barFill}%; --bar-max: ${barMax}px">
+        <div class="bar-chart" style="--bar-count: ${days.length}; --bar-gap: ${barGap}px; --bar-fill: ${barFill}%; --bar-max: ${barMax}px">
           <div class="chart-grid">
             ${ticks.map(() => '<span></span>').join("")}
           </div>
@@ -397,28 +478,15 @@ function renderTokensOverTime(chart, accountingMode) {
   `;
 }
 
-function chartBarSizing(granularity, count) {
-  if (granularity === "month") {
-    return { barWidth: count <= 14 ? 96 : 64, barGap: 10, barFill: 72, barMax: 88 };
-  }
-  if (granularity === "week") {
-    return { barWidth: count <= 16 ? 82 : 52, barGap: 8, barFill: 76, barMax: 72 };
-  }
-  if (count <= 32) {
-    return { barWidth: 44, barGap: 6, barFill: 82, barMax: 38 };
-  }
-  return { barWidth: 28, barGap: 4, barFill: 76, barMax: 24 };
-}
-
 function renderChartBar(day, models, maxTokens, index, labelEvery, dayCount, accountingMode) {
   const tokens = metricValue(day, accountingMode);
-  const height = tokens ? Math.max(2, (tokens / maxTokens) * 100) : 0;
+  const height = chartHeightPercent(tokens, maxTokens);
   const label = index % labelEvery === 0 || index === dayCount - 1 ? dayLabel(day.label, day.day) : "";
   const title = day.bucket_start && day.bucket_end && day.bucket_start !== day.bucket_end ? `${day.bucket_start} - ${day.bucket_end}` : day.day;
   const accountingLabel = accountingMode === WITH_CACHE ? "with cache" : "without cache";
   return `
-    <div class="bar-slot">
-      <div class="stacked-bar ${tokens ? "" : "empty"}" style="height: ${height}%" data-tooltip-title="${escapeHtml(title)}" data-tooltip-body="${full(tokens)} tokens ${accountingLabel}">
+    <div class="bar-slot" data-tooltip-title="${escapeHtml(title)}" data-tooltip-body="${full(tokens)} tokens ${accountingLabel}">
+      <div class="stacked-bar ${tokens ? "" : "empty"}" style="height: ${height}%">
         ${(day.models || []).map((item) => {
           const itemTokens = metricValue(item, accountingMode);
           const segmentHeight = tokens ? (itemTokens / tokens) * 100 : 0;
@@ -565,7 +633,8 @@ function renderUsageTables(data) {
   const modelPage = paginateRows(data.models, modelUsagePage);
   dailyUsagePage = dailyPage.page;
   modelUsagePage = modelPage.page;
-  const heat = heatmapCells(data.daily, data.range, data.range_start, data.range_end, cacheMode);
+  const chartDaily = data.chart?.daily || data.daily;
+  const heat = heatmapCells(chartDaily, data.chart.range, data.chart.range_start, data.chart.range_end, cacheMode);
   const months = monthLabels(heat);
   const heatColumns = Math.max(1, Math.ceil(heat.length / 7));
   return `
@@ -822,10 +891,47 @@ function bindTableView(data) {
 
   document.querySelectorAll("[data-visualization]").forEach((button) => {
     button.addEventListener("click", () => {
-      activeVisualization = button.dataset.visualization;
+      const nextVisualization = button.dataset.visualization;
+      if (nextVisualization === activeVisualization) return;
+      saveActiveChartState();
+      activeVisualization = nextVisualization;
+      restoreChartState(activeVisualization);
+      const canReuseChart = data.chart?.range === activeChartRange
+        && (activeChartRange !== "custom"
+          || (data.chart.range_start === chartStartDate && data.chart.range_end === chartEndDate));
       syncUrl();
-      render(data);
+      if (canReuseChart) render(data);
+      else refresh();
     });
+  });
+
+  document.querySelectorAll("[data-chart-range]").forEach((button) => {
+    button.addEventListener("click", () => {
+      activeChartRange = button.dataset.chartRange;
+      if (activeChartRange === "custom") {
+        chartStartDate = isIsoDate(chartStartDate) ? chartStartDate : data.chart.range_start || todayKey();
+        chartEndDate = isIsoDate(chartEndDate) ? chartEndDate : data.chart.range_end || chartStartDate;
+        normalizeChartCustomRange();
+        saveActiveChartState();
+        render(data);
+        return;
+      }
+      saveActiveChartState();
+      syncUrl();
+      refresh();
+    });
+  });
+
+  document.querySelector("#chart-range-form")?.addEventListener("submit", (event) => {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    chartStartDate = String(form.get("chart_start") || "");
+    chartEndDate = String(form.get("chart_end") || "");
+    normalizeChartCustomRange();
+    activeChartRange = "custom";
+    saveActiveChartState();
+    syncUrl();
+    refresh();
   });
 
   document.querySelectorAll("[data-cache-mode]").forEach((button) => {
@@ -842,10 +948,10 @@ function bindTableView(data) {
     cell.addEventListener("mouseleave", hideHeatTooltip);
   });
 
-  document.querySelectorAll(".stacked-bar, .bar-segment").forEach((item) => {
+  document.querySelectorAll(".bar-slot, .bar-segment").forEach((item) => {
     item.addEventListener("mouseenter", showChartTooltip);
     item.addEventListener("mousemove", positionHeatTooltip);
-    item.addEventListener("mouseleave", hideHeatTooltip);
+    item.addEventListener("mouseleave", handleChartTooltipLeave);
   });
 
   const retry = document.querySelector(".diagnostics-retry");
@@ -1006,7 +1112,7 @@ function renderSettingsDialog() {
             <button id="full-reindex" type="button" ${dirty || operationRunning ? "disabled" : ""}>Full reindex</button>
             <button id="reset-unibase" class="danger" type="button" ${dirty || operationRunning ? "disabled" : ""}>Reset Unibase</button>
           </div>
-          ${operation ? `<div class="operation-progress"><div><strong>${escapeHtml(operation.kind)}</strong><span>${escapeHtml(operation.state)}</span></div><progress max="${Math.max(operation.progress_total, 1)}" value="${operation.progress_current}"></progress>${operation.error ? `<code>${escapeHtml(operation.error)}</code>` : ""}</div>` : ""}
+          ${operation ? `<div class="operation-progress" role="status" aria-live="polite"><div><strong>${escapeHtml(operation.kind)}</strong><span>${escapeHtml(operation.state)}</span></div><progress aria-label="${escapeHtml(operation.kind)} progress" max="${Math.max(operation.progress_total, 1)}" value="${operation.progress_current}"></progress>${operation.error ? `<code>${escapeHtml(operation.error)}</code>` : ""}</div>` : ""}
         </section>
         <div class="settings-actions">
           <button class="settings-cancel" type="button">Cancel</button>
@@ -1636,10 +1742,22 @@ function showHeatTooltip(event) {
 }
 
 function showChartTooltip(event) {
-  const target = event.currentTarget;
+  showChartTooltipFor(event.currentTarget, event);
+}
+
+function showChartTooltipFor(target, event) {
   tooltip.innerHTML = `${escapeHtml(target.dataset.tooltipTitle)}<br><strong>${target.dataset.tooltipBody}</strong>`;
   tooltip.classList.add("visible");
   positionHeatTooltip(event);
+}
+
+function handleChartTooltipLeave(event) {
+  const slot = event.currentTarget.closest(".bar-slot");
+  if (event.currentTarget.classList.contains("bar-segment") && slot?.contains(event.relatedTarget)) {
+    showChartTooltipFor(slot, event);
+    return;
+  }
+  hideHeatTooltip();
 }
 
 function positionHeatTooltip(event) {
@@ -1672,6 +1790,7 @@ async function refresh() {
     diagnosticsErrors.delete(diagnosticsKey(data));
     activeProvider = data.provider || activeProvider;
     activeRange = data.range || activeRange;
+    activeChartRange = data.chart?.range || activeChartRange;
     customRangePending = false;
     customRangeOpen = false;
     ignoreAutoReview = Boolean(data.ignore_auto_review);
@@ -1679,6 +1798,11 @@ async function refresh() {
       customStartDate = data.range_start || customStartDate;
       customEndDate = data.range_end || customEndDate;
     }
+    if (data.chart?.range === "custom") {
+      chartStartDate = data.chart.range_start || chartStartDate;
+      chartEndDate = data.chart.range_end || chartEndDate;
+    }
+    saveActiveChartState();
     render(data);
   } catch (error) {
     if (error.name === "AbortError") return;
@@ -1692,6 +1816,10 @@ async function refresh() {
 if (activeRange === "custom") {
   normalizeCustomRange();
 }
+if (activeChartRange === "custom") {
+  normalizeChartCustomRange();
+}
+saveActiveChartState();
 
 syncUrl();
 refresh();

@@ -696,6 +696,15 @@ class Unibase:
             ).fetchone()
         return dict(row) if row else None
 
+    def source_file_keys(self, source_id: str, *, file_kind: str | None = None) -> set[str]:
+        sql = "select relative_path from source_files where source_id = ?"
+        params: list[object] = [source_id]
+        if file_kind is not None:
+            sql += " and file_kind = ?"
+            params.append(file_kind)
+        with self.connect(readonly=True) as conn:
+            return {str(row["relative_path"]) for row in conn.execute(sql, params).fetchall()}
+
     def clear_source_file_occurrences(self, source_file_id: int) -> None:
         with self.connect() as conn:
             conn.execute("delete from event_occurrences where source_file_id = ?", (source_file_id,))
