@@ -48,6 +48,14 @@ test("General exposes All-provider model merging", () => {
   assert.match(source, /merge_models_across_providers/);
 });
 
+test("General exposes configurable non-working weekdays", () => {
+  assert.match(source, /Non-working days/);
+  assert.match(source, /data-non-working-weekday/);
+  assert.match(source, /non_working_weekdays/);
+  assert.match(styles, /\.weekday-chips/);
+  assert.match(source, /reportValidity\(\);\s*input\.setCustomValidity\(""\);\s*return;/);
+});
+
 test("source choices are compact wrapping rows without horizontal scrolling", () => {
   assert.match(styles, /\.settings-dialog,[\s\S]*overflow-x:\s*hidden/);
   assert.match(styles, /\.settings-source-groups\s*\{[^}]*grid-template-columns:\s*1fr/s);

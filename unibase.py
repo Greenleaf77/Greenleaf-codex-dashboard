@@ -15,12 +15,59 @@ from pathlib import Path, PurePosixPath
 from typing import Iterable, Iterator
 
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 11
 DEFAULT_UNIBASE_DB = Path.home() / ".metermesh" / "unibase.sqlite3"
 PROVIDERS = ("codex", "claude", "opencode")
 SOURCE_PRIORITIES = {"live": 1000, "normalized_backup": 500, "legacy_backup": 400}
 SNAPSHOT_FORMAT = "metermesh-provider-snapshot"
 MAX_SAFE_ERROR_LENGTH = 240
+DEFAULT_NON_WORKING_WEEKDAYS = [5, 6]
+
+
+def fnv1a32_utf8(value: str) -> int:
+    result = 2166136261
+    for byte in value.encode("utf-8"):
+        result = ((result ^ byte) * 16777619) & 0xFFFFFFFF
+    return result
+
+
+def normalize_non_working_weekdays(value: object) -> list[int]:
+    if not isinstance(value, list) or any(type(day) is not int for day in value):
+        raise ValueError("Invalid non-working weekdays")
+    days = sorted(value)
+    if len(days) != len(set(days)) or any(day < 0 or day > 6 for day in days) or len(days) == 7:
+        raise ValueError("Invalid non-working weekdays")
+    return days
+
+
+def load_non_working_weekdays(value: object) -> list[int]:
+    try:
+        parsed = json.loads(value) if isinstance(value, str) else value
+        return normalize_non_working_weekdays(parsed)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return list(DEFAULT_NON_WORKING_WEEKDAYS)
+
+
+def _assign_model_color_slot_conn(conn: sqlite3.Connection, model: str) -> int:
+    row = conn.execute("select color_slot from known_models where model = ?", (model,)).fetchone()
+    if row is None:
+        raise ValueError("Unknown model")
+    if row[0] is not None:
+        return int(row[0])
+    slot = int(conn.execute(
+        "select coalesce(max(color_slot), -1) + 1 from known_models"
+    ).fetchone()[0])
+    conn.execute("update known_models set color_slot = ? where model = ?", (slot, model))
+    return slot
+
+
+def _assign_missing_model_color_slots_conn(conn: sqlite3.Connection) -> None:
+    models = [
+        str(row[0])
+        for row in conn.execute("select model from known_models where color_slot is null").fetchall()
+    ]
+    for model in sorted(models, key=lambda value: (fnv1a32_utf8(value), value)):
+        _assign_model_color_slot_conn(conn, model)
 
 
 class ClosingConnection(sqlite3.Connection):
@@ -126,11 +173,12 @@ MIGRATION_1 = """
 create table app_settings (
     id integer primary key check (id = 1),
     revision integer not null default 1,
-    merge_models_across_providers integer not null default 0,
+    merge_models_across_providers integer not null default 1,
     ignore_codex_auto_review integer not null default 0,
     experimental_codex_deduplication integer not null default 0,
     ignore_failed_requests integer not null default 0,
     legacy_preference_migrated integer not null default 0,
+    non_working_weekdays text not null default '[5,6]',
     generation integer not null default 0,
     state text not null default 'ready',
     created_at text not null,
@@ -145,7 +193,8 @@ create table disabled_models (
 create table known_models (
     model text primary key,
     first_seen_at text not null,
-    last_seen_at text not null
+    last_seen_at text not null,
+    color_slot integer
 );
 
 create table sources (
@@ -526,7 +575,7 @@ class Unibase:
                     columns = {row[1] for row in conn.execute("pragma table_info(app_settings)")}
                     if "merge_models_across_providers" not in columns:
                         conn.execute(
-                            "alter table app_settings add column merge_models_across_providers integer not null default 0"
+                            "alter table app_settings add column merge_models_across_providers integer not null default 1"
                         )
                     conn.execute(
                         """
@@ -551,6 +600,42 @@ class Unibase:
                     )
                     conn.execute("delete from disabled_models where lower(trim(model)) = '(unknown)'")
                     conn.execute("pragma user_version = 8")
+                    conn.commit()
+                    version = 8
+                if version == 8:
+                    conn.execute("begin immediate")
+                    settings_columns = {row[1] for row in conn.execute("pragma table_info(app_settings)")}
+                    if "non_working_weekdays" not in settings_columns:
+                        conn.execute(
+                            "alter table app_settings add column non_working_weekdays text not null default '[5,6]'"
+                        )
+                    model_columns = {row[1] for row in conn.execute("pragma table_info(known_models)")}
+                    if "color_slot" not in model_columns:
+                        conn.execute("alter table known_models add column color_slot integer")
+                    _assign_missing_model_color_slots_conn(conn)
+                    conn.execute("pragma user_version = 9")
+                    conn.commit()
+                    version = 9
+                if version == 9:
+                    conn.execute("begin immediate")
+                    models = conn.execute(
+                        "select model from known_models order by first_seen_at, model"
+                    ).fetchall()
+                    conn.executemany(
+                        "update known_models set color_slot = ? where model = ?",
+                        [(slot, str(row[0])) for slot, row in enumerate(models)],
+                    )
+                    conn.execute("pragma user_version = 10")
+                    conn.commit()
+                    version = 10
+                if version == 10:
+                    conn.execute("begin immediate")
+                    conn.execute(
+                        "update app_settings set merge_models_across_providers = 1, revision = revision + 1, updated_at = ? where id = 1",
+                        (utc_now(),),
+                    )
+                    conn.execute("update known_models set color_slot = null")
+                    conn.execute("pragma user_version = 11")
                     conn.commit()
 
     def settings(self) -> dict:
@@ -599,18 +684,29 @@ class Unibase:
         merge_models_across_providers: bool,
         sources: list[dict],
         models: list[dict],
+        non_working_weekdays: list[int] | None = None,
     ) -> dict:
         with OPERATION_LOCKS.acquire("maintenance"):
             if self.active_operation():
                 raise OperationConflict("A Unibase operation is already running")
             with self.connect() as conn:
                 conn.execute("begin immediate")
-                current = conn.execute("select revision from app_settings where id = 1").fetchone()
-                if int(current[0]) != revision:
+                current = conn.execute("select * from app_settings where id = 1").fetchone()
+                if int(current["revision"]) != revision:
                     raise RevisionConflict("Settings changed since this draft was opened")
+                current_weekdays = load_non_working_weekdays(current["non_working_weekdays"])
+                requested_weekdays = (
+                    current_weekdays
+                    if non_working_weekdays is None
+                    else normalize_non_working_weekdays(non_working_weekdays)
+                )
                 registry = {
                     row["source_id"]: row["kind"]
                     for row in conn.execute("select source_id, kind from sources").fetchall()
+                }
+                current_sources = {
+                    row["source_id"]: bool(row["enabled"])
+                    for row in conn.execute("select source_id, enabled from sources").fetchall()
                 }
                 provided = {str(item.get("source_id")) for item in sources}
                 if provided != set(registry) or len(provided) != len(sources):
@@ -632,17 +728,32 @@ class Unibase:
                     or not all(isinstance(item.get("enabled"), bool) for item in models)
                 ):
                     raise ValueError("Invalid model settings")
+                current_disabled = {
+                    str(row[0]) for row in conn.execute("select model from disabled_models").fetchall()
+                }
+                requested_disabled = {
+                    name for name, item in zip(model_names, models) if not item["enabled"]
+                }
+                requested_sources = {str(item["source_id"]): bool(item["enabled"]) for item in sources}
+                maintenance_required = (
+                    bool(current["merge_models_across_providers"]) != merge_models_across_providers
+                    or current_sources != requested_sources
+                    or current_disabled != requested_disabled
+                )
                 conn.execute("delete from disabled_models")
                 conn.executemany(
                     "insert into disabled_models(model, created_at) values (?, ?)",
                     [(name, utc_now()) for name, item in zip(model_names, models) if not item["enabled"]],
                 )
                 conn.execute(
-                    "update app_settings set revision = revision + 1, merge_models_across_providers = ?, ignore_codex_auto_review = 0, experimental_codex_deduplication = 1, ignore_failed_requests = 0, legacy_preference_migrated = 1, updated_at = ? where id = 1",
-                    (int(merge_models_across_providers), utc_now()),
+                    "update app_settings set revision = revision + 1, merge_models_across_providers = ?, non_working_weekdays = ?, ignore_codex_auto_review = 0, experimental_codex_deduplication = 1, ignore_failed_requests = 0, legacy_preference_migrated = 1, updated_at = ? where id = 1",
+                    (int(merge_models_across_providers), json.dumps(requested_weekdays, separators=(",", ":")), utc_now()),
                 )
-            self.rebuild_active_events()
-            return self.settings()
+            if maintenance_required:
+                self.rebuild_active_events()
+            result = self.settings()
+            result["_maintenance_required"] = maintenance_required
+            return result
 
     def register_source(self, source: DiscoveredSource) -> None:
         now = utc_now()

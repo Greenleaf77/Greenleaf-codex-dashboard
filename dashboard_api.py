@@ -35,6 +35,8 @@ from unibase import (
     OperationConflict,
     RevisionConflict,
     Unibase,
+    load_non_working_weekdays,
+    normalize_non_working_weekdays,
     register_default_sources,
     resolve_unibase_path,
     sanitize_error,
@@ -516,7 +518,7 @@ def chart_granularity(start_day: dt.date, end_day: dt.date) -> str:
     span_days = (end_day - start_day).days + 1
     if span_days <= 90:
         return "day"
-    if end_day <= add_months(start_day, 6):
+    if span_days <= 190:
         return "week"
     return "month"
 
@@ -540,6 +542,8 @@ def activity_from_timestamps(
     filters: dict[str, str | int | bool | None],
     timezone: ZoneInfo,
     idle_timeout_seconds: int = ACTIVITY_IDLE_TIMEOUT_SECONDS,
+    non_working_weekdays: tuple[int, ...] | list[int] = (5, 6),
+    workdays_only: bool = False,
 ) -> dict:
     ordered = sorted(int(value) for value in timestamps)
     start_day = parse_iso_day(str(filters["start_day"])) if filters.get("start_day") else None
@@ -558,13 +562,19 @@ def activity_from_timestamps(
         dt.datetime.combine(end_day + dt.timedelta(days=1), dt.time.min, timezone).timestamp()
     )
     intervals: list[list[int]] = []
-    request_count = 0
-    request_days: dict[str, int] = {}
+    excluded_weekdays = set(non_working_weekdays)
+    included_request_days: dict[str, int] = {}
+    excluded_request_days: dict[str, int] = {}
     for timestamp in ordered:
         if range_start <= timestamp < range_end:
-            request_count += 1
-            day = dt.datetime.fromtimestamp(timestamp, timezone).date().isoformat()
-            request_days[day] = request_days.get(day, 0) + 1
+            request_day = dt.datetime.fromtimestamp(timestamp, timezone).date()
+            day_key = request_day.isoformat()
+            target = (
+                excluded_request_days
+                if workdays_only and request_day.weekday() in excluded_weekdays
+                else included_request_days
+            )
+            target[day_key] = target.get(day_key, 0) + 1
         interval_start = max(timestamp, range_start)
         interval_end = min(timestamp + idle_timeout_seconds, range_end)
         if interval_end <= interval_start:
@@ -574,17 +584,30 @@ def activity_from_timestamps(
         else:
             intervals.append([interval_start, interval_end])
 
-    daily_seconds: dict[str, int] = {}
+    included_daily_seconds: dict[str, int] = {}
+    excluded_daily_seconds: dict[str, int] = {}
+    included_focus_blocks = 0
     for interval_start, interval_end in intervals:
         cursor = interval_start
+        interval_has_included_segment = False
         while cursor < interval_end:
             local_day = dt.datetime.fromtimestamp(cursor, timezone).date()
             next_day = local_day + dt.timedelta(days=1)
             next_day_start = int(dt.datetime.combine(next_day, dt.time.min, timezone).timestamp())
             segment_end = min(interval_end, next_day_start)
             day_key = local_day.isoformat()
-            daily_seconds[day_key] = daily_seconds.get(day_key, 0) + segment_end - cursor
+            if workdays_only and local_day.weekday() in excluded_weekdays:
+                excluded_daily_seconds[day_key] = (
+                    excluded_daily_seconds.get(day_key, 0) + segment_end - cursor
+                )
+            else:
+                included_daily_seconds[day_key] = (
+                    included_daily_seconds.get(day_key, 0) + segment_end - cursor
+                )
+                interval_has_included_segment = True
             cursor = segment_end
+        if interval_has_included_segment:
+            included_focus_blocks += 1
 
     granularity = chart_granularity(start_day, end_day)
     days = []
@@ -594,12 +617,18 @@ def activity_from_timestamps(
         visible_start = max(bucket_start, start_day)
         visible_end = min(bucket_end, end_day)
         bucket_seconds = 0
+        bucket_excluded_seconds = 0
         bucket_requests = 0
+        bucket_excluded_requests = 0
+        bucket_all_excluded = workdays_only
         day_cursor = visible_start
         while day_cursor <= visible_end:
             day_key = day_cursor.isoformat()
-            bucket_seconds += daily_seconds.get(day_key, 0)
-            bucket_requests += request_days.get(day_key, 0)
+            bucket_seconds += included_daily_seconds.get(day_key, 0)
+            bucket_excluded_seconds += excluded_daily_seconds.get(day_key, 0)
+            bucket_requests += included_request_days.get(day_key, 0)
+            bucket_excluded_requests += excluded_request_days.get(day_key, 0)
+            bucket_all_excluded = bucket_all_excluded and day_cursor.weekday() in excluded_weekdays
             day_cursor += dt.timedelta(days=1)
         days.append(
             {
@@ -608,7 +637,12 @@ def activity_from_timestamps(
                 "bucket_end": visible_end.isoformat(),
                 "label": label,
                 "active_seconds": bucket_seconds,
+                "excluded_active_seconds": bucket_excluded_seconds,
+                "raw_active_seconds": bucket_seconds + bucket_excluded_seconds,
                 "request_count": bucket_requests,
+                "excluded_request_count": bucket_excluded_requests,
+                "raw_request_count": bucket_requests + bucket_excluded_requests,
+                "fully_excluded": bucket_all_excluded,
             }
         )
         if granularity == "month":
@@ -618,23 +652,33 @@ def activity_from_timestamps(
         else:
             cursor = bucket_start + dt.timedelta(days=1)
 
-    total_seconds = sum(daily_seconds.values())
-    active_days = len(daily_seconds)
-    period_days = (end_day - start_day).days + 1
-    peak_day, peak_day_seconds = max(daily_seconds.items(), key=lambda item: item[1], default=("-", 0))
+    total_seconds = sum(included_daily_seconds.values())
+    active_days = len(included_daily_seconds)
+    calendar_period_days = (end_day - start_day).days + 1
+    eligible_period_days = sum(
+        not workdays_only or day.weekday() not in excluded_weekdays
+        for day in (start_day + dt.timedelta(days=offset) for offset in range(calendar_period_days))
+    )
+    peak_day, peak_day_seconds = max(
+        included_daily_seconds.items(), key=lambda item: item[1], default=("-", 0)
+    )
     return {
         "range": filters["range"],
         "granularity": granularity,
         "range_start": start_day.isoformat(),
         "range_end": end_day.isoformat(),
         "idle_timeout_minutes": idle_timeout_seconds // 60,
+        "workdays_only": workdays_only,
+        "non_working_weekdays": sorted(excluded_weekdays),
         "total_seconds": total_seconds,
-        "average_seconds_per_day": total_seconds / max(period_days, 1),
+        "average_seconds_per_day": total_seconds / max(eligible_period_days, 1),
         "average_seconds_per_active_day": total_seconds / max(active_days, 1),
-        "period_days": period_days,
+        "period_days": eligible_period_days,
+        "calendar_period_days": calendar_period_days,
+        "eligible_period_days": eligible_period_days,
         "active_days": active_days,
-        "focus_blocks": len(intervals),
-        "request_count": request_count,
+        "focus_blocks": included_focus_blocks,
+        "request_count": sum(included_request_days.values()),
         "peak_day": peak_day,
         "peak_day_seconds": peak_day_seconds,
         "days": days,
@@ -1339,8 +1383,8 @@ def _price_usage_group(row: dict, pricing: dict, all_scope: bool) -> dict:
 
 def _chart_days_from_aggregate_rows(rows: list[dict], filters: dict[str, str | int | bool | None]) -> dict:
     metric_keys = ("total_tokens", "total_with_cached_tokens")
-    bucket_model_map: dict[str, dict[str, dict[str, int]]] = {}
-    model_totals: dict[str, dict[str, int]] = {}
+    bucket_model_map: dict[str, dict[str, dict[str, object]]] = {}
+    model_totals: dict[str, dict[str, object]] = {}
     daily_map: dict[str, dict] = {}
     start_day = parse_iso_day(str(filters["start_day"])) if filters.get("start_day") else None
     end_day = parse_iso_day(str(filters["end_day"])) if filters.get("end_day") else None
@@ -1364,12 +1408,13 @@ def _chart_days_from_aggregate_rows(rows: list[dict], filters: dict[str, str | i
         bucket_key = bucket_start.isoformat()
         model = str(row["model"])
         bucket_models = bucket_model_map.setdefault(bucket_key, {})
-        bucket_totals = bucket_models.setdefault(model, {key: 0 for key in metric_keys})
-        overall_totals = model_totals.setdefault(model, {key: 0 for key in metric_keys})
+        metadata = {key: 0 for key in metric_keys}
+        bucket_totals = bucket_models.setdefault(model, dict(metadata))
+        overall_totals = model_totals.setdefault(model, dict(metadata))
         for key in metric_keys:
             tokens = int(row[key])
-            bucket_totals[key] += tokens
-            overall_totals[key] += tokens
+            bucket_totals[key] = int(bucket_totals[key]) + tokens
+            overall_totals[key] = int(overall_totals[key]) + tokens
 
     days = []
     cursor, _, _ = chart_bucket_for_day(start_day, granularity)
@@ -1379,7 +1424,7 @@ def _chart_days_from_aggregate_rows(rows: list[dict], filters: dict[str, str | i
         models = [
             {"model": model, **totals}
             for model, totals in sorted(
-                bucket_model_map.get(day_key, {}).items(), key=lambda item: item[1]["total_tokens"], reverse=True
+                bucket_model_map.get(day_key, {}).items(), key=lambda item: int(item[1]["total_tokens"]), reverse=True
             )
             if totals["total_tokens"] or totals["total_with_cached_tokens"]
         ]
@@ -1401,7 +1446,7 @@ def _chart_days_from_aggregate_rows(rows: list[dict], filters: dict[str, str | i
 
     models = [
         {"model": model, **totals}
-        for model, totals in sorted(model_totals.items(), key=lambda item: item[1]["total_tokens"], reverse=True)
+        for model, totals in sorted(model_totals.items(), key=lambda item: int(item[1]["total_tokens"]), reverse=True)
         if totals["total_tokens"] or totals["total_with_cached_tokens"]
     ]
     return {
@@ -1490,6 +1535,7 @@ def load_unibase_usage(
     include_diagnostics: bool = False,
     provider: str = "all",
     timezone_name: str = "UTC",
+    workdays_only: bool = False,
 ) -> dict:
     started_at = time.perf_counter()
     provider = normalize_provider(provider)
@@ -1684,7 +1730,13 @@ def load_unibase_usage(
         "daily": daily_rows,
         "models": model_rows,
         "chart": chart,
-        "activity": activity_from_timestamps(activity_timestamps, chart_filters, timezone),
+        "activity": activity_from_timestamps(
+            activity_timestamps,
+            chart_filters,
+            timezone,
+            non_working_weekdays=load_non_working_weekdays(settings["non_working_weekdays"]),
+            workdays_only=workdays_only,
+        ),
         "pricing": {
             "source": pricing["source"], "url": pricing["url"], "loaded_at": pricing["loaded_at"],
             "error": pricing["error"], "missing_models": sorted(missing_models),
@@ -2105,6 +2157,7 @@ def settings_payload(unibase_path: Path) -> dict:
     return {
         "revision": settings["revision"],
         "merge_models_across_providers": bool(settings["merge_models_across_providers"]),
+        "non_working_weekdays": load_non_working_weekdays(settings["non_working_weekdays"]),
         "sources": groups,
         "models": model_groups,
         "unibase": {
@@ -3005,15 +3058,19 @@ class DashboardHandler(BaseHTTPRequestHandler):
         filters["chart_end_day"] = chart_filters["end_day"]
         requested_diagnostics = parse_bool_flag(query.get("include_diagnostics", [None])[0], default=False)
         filters["include_diagnostics"] = requested_diagnostics if self.unibase_path else provider == "codex" and requested_diagnostics
+        filters["workdays_only"] = parse_bool_flag(query.get("workdays", [None])[0], default=False)
         return filters
 
     def usage_payload(self, filters: dict) -> dict:
         if self.unibase_path:
-            generation = int(Unibase(self.unibase_path, migrate=False).settings()["generation"])
+            settings = Unibase(self.unibase_path, migrate=False).settings()
+            generation = int(settings["generation"])
+            settings_revision = int(settings["revision"])
             cache_key = (
-                str(self.unibase_path), generation, filters["range"], filters["start_day"], filters["end_day"],
+                str(self.unibase_path), generation, settings_revision, filters["range"], filters["start_day"], filters["end_day"],
                 bool(filters["ignore_auto_review"]), filters["chart_range"], filters["chart_start_day"],
                 filters["chart_end_day"], bool(filters["include_diagnostics"]), filters["provider"], filters["timezone"],
+                bool(filters["workdays_only"]),
             )
             now = time.monotonic()
             with USAGE_RESPONSE_CACHE_LOCK:
@@ -3038,6 +3095,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     bool(filters["include_diagnostics"]),
                     provider=str(filters["provider"]),
                     timezone_name=str(filters["timezone"]),
+                    workdays_only=bool(filters["workdays_only"]),
                 )
                 with USAGE_RESPONSE_CACHE_LOCK:
                     USAGE_RESPONSE_CACHE[cache_key] = (now, dict(payload))
@@ -3195,6 +3253,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if set(payload) != {
                 "revision",
                 "merge_models_across_providers",
+                "non_working_weekdays",
                 "sources",
                 "models",
             }:
@@ -3202,6 +3261,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if (
                 not isinstance(payload["revision"], int)
                 or not isinstance(payload["merge_models_across_providers"], bool)
+                or not isinstance(payload["non_working_weekdays"], list)
                 or not isinstance(payload["sources"], list)
                 or not isinstance(payload["models"], list)
                 or not all(
@@ -3215,21 +3275,26 @@ class DashboardHandler(BaseHTTPRequestHandler):
             ):
                 raise ValueError("Invalid settings fields")
             database = Unibase(self.unibase_path)
-            database.apply_settings(
+            applied = database.apply_settings(
                 payload["revision"],
                 payload["merge_models_across_providers"],
                 payload["sources"],
                 payload["models"],
+                payload["non_working_weekdays"],
             )
-            scheduled = schedule_enabled_sources_refresh(
-                self.unibase_path,
-                self.opencode_db_path,
-                codex_root=self.db_path.parent,
-                codex_state_db=self.db_path,
-                claude_root=self.claude_projects_path.parent
-                if self.claude_projects_path.name == "projects" else self.claude_projects_path,
-                reason="settings update",
-            )
+            maintenance_required = bool(applied.pop("_maintenance_required"))
+            with USAGE_RESPONSE_CACHE_LOCK:
+                USAGE_RESPONSE_CACHE.clear()
+            if maintenance_required:
+                schedule_enabled_sources_refresh(
+                    self.unibase_path,
+                    self.opencode_db_path,
+                    codex_root=self.db_path.parent,
+                    codex_state_db=self.db_path,
+                    claude_root=self.claude_projects_path.parent
+                    if self.claude_projects_path.name == "projects" else self.claude_projects_path,
+                    reason="settings update",
+                )
             self.send_json(200, settings_payload(self.unibase_path))
         except (RevisionConflict, OperationConflict) as exc:
             self.send_json(409, {"error": str(exc)})

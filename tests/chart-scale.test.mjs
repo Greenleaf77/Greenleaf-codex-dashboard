@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 
-import { chartBarSizing, chartHeightPercent } from "../src/chart-scale.js";
+import { activityMaxSeconds, activityTicks, chartBarSizing, chartHeightPercent } from "../src/chart-scale.js";
 
 test("chart heights preserve a linear token scale without a visual floor", () => {
   assert.equal(chartHeightPercent(0, 100), 0);
@@ -31,7 +31,12 @@ test("chart grid fits every bucket into the available panel width", () => {
 });
 
 test("daily Active time uses a fixed 24-hour vertical scale", () => {
-  const source = readFileSync(new URL("../src/main.js", import.meta.url), "utf8");
-  assert.match(source, /dailyScale \? 24 \* 60 \* 60/);
-  assert.match(source, /\[24, 18, 12, 6, 0\]\.map\(\(hours\) => hours \* 60 \* 60\)/);
+  assert.equal(activityMaxSeconds([], true), 24 * 60 * 60);
+  assert.equal(activityMaxSeconds([{ raw_active_seconds: 60 }], true), 24 * 60 * 60);
+});
+
+test("daily Active time expands its scale for a 25-hour fall-back day", () => {
+  const maximum = activityMaxSeconds([{ raw_active_seconds: 25 * 60 * 60 }], true);
+  assert.equal(maximum, 25 * 60 * 60);
+  assert.deepEqual(activityTicks(maximum), [90000, 67500, 45000, 22500, 0]);
 });
