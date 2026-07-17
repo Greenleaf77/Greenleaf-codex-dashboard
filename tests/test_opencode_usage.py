@@ -9,7 +9,7 @@ import unibase
 
 
 def message_data(*, provider="openai", model="gpt-test", completed=1784203200000, input_tokens=0, output=0, reasoning=0, cache_read=0, cache_write=0, cost=None):
-    return {
+    data = {
         "role": "assistant",
         "providerID": provider,
         "modelID": model,
@@ -24,6 +24,7 @@ def message_data(*, provider="openai", model="gpt-test", completed=1784203200000
         "content": "private response text",
         "path": "/private/project",
     }
+    return data
 
 
 def create_database(path):

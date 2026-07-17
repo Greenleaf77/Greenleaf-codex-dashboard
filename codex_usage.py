@@ -12,10 +12,30 @@ from unibase import Unibase, open_source_sqlite_readonly, sanitize_error, stable
 
 
 PARSER_VERSION = 2
+DEDUP_PARSER_VERSION = 3
 AUTO_REVIEW_MODEL = "codex-auto-review"
 USAGE_COMPONENTS = ("input_tokens", "cached_input_tokens", "output_tokens", "reasoning_output_tokens")
+DEDUP_USAGE_FIELDS = (*USAGE_COMPONENTS, "total_tokens")
 ROLLOUT_UUID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 ROLLOUT_FILENAME = re.compile(r"^rollout-.*\.jsonl$")
+
+
+def active_parser_version(experimental_deduplication: bool) -> int:
+    return DEDUP_PARSER_VERSION if experimental_deduplication else PARSER_VERSION
+
+
+def canonical_json(value: object) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+
+
+def normalize_dedup_usage(value: object) -> tuple[int, int, int, int, int]:
+    usage = value if isinstance(value, dict) else {}
+    return tuple(int(usage.get(name) or 0) for name in DEDUP_USAGE_FIELDS)
+
+
+def make_dedup_key(usage: object, rate_limits: object) -> str:
+    canonical = canonical_json({"usage": normalize_dedup_usage(usage), "rate_limits": rate_limits})
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def parse_usage_components(value: object, *, cumulative: bool = False) -> dict[str, int] | None:
@@ -179,6 +199,55 @@ def scan_rollout_telemetry(rollout_path: Path, stream_key: str, model: str) -> d
     return {"usage_events": sorted(fallback_events + exact_events, key=lambda item: item["timestamp_utc"]), "token_events": token_events}
 
 
+def scan_rollout_deduplicated_usage(rollout_path: Path, stream_key: str, model: str) -> dict:
+    usage_events = []
+    diagnostics = {
+        "processed_lines": 0,
+        "malformed_lines": 0,
+        "token_count_events": 0,
+        "minimum_timestamp": None,
+        "maximum_timestamp": None,
+    }
+    with rollout_path.open(encoding="utf-8", errors="replace") as handle:
+        for line_number, line in enumerate(handle, 1):
+            diagnostics["processed_lines"] += 1
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError:
+                diagnostics["malformed_lines"] += 1
+                continue
+            if item.get("type") != "event_msg":
+                continue
+            payload = item.get("payload") or {}
+            if not isinstance(payload, dict) or payload.get("type") != "token_count":
+                continue
+            diagnostics["token_count_events"] += 1
+            info = payload.get("info") or {}
+            usage_value = info.get("last_token_usage") if isinstance(info, dict) else None
+            try:
+                normalized = normalize_dedup_usage(usage_value)
+            except (TypeError, ValueError):
+                continue
+            timestamp = item.get("timestamp")
+            if not isinstance(timestamp, str) or not timestamp:
+                continue
+            usage = dict(zip(DEDUP_USAGE_FIELDS, normalized))
+            try:
+                event = usage_event(stream_key, model, timestamp, usage, "deduplicated", "usage_update")
+            except ValueError:
+                continue
+            event["input_tokens"] = normalized[0] - normalized[1]
+            event["dedup_key"] = make_dedup_key(usage_value, payload.get("rate_limits"))
+            event["source_line"] = line_number
+            usage_events.append(event)
+            normalized_timestamp = event["timestamp_utc"]
+            if diagnostics["minimum_timestamp"] is None or normalized_timestamp < diagnostics["minimum_timestamp"]:
+                diagnostics["minimum_timestamp"] = normalized_timestamp
+            if diagnostics["maximum_timestamp"] is None or normalized_timestamp > diagnostics["maximum_timestamp"]:
+                diagnostics["maximum_timestamp"] = normalized_timestamp
+    return {"usage_events": usage_events, "diagnostics": diagnostics}
+
+
 def codex_usage_files(root: Path) -> list[Path]:
     sessions = root / "sessions"
     return sorted(path for path in sessions.glob("**/rollout-*.jsonl") if path.is_file()) if sessions.is_dir() else []
@@ -269,9 +338,12 @@ def import_codex_source(
     source: dict,
     *,
     ignore_auto_review: bool = False,
+    experimental_deduplication: bool = False,
     state_path: Path | None = None,
     require_state_inventory: bool = False,
-) -> dict[str, int]:
+    force_full_scan: bool = False,
+    non_destructive: bool = False,
+) -> dict[str, object]:
     source_id = str(source["source_id"])
     root = Path(source["root_path"])
     if not root.exists():
@@ -312,34 +384,67 @@ def import_codex_source(
         raise RuntimeError("Codex state inventory is unavailable or incomplete")
 
     scan_generation = unibase.begin_source_scan(source_id)
+    parser_version = active_parser_version(experimental_deduplication)
     seen_paths = []
     parsed_files = 0
     imported = 0
+    processed_lines = 0
+    malformed_lines = 0
+    token_count_events = 0
+    minimum_timestamp = None
+    maximum_timestamp = None
     dirty_event_keys: set[tuple[str, str]] = set()
     try:
         for path, file_key in inventory:
             seen_paths.append(file_key)
             stat = path.stat()
             previous = unibase.file_checkpoint(source_id, file_key)
-            if previous and int(previous["size"]) == stat.st_size and int(previous["mtime_ns"]) == stat.st_mtime_ns:
+            if (
+                previous
+                and not force_full_scan
+                and int(previous.get("parser_version") or 0) == parser_version
+                and int(previous["size"]) == stat.st_size
+                and int(previous["mtime_ns"]) == stat.st_mtime_ns
+            ):
                 continue
             content_hash = _file_hash(path)
-            unchanged = bool(previous and previous.get("content_hash") == content_hash and int(previous["size"]) == stat.st_size)
+            unchanged = bool(
+                previous
+                and not force_full_scan
+                and int(previous.get("parser_version") or 0) == parser_version
+                and previous.get("content_hash") == content_hash
+                and int(previous["size"]) == stat.st_size
+            )
             if unchanged:
                 unibase.upsert_source_file(
                     source_id, file_key, "codex_rollout", size=stat.st_size, mtime_ns=stat.st_mtime_ns,
                     complete_offset=stat.st_size, content_hash=content_hash, scan_generation=scan_generation,
-                    parser_version=PARSER_VERSION,
+                    parser_version=parser_version,
                 )
                 continue
-            unibase.register_content_blob(content_hash, stat.st_size, "codex", PARSER_VERSION)
+            unibase.register_content_blob(content_hash, stat.st_size, "codex", parser_version)
             source_file_id = int(previous["source_file_id"]) if previous else unibase.upsert_source_file(
                 source_id, file_key, "codex_rollout", size=0, mtime_ns=0, content_hash=None,
-                scan_generation=scan_generation, parser_version=PARSER_VERSION,
+                scan_generation=scan_generation, parser_version=parser_version,
             )
             stream_key, metadata_model = rollout_metadata(path, content_hash)
             model = state_rollouts.get(path.resolve(), backup_models.get(path.name, metadata_model))
-            telemetry = {"usage_events": []} if ignore_auto_review and model == AUTO_REVIEW_MODEL else scan_rollout_telemetry(path, stream_key, model)
+            if ignore_auto_review and model == AUTO_REVIEW_MODEL:
+                telemetry = {"usage_events": []}
+            elif experimental_deduplication:
+                telemetry = scan_rollout_deduplicated_usage(path, stream_key, model)
+                diagnostics = telemetry["diagnostics"]
+                processed_lines += int(diagnostics["processed_lines"])
+                malformed_lines += int(diagnostics["malformed_lines"])
+                token_count_events += int(diagnostics["token_count_events"])
+                file_minimum = diagnostics["minimum_timestamp"]
+                file_maximum = diagnostics["maximum_timestamp"]
+                if file_minimum and (minimum_timestamp is None or file_minimum < minimum_timestamp):
+                    minimum_timestamp = file_minimum
+                if file_maximum and (maximum_timestamp is None or file_maximum > maximum_timestamp):
+                    maximum_timestamp = file_maximum
+            else:
+                telemetry = scan_rollout_telemetry(path, stream_key, model)
             ordinals: dict[tuple[str, str, str], int] = {}
             parsed_events = []
             for item in telemetry["usage_events"]:
@@ -347,7 +452,9 @@ def import_codex_source(
                 ordinal = ordinals.get(ordinal_key, 0)
                 ordinals[ordinal_key] = ordinal + 1
                 response_id = item.get("response_id")
-                if response_id:
+                if experimental_deduplication:
+                    event_key = item["dedup_key"]
+                elif response_id:
                     event_key = stable_id("codex", "response", response_id)
                 else:
                     event_key = stable_id("codex", "record", stream_key, *ordinal_key, ordinal)
@@ -359,7 +466,7 @@ def import_codex_source(
                     "occurred_at": item["occurred_at"],
                     "model": model,
                     "native_provider_id": "openai",
-                    "semantics": "exact" if item["source"] == "exact" else "cumulative_fallback",
+                    "semantics": "codex_global_dedup" if experimental_deduplication else "exact" if item["source"] == "exact" else "cumulative_fallback",
                     "classification": item["classification"],
                     "input_tokens": item["input_tokens"],
                     "cache_read_tokens": item["cache_read_tokens"],
@@ -370,13 +477,18 @@ def import_codex_source(
                     "cost_kind": "unavailable",
                 })
                 imported += 1
-            dirty_event_keys.update(
-                unibase.replace_source_file_events(source_id, source_file_id, parsed_events, scan_generation)
-            )
+            if non_destructive:
+                dirty_event_keys.update(
+                    unibase.add_events(source_id, source_file_id, parsed_events, scan_generation)
+                )
+            else:
+                dirty_event_keys.update(
+                    unibase.replace_source_file_events(source_id, source_file_id, parsed_events, scan_generation)
+                )
             unibase.upsert_source_file(
                 source_id, file_key, "codex_rollout", size=stat.st_size, mtime_ns=stat.st_mtime_ns,
                 complete_offset=stat.st_size, content_hash=content_hash, scan_generation=scan_generation,
-                parser_version=PARSER_VERSION,
+                parser_version=parser_version,
             )
             parsed_files += 1
         if is_live and not state_inventory_complete:
@@ -384,21 +496,34 @@ def import_codex_source(
                 key for key in unibase.source_file_keys(source_id, file_kind="codex_rollout")
                 if key.startswith("external:")
             )
+        if non_destructive:
+            seen_paths.extend(key for key in unibase.source_file_keys(source_id) if key not in seen_paths)
         unibase.reconcile_source_files(
             source_id,
             scan_generation,
             seen_paths,
             rebuild_active=False,
             dirty_event_keys=dirty_event_keys,
+            complete=not non_destructive,
         )
         if is_live and not state_inventory_complete:
             unibase.mark_source_error(source_id, "Codex state inventory is incomplete; retained committed data")
+        active_events = unibase.active_event_rows("codex")
+        unique_usage_records = len(active_events) if experimental_deduplication else imported
         return {
             "files": len(set(seen_paths)),
             "scanned_files": parsed_files,
+            "processed_files": parsed_files,
+            "processed_lines": processed_lines,
+            "malformed_lines": malformed_lines,
+            "token_count_events": token_count_events,
+            "unique_usage_records": unique_usage_records,
+            "duplicate_usage_events": max(token_count_events - unique_usage_records, 0),
+            "minimum_timestamp": minimum_timestamp,
+            "maximum_timestamp": maximum_timestamp,
             "processed_records": imported,
             "new_events": imported,
-            "events": len(unibase.active_event_rows("codex")),
+            "events": len(active_events),
         }
     except Exception as exc:
         unibase.mark_source_error(source_id, sanitize_error(exc) or "Codex import failed")

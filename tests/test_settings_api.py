@@ -1,6 +1,8 @@
 import json
+import sqlite3
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -21,6 +23,8 @@ class SettingsApiTests(unittest.TestCase):
         self.db = unibase.Unibase(self.path)
         self.codex_root = self.root / ".codex"
         (self.codex_root / "sessions").mkdir(parents=True)
+        with sqlite3.connect(self.codex_root / "state_5.sqlite") as conn:
+            conn.execute("create table threads (id text primary key, rollout_path text, model text)")
         self.db.register_source(unibase.DiscoveredSource(
             "codex-live", "codex", "live", self.codex_root, "live", "Live Codex",
             True, 1000, None, None, "ready",
@@ -63,46 +67,314 @@ class SettingsApiTests(unittest.TestCase):
                 error.close()
 
     def test_get_and_apply_settings_are_safe_and_revisioned(self):
+        self.db.upsert_source_file("codex-live", "file:safe", "codex_rollout", size=2 * 1024 * 1024, mtime_ns=1)
         status, payload = self.request("/api/settings")
         self.assertEqual(status, 200)
         self.assertEqual(payload["revision"], 1)
-        self.assertEqual(len(payload["backups"]["codex"]), 1)
+        self.assertEqual(len(payload["sources"]["codex"]), 2)
+        self.assertTrue(payload["sources"]["codex"][0]["original"])
+        self.assertEqual(payload["sources"]["codex"][0]["size_bytes"], 2 * 1024 * 1024)
+        self.assertIsNone(payload["unibase"]["fresh_at"])
+        self.assertNotIn("ignore_failed_requests", payload)
         encoded = json.dumps(payload)
         self.assertNotIn(str(self.root), encoded)
 
+        sources = [
+            {"source_id": source["source_id"], "enabled": source["enabled"]}
+            for provider_sources in payload["sources"].values()
+            for source in provider_sources
+        ]
+        next(source for source in sources if source["source_id"] == "codex-backup")["enabled"] = True
         body = {
             "revision": payload["revision"],
             "ignore_codex_auto_review": True,
-            "backups": [{"source_id": "codex-backup", "enabled": True}],
+            "experimental_codex_deduplication": True,
+            "sources": sources,
+            "models": [],
         }
-        status, applied = self.request("/api/settings", "POST", body)
-        self.assertEqual(status, 200)
-        self.assertTrue(applied["ignore_codex_auto_review"])
-        self.assertTrue(applied["backups"]["codex"][0]["enabled"])
+        with patch.object(dashboard_api, "schedule_enabled_sources_refresh", return_value=True):
+            status, applied = self.request("/api/settings", "POST", body)
+            self.assertEqual(status, 200)
+            self.assertTrue(applied["ignore_codex_auto_review"])
+            self.assertTrue(applied["experimental_codex_deduplication"])
+            self.assertTrue(applied["sources"]["codex"][1]["enabled"])
 
-        status, conflict = self.request("/api/settings", "POST", body)
+            status, conflict = self.request("/api/settings", "POST", body)
         self.assertEqual(status, 409)
         self.assertIn("error", conflict)
+
+    def test_models_are_grouped_globally_and_disabled_across_stats_and_requests(self):
+        for provider in ("claude", "opencode"):
+            self.db.register_source(unibase.DiscoveredSource(
+                f"{provider}-live", provider, "live", self.root / f".{provider}", "live",
+                f"Live {provider}", True, 1000, None, None, "ready",
+            ))
+
+        def add_event(provider, event_key, model, occurred_at):
+            self.db.add_event(f"{provider}-live", None, {
+                "provider": provider,
+                "event_key": event_key,
+                "stream_key": f"stream-{event_key}",
+                "timestamp_utc": "2026-07-16T12:00:00Z",
+                "occurred_at": occurred_at,
+                "model": model,
+                "native_provider_id": provider,
+                "semantics": "exact",
+                "classification": "usage_update",
+                "input_tokens": 10,
+                "cache_read_tokens": 0,
+                "cache_write_tokens": 0,
+                "output_tokens": 1,
+                "reasoning_tokens": 0,
+                "cost_usd": None,
+                "cost_kind": "unavailable",
+            }, 1)
+
+        add_event("codex", "gpt-codex", "GPT-TEST", 1784203200)
+        add_event("opencode", "gpt-opencode", "GPT-TEST", 1784203260)
+        add_event("claude", "claude", "claude-test", 1784203320)
+        add_event("codex", "other", "custom-model", 1784203380)
+        self.db.rebuild_active_events()
+
+        status, payload = self.request("/api/settings")
+
+        self.assertEqual(status, 200)
+        self.assertEqual([item["model"] for item in payload["models"]["gpt"]], ["GPT-TEST"])
+        self.assertEqual([item["model"] for item in payload["models"]["claude"]], ["claude-test"])
+        self.assertEqual([item["model"] for item in payload["models"]["others"]], ["custom-model"])
+
+        sources = [
+            {"source_id": source["source_id"], "enabled": source["enabled"]}
+            for provider_sources in payload["sources"].values()
+            for source in provider_sources
+        ]
+        models = [
+            {"model": model["model"], "enabled": model["model"] != "GPT-TEST"}
+            for group in payload["models"].values()
+            for model in group
+        ]
+        with patch.object(dashboard_api, "schedule_enabled_sources_refresh", return_value=True):
+            status, applied = self.request("/api/settings", "POST", {
+                "revision": payload["revision"],
+                "ignore_codex_auto_review": False,
+                "experimental_codex_deduplication": False,
+                "sources": sources,
+                "models": models,
+            })
+
+        self.assertEqual(status, 200)
+        self.assertFalse(applied["models"]["gpt"][0]["enabled"])
+        pricing = {
+            "source": "test", "url": "", "loaded_at": "now", "models": {},
+            "fallback": dashboard_api.FALLBACK_PRICING, "error": None,
+        }
+        with patch.object(dashboard_api, "load_pricing", return_value=pricing):
+            stats = dashboard_api.load_unibase_usage(self.path, "all", chart_range="all", provider="all")
+            requests = dashboard_api.load_requests(self.path, provider="all")
+        self.assertNotIn("GPT-TEST", {row["model"].split(" · ")[-1] for row in stats["models"]})
+        self.assertNotIn("GPT-TEST", {item["model"].split(" · ")[-1] for item in requests["items"]})
+        self.assertEqual(stats["totals"]["total_tokens"], 22)
 
     def test_post_requires_json_and_strict_fields(self):
         status, _ = self.request("/api/settings", "POST", {"revision": 1}, content_type="text/plain")
         self.assertEqual(status, 400)
         status, _ = self.request("/api/settings", "POST", {"revision": 1})
         self.assertEqual(status, 400)
+        status, _ = self.request("/api/settings", "POST", {
+            "revision": 1,
+            "ignore_codex_auto_review": False,
+            "experimental_codex_deduplication": False,
+            "sources": [None],
+            "models": [],
+        })
+        self.assertEqual(status, 400)
 
-    def test_reset_confirmation_preserves_settings_and_registry(self):
+    def test_manual_refresh_runs_incremental_source_scan(self):
+        with patch.object(dashboard_api, "schedule_enabled_sources_refresh", return_value=True) as schedule:
+            status, _ = self.request("/api/sources/refresh", "POST", {})
+
+        self.assertEqual(status, 202)
+        self.assertNotIn("force_full_scan", schedule.call_args.kwargs)
+        self.assertEqual(schedule.call_args.kwargs["reason"], "manual incremental refresh")
+
+    def test_manual_refresh_conflicts_when_refresh_is_already_running(self):
+        running = {"state": "running", "reason": "periodic", "error": None}
+        with patch.object(dashboard_api, "schedule_enabled_sources_refresh", return_value=False), patch.object(
+            dashboard_api, "source_refresh_status", return_value=running
+        ):
+            status, payload = self.request("/api/sources/refresh", "POST", {})
+
+        self.assertEqual(status, 409)
+        self.assertIn("already running", payload["error"])
+        self.assertEqual(payload["source_sync"], running)
+
+    def test_source_refresh_is_rejected_while_unibase_is_empty(self):
+        self.db.reset()
+
+        status, payload = self.request("/api/sources/refresh", "POST", {})
+
+        self.assertEqual(status, 409)
+        self.assertIn("empty", payload["error"])
+        self.assertFalse(dashboard_api.schedule_enabled_sources_refresh(self.path, reason="startup"))
+
+    def test_scheduler_cooldown_is_measured_from_refresh_completion(self):
+        with dashboard_api.SOURCE_REFRESH_STATE_LOCK:
+            previous = dashboard_api.SOURCE_REFRESH_COMPLETED_MONOTONIC
+            dashboard_api.SOURCE_REFRESH_COMPLETED_MONOTONIC = 100.0
+        self.addCleanup(setattr, dashboard_api, "SOURCE_REFRESH_COMPLETED_MONOTONIC", previous)
+
+        self.assertEqual(dashboard_api.source_refresh_cooldown_remaining(100.0), 60.0)
+        self.assertEqual(dashboard_api.source_refresh_cooldown_remaining(130.0), 30.0)
+        self.assertEqual(dashboard_api.source_refresh_cooldown_remaining(160.0), 0.0)
+
+    def test_scheduler_rechecks_cooldown_after_each_wake_up(self):
+        with patch.object(dashboard_api, "source_refresh_running", return_value=False), patch.object(
+            dashboard_api, "source_refresh_cooldown_remaining", side_effect=[30.0, 59.0, 0.0]
+        ), patch.object(dashboard_api.time, "sleep") as sleep:
+            dashboard_api.wait_for_source_refresh_window()
+
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [30.0, 59.0])
+
+    def test_periodic_claim_rechecks_cooldown_atomically(self):
+        with dashboard_api.SOURCE_REFRESH_STATE_LOCK:
+            previous = dashboard_api.SOURCE_REFRESH_COMPLETED_MONOTONIC
+            dashboard_api.SOURCE_REFRESH_COMPLETED_MONOTONIC = 100.0
+        self.addCleanup(setattr, dashboard_api, "SOURCE_REFRESH_COMPLETED_MONOTONIC", previous)
+
+        with patch.object(dashboard_api.time, "monotonic", return_value=101.0), patch.object(
+            dashboard_api.threading, "Thread"
+        ) as thread:
+            scheduled = dashboard_api.schedule_enabled_sources_refresh(
+                self.path,
+                reason="periodic",
+                respect_cooldown=True,
+            )
+
+        self.assertFalse(scheduled)
+        thread.assert_not_called()
+
+    def test_refresh_state_rolls_back_when_worker_thread_cannot_start(self):
+        with dashboard_api.SOURCE_REFRESH_STATE_LOCK:
+            previous_running = dashboard_api.SOURCE_REFRESH_RUNNING
+            previous_error = dashboard_api.SOURCE_REFRESH_ERROR
+            dashboard_api.SOURCE_REFRESH_RUNNING = False
+            dashboard_api.SOURCE_REFRESH_ERROR = None
+        self.addCleanup(setattr, dashboard_api, "SOURCE_REFRESH_RUNNING", previous_running)
+        self.addCleanup(setattr, dashboard_api, "SOURCE_REFRESH_ERROR", previous_error)
+
+        with patch.object(dashboard_api.threading, "Thread") as thread:
+            thread.return_value.start.side_effect = RuntimeError("thread unavailable")
+            with self.assertRaisesRegex(RuntimeError, "thread unavailable"):
+                dashboard_api.schedule_enabled_sources_refresh(self.path, reason="manual incremental refresh")
+
+        self.assertFalse(dashboard_api.source_refresh_running())
+        self.assertIn("thread unavailable", dashboard_api.source_refresh_status()["error"])
+
+    def test_status_freshness_respects_provider_scope(self):
+        self.db.register_source(unibase.DiscoveredSource(
+            "claude-live", "claude", "live", self.root / ".claude", "live", "Live Claude",
+            True, 1000, None, None, "ready",
+        ))
+        with self.db.connect() as conn:
+            conn.execute(
+                "update sources set last_successful_scan = '2026-07-16T12:00:00Z', stale = 0 where source_id = 'codex-live'"
+            )
+            conn.execute("update sources set stale = 1 where source_id = 'claude-live'")
+
+        status, payload = self.request("/api/unibase/status?provider=codex")
+
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["fresh_at"], "2026-07-16T12:00:00Z")
+
+    def test_source_refresh_reports_individual_source_failures(self):
+        with patch.object(dashboard_api, "register_default_sources"), patch.object(
+            dashboard_api, "import_registered_source", side_effect=RuntimeError("provider unavailable")
+        ):
+            with self.assertRaisesRegex(RuntimeError, "codex"):
+                dashboard_api.refresh_enabled_sources(self.path, force_full_scan=True)
+
+    def test_periodic_refresh_reparses_sources_with_old_parser_versions(self):
+        claude_root = self.root / ".claude-source"
+        claude_root.mkdir()
+        self.db.register_source(unibase.DiscoveredSource(
+            "claude-source", "claude", "normalized_backup", claude_root, "snapshot", "Snapshot",
+            True, 500, "snapshot", "2026-07-16T00:00:00Z", "ready",
+        ))
+        self.db.upsert_source_file(
+            "claude-source", "file:safe", "claude_transcript", size=1, mtime_ns=1, parser_version=2
+        )
+        with self.db.connect() as conn:
+            conn.execute(
+                "update sources set last_successful_scan = '2026-07-16T00:00:00Z' where source_id = 'claude-source'"
+            )
+
+        with patch.object(dashboard_api, "register_default_sources"), patch.object(
+            dashboard_api, "import_registered_source"
+        ) as import_source:
+            dashboard_api.refresh_enabled_sources(self.path)
+
+        imported_ids = {call.args[1]["source_id"] for call in import_source.call_args_list}
+        self.assertIn("claude-source", imported_ids)
+
+    def test_periodic_refresh_forces_full_reconciliation_for_stale_sources(self):
+        with self.db.connect() as conn:
+            conn.execute(
+                "update sources set stale = 1, last_successful_scan = '2026-07-16T00:00:00Z' where source_id = 'codex-live'"
+            )
+        with patch.object(dashboard_api, "register_default_sources"), patch.object(
+            dashboard_api, "import_registered_source"
+        ) as import_source:
+            dashboard_api.refresh_enabled_sources(self.path)
+
+        live_call = next(call for call in import_source.call_args_list if call.args[1]["source_id"] == "codex-live")
+        self.assertTrue(live_call.kwargs["force_full_scan"])
+
+    def test_reset_confirmation_rebuilds_and_preserves_settings_and_registry(self):
+        rollout = self.codex_root / "sessions" / "2026" / "07" / "16" / "rollout-test.jsonl"
+        rollout.parent.mkdir(parents=True)
+        rollout.write_text("\n".join(json.dumps(row) for row in (
+            {
+                "timestamp": "2026-07-16T11:59:00Z",
+                "type": "session_meta",
+                "payload": {"type": "session_meta", "id": "session-test", "model": "gpt-test"},
+            },
+            {
+                "timestamp": "2026-07-16T12:00:00Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "raw_response_completed",
+                    "response_id": "response-test",
+                    "token_usage": {
+                        "input_tokens": 5,
+                        "cached_input_tokens": 1,
+                        "output_tokens": 2,
+                        "reasoning_output_tokens": 0,
+                    },
+                },
+            },
+        )) + "\n", encoding="utf-8")
+        with sqlite3.connect(self.codex_root / "state_5.sqlite") as conn:
+            conn.execute("insert into threads values (?, ?, ?)", ("session-test", str(rollout), "gpt-test"))
         self.db.update_settings(1, True)
         status, _ = self.request("/api/unibase/reset", "POST", {"confirmation": "wrong"})
         self.assertEqual(status, 400)
         status, payload = self.request("/api/unibase/reset", "POST", {"confirmation": "RESET UNIBASE"})
-        self.assertEqual(status, 200)
-        self.assertEqual(payload["unibase"]["state"], "reset_empty")
-        self.assertTrue(payload["ignore_codex_auto_review"])
-        self.assertEqual(len(payload["backups"]["codex"]), 1)
+        self.assertEqual(status, 202)
+        for _ in range(100):
+            operation = self.db.operation_status(payload["operation_id"])["operation"]
+            if operation["state"] not in {"queued", "running"}:
+                break
+            time.sleep(0.01)
+        self.assertEqual(operation["state"], "succeeded")
+        settings = dashboard_api.settings_payload(self.path)
+        self.assertEqual(settings["unibase"]["state"], "ready")
+        self.assertTrue(settings["ignore_codex_auto_review"])
+        self.assertEqual(len(settings["sources"]["codex"]), 2)
+        self.assertEqual(settings["unibase"]["counts"]["active_events"], 1)
 
     def test_staging_reindex_succeeds_and_status_is_pollable(self):
-        operation_id = self.db.create_operation("full_reindex")
-        dashboard_api.reindex_worker(self.path, operation_id)
+        operation_id = self.db.create_operation("reset")
+        dashboard_api.reset_worker(self.path, operation_id)
 
         status = unibase.Unibase(self.path).operation_status(operation_id)
         self.assertEqual(status["operation"]["state"], "succeeded")
@@ -113,9 +385,9 @@ class SettingsApiTests(unittest.TestCase):
         self.addCleanup(reader.close)
         reader.execute("begin")
         before = reader.execute("select generation from app_settings where id = 1").fetchone()[0]
-        operation_id = self.db.create_operation("full_reindex")
+        operation_id = self.db.create_operation("reset")
 
-        dashboard_api.reindex_worker(self.path, operation_id)
+        dashboard_api.reset_worker(self.path, operation_id)
 
         self.assertEqual(reader.execute("select generation from app_settings where id = 1").fetchone()[0], before)
         self.assertEqual(unibase.Unibase(self.path).operation_status(operation_id)["operation"]["state"], "succeeded")
@@ -128,30 +400,35 @@ class SettingsApiTests(unittest.TestCase):
             size=1,
             mtime_ns=1,
         )
-        operation_id = self.db.create_operation("full_reindex")
+        operation_id = self.db.create_operation("reset")
 
-        dashboard_api.reindex_worker(self.path, operation_id, codex_state_db=self.codex_root / "missing.sqlite")
+        dashboard_api.reset_worker(self.path, operation_id, codex_state_db=self.codex_root / "missing.sqlite")
 
         database = unibase.Unibase(self.path)
         self.assertEqual(database.operation_status(operation_id)["operation"]["state"], "failed")
         self.assertIn("external:root:file", database.source_file_keys("codex-live"))
 
     def test_reindex_requires_provided_state_inventory_before_external_checkpoints_exist(self):
-        operation_id = self.db.create_operation("full_reindex")
+        operation_id = self.db.create_operation("reset")
 
-        dashboard_api.reindex_worker(self.path, operation_id, codex_state_db=self.codex_root / "missing.sqlite")
+        dashboard_api.reset_worker(self.path, operation_id, codex_state_db=self.codex_root / "missing.sqlite")
 
         database = unibase.Unibase(self.path)
         self.assertEqual(database.operation_status(operation_id)["operation"]["state"], "failed")
         self.assertEqual(len(database.sources("codex")), 2)
 
     def test_mutations_conflict_with_running_operation(self):
-        self.db.create_operation("full_reindex")
+        self.db.create_operation("resync")
         settings = dashboard_api.settings_payload(self.path)
         body = {
             "revision": settings["revision"],
             "ignore_codex_auto_review": False,
-            "backups": [{"source_id": "codex-backup", "enabled": False}],
+            "experimental_codex_deduplication": False,
+            "sources": [
+                {"source_id": "codex-live", "enabled": True},
+                {"source_id": "codex-backup", "enabled": False},
+            ],
+            "models": [],
         }
         status, _ = self.request("/api/settings", "POST", body)
         self.assertEqual(status, 409)
@@ -179,6 +456,34 @@ class SettingsApiTests(unittest.TestCase):
             reset_thread.join()
 
         self.assertEqual(self.db.settings()["state"], "reset_empty")
+
+    def test_resync_is_non_destructive_and_forces_full_source_reads(self):
+        self.db.add_event("codex-live", None, {
+            "provider": "codex", "event_key": "event-1", "stream_key": "stream-1",
+            "timestamp_utc": "2026-07-16T12:00:00Z", "occurred_at": 1784203200,
+            "model": "gpt-test", "native_provider_id": "openai", "semantics": "exact",
+            "classification": "usage_update", "input_tokens": 1, "cache_read_tokens": 0,
+            "cache_write_tokens": 0, "output_tokens": 1, "reasoning_tokens": 0,
+            "cost_usd": None, "cost_kind": "unavailable",
+        }, 1)
+        self.db.rebuild_active_events()
+        operation_id = self.db.create_operation("resync")
+
+        with patch.object(dashboard_api, "import_registered_source") as import_source:
+            dashboard_api.resync_worker(self.path, operation_id)
+
+        self.assertEqual(len(self.db.active_event_rows()), 1)
+        self.assertTrue(import_source.call_args.kwargs["force_full_scan"])
+        self.assertTrue(import_source.call_args.kwargs["non_destructive"])
+        self.assertEqual(self.db.operation_status(operation_id)["operation"]["state"], "succeeded")
+
+    def test_resync_rejects_reset_empty_unibase(self):
+        self.db.reset()
+
+        status, payload = self.request("/api/unibase/resync", "POST", {})
+
+        self.assertEqual(status, 409)
+        self.assertIn("empty", payload["error"])
 
     def test_first_api_request_migrates_legacy_preference_cookie(self):
         status, _ = self.request("/data.json?provider=codex", cookie="ignore_codex_auto_review_v2=1")
@@ -215,7 +520,7 @@ class SettingsApiTests(unittest.TestCase):
         status, payload = self.request("/api/settings")
 
         self.assertEqual(status, 200)
-        self.assertTrue(any(source["label"] == "New snapshot" for source in payload["backups"]["codex"]))
+        self.assertTrue(any(source["label"] == "New snapshot" for source in payload["sources"]["codex"]))
 
 
 if __name__ == "__main__":

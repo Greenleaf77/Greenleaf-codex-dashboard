@@ -15,7 +15,7 @@ from pathlib import Path, PurePosixPath
 from typing import Iterable, Iterator
 
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 7
 DEFAULT_UNIBASE_DB = Path.home() / ".metermesh" / "unibase.sqlite3"
 PROVIDERS = ("codex", "claude", "opencode")
 SOURCE_PRIORITIES = {"live": 1000, "normalized_backup": 500, "legacy_backup": 400}
@@ -127,11 +127,18 @@ create table app_settings (
     id integer primary key check (id = 1),
     revision integer not null default 1,
     ignore_codex_auto_review integer not null default 0,
+    experimental_codex_deduplication integer not null default 0,
+    ignore_failed_requests integer not null default 0,
     legacy_preference_migrated integer not null default 0,
     generation integer not null default 0,
     state text not null default 'ready',
     created_at text not null,
     updated_at text not null
+);
+
+create table disabled_models (
+    model text primary key,
+    created_at text not null
 );
 
 create table sources (
@@ -234,6 +241,7 @@ create table event_variants (
     reasoning_tokens integer not null default 0,
     cost_usd real,
     cost_kind text not null default 'unavailable',
+    failed integer not null default 0,
     payload_hash text not null,
     created_at text not null,
     unique(provider, event_key, payload_hash)
@@ -278,7 +286,8 @@ create table active_events (
     output_tokens integer not null,
     reasoning_tokens integer not null,
     cost_usd real,
-    cost_kind text not null
+    cost_kind text not null,
+    failed integer not null default 0
 );
 
 create index active_events_provider_time on active_events(provider, occurred_at desc, canonical_event_id desc);
@@ -477,13 +486,44 @@ class Unibase:
                         commit;
                         """
                     )
+                    version = 5
+                if version == 5:
+                    conn.execute("begin immediate")
+                    migrations = (
+                        ("app_settings", "ignore_failed_requests", "integer not null default 0"),
+                        ("event_variants", "failed", "integer not null default 0"),
+                        ("active_events", "failed", "integer not null default 0"),
+                    )
+                    for table, column, declaration in migrations:
+                        columns = {row[1] for row in conn.execute(f"pragma table_info({table})")}
+                        if column not in columns:
+                            conn.execute(f"alter table {table} add column {column} {declaration}")
+                    conn.execute("pragma user_version = 6")
+                    conn.commit()
+                    version = 6
+                if version == 6:
+                    conn.execute("begin immediate")
+                    columns = {row[1] for row in conn.execute("pragma table_info(app_settings)")}
+                    if "experimental_codex_deduplication" not in columns:
+                        conn.execute(
+                            "alter table app_settings add column experimental_codex_deduplication integer not null default 0"
+                        )
+                    conn.execute(
+                        "create table if not exists disabled_models (model text primary key, created_at text not null)"
+                    )
+                    conn.execute("pragma user_version = 7")
+                    conn.commit()
 
     def settings(self) -> dict:
         with self.connect(readonly=True) as conn:
             row = conn.execute("select * from app_settings where id = 1").fetchone()
         return dict(row)
 
-    def update_settings(self, revision: int, ignore_codex_auto_review: bool) -> dict:
+    def update_settings(
+        self,
+        revision: int,
+        ignore_codex_auto_review: bool,
+    ) -> dict:
         with OPERATION_LOCKS.acquire("settings"):
             with self.connect() as conn:
                 conn.execute("begin immediate")
@@ -491,7 +531,7 @@ class Unibase:
                 if int(current[0]) != revision:
                     raise RevisionConflict("Settings changed since this draft was opened")
                 conn.execute(
-                    "update app_settings set revision = revision + 1, ignore_codex_auto_review = ?, legacy_preference_migrated = 1, updated_at = ? where id = 1",
+                    "update app_settings set revision = revision + 1, ignore_codex_auto_review = ?, ignore_failed_requests = 0, legacy_preference_migrated = 1, updated_at = ? where id = 1",
                     (int(ignore_codex_auto_review), utc_now()),
                 )
             return self.settings()
@@ -514,7 +554,14 @@ class Unibase:
             ).fetchone()
         return dict(row) if row else None
 
-    def apply_settings(self, revision: int, ignore_codex_auto_review: bool, backups: list[dict]) -> dict:
+    def apply_settings(
+        self,
+        revision: int,
+        ignore_codex_auto_review: bool,
+        experimental_codex_deduplication: bool,
+        sources: list[dict],
+        models: list[dict],
+    ) -> dict:
         with OPERATION_LOCKS.acquire("maintenance"):
             if self.active_operation():
                 raise OperationConflict("A Unibase operation is already running")
@@ -523,23 +570,38 @@ class Unibase:
                 current = conn.execute("select revision from app_settings where id = 1").fetchone()
                 if int(current[0]) != revision:
                     raise RevisionConflict("Settings changed since this draft was opened")
-                expected = {
-                    row["source_id"]
-                    for row in conn.execute("select source_id from sources where kind != 'live'").fetchall()
+                registry = {
+                    row["source_id"]: row["kind"]
+                    for row in conn.execute("select source_id, kind from sources").fetchall()
                 }
-                provided = {str(item.get("source_id")) for item in backups}
-                if provided != expected or len(provided) != len(backups):
-                    raise ValueError("Backup source list does not match the current registry")
-                for item in backups:
+                provided = {str(item.get("source_id")) for item in sources}
+                if provided != set(registry) or len(provided) != len(sources):
+                    raise ValueError("Source list does not match the current registry")
+                for item in sources:
                     if not isinstance(item.get("enabled"), bool):
-                        raise ValueError("Backup enabled value must be boolean")
+                        raise ValueError("Source enabled value must be boolean")
+                    source_id = str(item["source_id"])
+                    if registry[source_id] == "live" and not item["enabled"]:
+                        raise ValueError("Original sources cannot be disabled")
                     conn.execute(
                         "update sources set enabled = ?, updated_at = ? where source_id = ? and kind != 'live'",
-                        (int(item["enabled"]), utc_now(), item["source_id"]),
+                        (int(item["enabled"]), utc_now(), source_id),
                     )
+                model_names = [str(item.get("model") or "") for item in models]
+                if (
+                    len(set(model_names)) != len(model_names)
+                    or any(not name or len(name) > 500 for name in model_names)
+                    or not all(isinstance(item.get("enabled"), bool) for item in models)
+                ):
+                    raise ValueError("Invalid model settings")
+                conn.execute("delete from disabled_models")
+                conn.executemany(
+                    "insert into disabled_models(model, created_at) values (?, ?)",
+                    [(name, utc_now()) for name, item in zip(model_names, models) if not item["enabled"]],
+                )
                 conn.execute(
-                    "update app_settings set revision = revision + 1, ignore_codex_auto_review = ?, legacy_preference_migrated = 1, updated_at = ? where id = 1",
-                    (int(ignore_codex_auto_review), utc_now()),
+                    "update app_settings set revision = revision + 1, ignore_codex_auto_review = ?, experimental_codex_deduplication = ?, ignore_failed_requests = 0, legacy_preference_migrated = 1, updated_at = ? where id = 1",
+                    (int(ignore_codex_auto_review), int(experimental_codex_deduplication), utc_now()),
                 )
             self.rebuild_active_events()
             return self.settings()
@@ -549,7 +611,7 @@ class Unibase:
         with self.connect() as conn:
             previous = conn.execute(
                 """
-                select source_id, inventory_signature, stable_inventory_count, enabled
+                select source_id, root_path, discovery_status, inventory_signature, stable_inventory_count, enabled
                 from sources
                 where source_id = ? or (provider = ? and kind = ? and relative_name = ?)
                 order by source_id = ? desc
@@ -560,6 +622,13 @@ class Unibase:
             effective_source_id = previous["source_id"] if previous else source.source_id
             stable_count = 0
             status = source.status
+            if (
+                previous
+                and source.kind == "live"
+                and source.status == "not_indexed"
+                and previous["root_path"] == str(source.root_path)
+            ):
+                status = previous["discovery_status"]
             if source.kind == "legacy_backup" and source.inventory_signature:
                 stable_count = 1
                 if previous and previous["inventory_signature"] == source.inventory_signature:
@@ -815,7 +884,12 @@ class Unibase:
             ).fetchone()[0]
         )
         conn.execute(
-            "insert or ignore into event_occurrences(event_variant_id, source_id, source_file_id, scan_generation) values (?, ?, ?, ?)",
+            """
+            insert into event_occurrences(event_variant_id, source_id, source_file_id, scan_generation)
+            values (?, ?, ?, ?)
+            on conflict(event_variant_id, source_id, source_file_id)
+            do update set scan_generation = excluded.scan_generation
+            """,
             (variant_id, source_id, source_file_id, scan_generation),
         )
         conn.execute(
@@ -923,6 +997,7 @@ class Unibase:
         *,
         rebuild_active: bool = True,
         dirty_event_keys: Iterable[tuple[str, str]] = (),
+        complete: bool = True,
     ) -> bool:
         seen = set(seen_paths)
         removed = False
@@ -946,10 +1021,16 @@ class Unibase:
                     )
                     conn.execute("delete from event_occurrences where source_id = ? and source_file_id = ?", (source_id, row["source_file_id"]))
                     conn.execute("delete from source_files where source_file_id = ?", (row["source_file_id"],))
-            conn.execute(
-                "update sources set discovery_status = 'ready', stale = 0, error = null, last_successful_generation = ?, last_successful_scan = ?, file_count = ?, updated_at = ? where source_id = ?",
-                (scan_generation, utc_now(), len(seen), utc_now(), source_id),
-            )
+            if complete:
+                conn.execute(
+                    "update sources set discovery_status = 'ready', stale = 0, error = null, last_successful_generation = ?, last_successful_scan = ?, file_count = ?, updated_at = ? where source_id = ?",
+                    (scan_generation, utc_now(), len(seen), utc_now(), source_id),
+                )
+            else:
+                conn.execute(
+                    "update sources set discovery_status = 'ready', stale = 1, error = null, file_count = ?, updated_at = ? where source_id = ?",
+                    (len(seen), utc_now(), source_id),
+                )
         if dirty:
             self.rebuild_active_events(dirty)
         elif rebuild_active or removed:
@@ -986,21 +1067,24 @@ class Unibase:
                     create temp table active_event_winners as
                     with ranked_sources as (
                         select ev.*, s.priority, coalesce(s.snapshot_date, '') snapshot_date,
-                               s.source_id stable_source_id,
-                               row_number() over (
-                                   partition by ev.event_variant_id
-                                   order by s.priority desc, coalesce(s.snapshot_date, '') desc, s.source_id asc
-                               ) source_rank
+                               s.source_id stable_source_id, eo.scan_generation,
+                                row_number() over (
+                                    partition by ev.event_variant_id
+                                    order by s.priority desc, coalesce(s.snapshot_date, '') desc, s.source_id asc,
+                                             eo.scan_generation desc, coalesce(eo.source_file_id, 0) asc
+                                ) source_rank
                         from event_variants ev
                         join event_occurrences eo on eo.event_variant_id = ev.event_variant_id
                         join sources s on s.source_id = eo.source_id and s.enabled = 1
                         {"join dirty_event_keys dirty on dirty.provider = ev.provider and dirty.event_key = ev.event_key" if dirty is not None else ""}
                     ), ranked_variants as (
                         select ranked_sources.*,
-                               row_number() over (
-                                   partition by provider, event_key
-                                   order by priority desc, snapshot_date desc, stable_source_id asc, payload_hash asc
-                               ) variant_rank,
+                                row_number() over (
+                                    partition by provider, event_key
+                                    order by case when semantics = 'codex_global_dedup' then occurred_at end asc,
+                                             priority desc, snapshot_date desc, stable_source_id asc,
+                                             scan_generation desc, payload_hash asc
+                                ) variant_rank,
                                count(*) over (partition by provider, event_key) variant_count
                         from ranked_sources
                         where source_rank = 1
@@ -1035,7 +1119,11 @@ class Unibase:
                     """
                     update canonical_events as canonical
                     set selected_variant_id = winner.event_variant_id,
-                        conflict_state = case when winner.variant_count > 1 then 'conflict' else 'clean' end
+                        conflict_state = case
+                            when winner.semantics = 'codex_global_dedup' then 'clean'
+                            when winner.variant_count > 1 then 'conflict'
+                            else 'clean'
+                        end
                     from active_event_winners as winner
                     where canonical.provider = winner.provider and canonical.event_key = winner.event_key
                     """
@@ -1051,8 +1139,8 @@ class Unibase:
                     select canonical.canonical_event_id, winner.event_variant_id, ?, winner.provider,
                            winner.event_key, winner.stream_key, winner.timestamp_utc, winner.occurred_at,
                            winner.model, winner.native_provider_id, winner.semantics, winner.classification,
-                           winner.input_tokens, winner.cache_read_tokens, winner.cache_write_tokens,
-                           winner.output_tokens, winner.reasoning_tokens, winner.cost_usd, winner.cost_kind
+                            winner.input_tokens, winner.cache_read_tokens, winner.cache_write_tokens,
+                            winner.output_tokens, winner.reasoning_tokens, winner.cost_usd, winner.cost_kind
                     from active_event_winners winner
                     join canonical_events canonical
                       on canonical.provider = winner.provider and canonical.event_key = winner.event_key
@@ -1113,7 +1201,7 @@ class Unibase:
                     "content_blobs", "source_files",
                 ):
                     conn.execute(f"delete from {table}")
-                conn.execute("update sources set discovery_status = 'not_indexed', stale = 0, file_count = 0, event_count = 0, error = null")
+                conn.execute("update sources set discovery_status = 'not_indexed', stale = 0, last_successful_generation = null, file_count = 0, event_count = 0, last_successful_scan = null, error = null")
                 conn.execute("update app_settings set generation = generation + 1, state = 'reset_empty', updated_at = ? where id = 1", (utc_now(),))
 
     def integrity_check(self) -> bool:

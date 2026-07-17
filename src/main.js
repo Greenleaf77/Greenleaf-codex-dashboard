@@ -63,6 +63,7 @@ const iconPaths = {
   chart: '<line x1="4" y1="20" x2="20" y2="20"/><line x1="6" y1="20" x2="6" y2="12"/><line x1="11" y1="20" x2="11" y2="7"/><line x1="16" y1="20" x2="16" y2="4"/><polyline points="4 8 9 5 13 7 20 3"/>',
   database: '<rect x="4" y="4" width="16" height="16" rx="2"/><line x1="4" y1="9" x2="20" y2="9"/><line x1="4" y1="15" x2="20" y2="15"/><circle cx="8" cy="6.5" r=".8"/><circle cx="8" cy="12" r=".8"/><circle cx="8" cy="18" r=".8"/><line x1="11" y1="6.5" x2="17" y2="6.5"/><line x1="11" y1="12" x2="17" y2="12"/><line x1="11" y1="18" x2="17" y2="18"/>',
   settings: '<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.8 2.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6V21h-4v-.1a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1L4.2 17l.1-.1a1.7 1.7 0 0 0 .3-1.9A1.7 1.7 0 0 0 3 14H3v-4h.1a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9L4.2 7 7 4.2l.1.1a1.7 1.7 0 0 0 1.9.3A1.7 1.7 0 0 0 10 3h4v.1a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1L19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.1v4H21a1.7 1.7 0 0 0-1.6 1Z"/>',
+  refresh: '<path d="M20 6v5h-5"/><path d="M18.2 9A7 7 0 1 0 19 15"/>',
   info: '<circle cx="12" cy="12" r="9"/><line x1="12" y1="10.5" x2="12" y2="16"/><circle cx="12" cy="7.5" r=".7"/>',
   usage: '<polyline points="3 13 7 13 9.5 6 14 18 16.5 11 21 11"/>',
   models: '<rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/><line x1="10" y1="7" x2="14" y2="7"/><line x1="7" y1="10" x2="7" y2="14"/><line x1="17" y1="10" x2="17" y2="14"/>'
@@ -131,9 +132,13 @@ let settingsLoading = false;
 let settingsData = null;
 let settingsDraft = null;
 let settingsError = null;
+let settingsApplyPending = false;
+let settingsApplied = false;
+let settingsActiveTab = "general";
 let resetConfirmOpen = false;
 let resetConfirmation = "";
 let operationPollTimer = null;
+let manualRefreshPending = false;
 
 const numberFormatter = new Intl.NumberFormat("en-US");
 const percentageFormatter = new Intl.NumberFormat("en-US", { minimumFractionDigits: 1, maximumFractionDigits: 1 });
@@ -146,6 +151,17 @@ function full(value) {
 
 function money(value) {
   return moneyFormatter.format(Number(value || 0));
+}
+
+function formatTimestamp(value, fallback = "Not synced") {
+  if (!value) return fallback;
+  const timestamp = new Date(value);
+  if (Number.isNaN(timestamp.getTime())) return fallback;
+  return timestamp.toLocaleString([], { dateStyle: "medium", timeStyle: "short" });
+}
+
+function formatMegabytes(bytes) {
+  return `${(Number(bytes || 0) / (1024 * 1024)).toFixed(2)} MB`;
 }
 
 function resetUsageTablePages() {
@@ -1280,31 +1296,57 @@ function settingsIsDirty() {
   if (!settingsData || !settingsDraft) return false;
   const original = {
     ignore_codex_auto_review: settingsData.ignore_codex_auto_review,
-    backups: Object.values(settingsData.backups).flat().map(({ source_id, enabled }) => ({ source_id, enabled }))
+    experimental_codex_deduplication: settingsData.experimental_codex_deduplication,
+    sources: Object.values(settingsData.sources).flat().map(({ source_id, enabled }) => ({ source_id, enabled })),
+    models: Object.values(settingsData.models).flat().map(({ model, enabled }) => ({ model, enabled }))
   };
   return JSON.stringify(original) !== JSON.stringify(settingsDraft);
 }
 
-function renderBackupGroup(provider, sources) {
+function settingsDraftFromData(payload) {
+  return {
+    ignore_codex_auto_review: payload.ignore_codex_auto_review,
+    experimental_codex_deduplication: payload.experimental_codex_deduplication,
+    sources: Object.values(payload.sources).flat().map(({ source_id, enabled }) => ({ source_id, enabled })),
+    models: Object.values(payload.models).flat().map(({ model, enabled }) => ({ model, enabled }))
+  };
+}
+
+function renderSourceGroup(provider, sources) {
   const label = providerOptions.find((option) => option.value === provider)?.label || provider;
-  const operationRunning = ["queued", "running"].includes(settingsData?.unibase?.current_operation?.state);
+  const settingsLocked = settingsApplyPending || ["queued", "running"].includes(settingsData?.unibase?.current_operation?.state);
   return `
     <div class="settings-source-group">
       <h3>${escapeHtml(label)}</h3>
-      ${sources.length ? sources.map((source) => {
-        const draft = settingsDraft?.backups.find((item) => item.source_id === source.source_id);
+      <div class="settings-source-list">${sources.length ? sources.map((source) => {
+        const draft = settingsDraft?.sources.find((item) => item.source_id === source.source_id);
         return `
-          <label class="settings-source">
-            <input type="checkbox" data-settings-source="${escapeHtml(source.source_id)}" ${draft?.enabled ? "checked" : ""} ${operationRunning || ["ambiguous", "incomplete"].includes(source.status) ? "disabled" : ""}>
+          <label class="settings-source ${source.original ? "settings-source-original" : ""}">
+            <input type="checkbox" data-settings-source="${escapeHtml(source.source_id)}" ${draft?.enabled ? "checked" : ""} ${source.original || settingsLocked || ["ambiguous", "incomplete"].includes(source.status) ? "disabled" : ""}>
             <span>
-              <strong>${escapeHtml(source.label)}</strong>
-              <small>${escapeHtml(source.relative_name)} · ${escapeHtml(source.layout)}${source.snapshot_date ? ` · ${escapeHtml(source.snapshot_date)}` : ""}</small>
-              <em class="source-status status-${escapeHtml(source.status)}">${escapeHtml(source.status)}${source.stale ? " · stale" : ""} · ${full(source.event_count)} events</em>
+              <strong>${escapeHtml(source.label)}${source.original ? '<span class="source-origin-badge">Original</span>' : ""}</strong>
+              <small title="${escapeHtml(source.path)}">${escapeHtml(source.path)} · ${formatMegabytes(source.size_bytes)} · ${full(source.event_count)} events</small>
             </span>
+            <em class="source-status status-${escapeHtml(source.status)}">${escapeHtml(source.status)}${source.stale ? " · stale" : ""}</em>
           </label>
         `;
-      }).join("") : '<p class="settings-empty">No backup snapshots discovered.</p>'}
+      }).join("") : '<p class="settings-empty">No sources discovered.</p>'}</div>
     </div>
+  `;
+}
+
+function renderModelGroup(group, models) {
+  const settingsLocked = settingsApplyPending || ["queued", "running"].includes(settingsData?.unibase?.current_operation?.state);
+  return `
+    <section class="settings-model-group">
+      <div class="settings-model-heading"><h3>${escapeHtml(group.toUpperCase())}</h3><span>${full(models.length)}</span></div>
+      <div class="settings-model-list">
+        ${models.length ? models.map((item) => {
+          const draft = settingsDraft?.models.find((model) => model.model === item.model);
+          return `<label class="settings-model"><input type="checkbox" data-settings-model="${escapeHtml(item.model)}" ${draft?.enabled ? "checked" : ""} ${settingsLocked ? "disabled" : ""}><span title="${escapeHtml(item.model)}">${escapeHtml(item.model)}</span></label>`;
+        }).join("") : '<p class="settings-empty">No models found.</p>'}
+      </div>
+    </section>
   `;
 }
 
@@ -1318,38 +1360,53 @@ function renderSettingsDialog() {
   }
   const operation = settingsData.unibase.current_operation;
   const operationRunning = operation && ["queued", "running"].includes(operation.state);
+  const settingsLocked = operationRunning || settingsApplyPending;
   const dirty = settingsIsDirty();
   return `
     <dialog class="settings-dialog" id="settings-dialog" aria-labelledby="settings-title">
       <form class="settings-shell" id="settings-form">
         <div class="settings-header">
           <div><span class="eyebrow">MeterMesh control plane</span><h2 id="settings-title">Settings</h2></div>
-          <button class="settings-close" type="button" aria-label="Close Settings">×</button>
+          <button class="settings-close" id="settings-close" type="button" aria-label="Close Settings" ${settingsApplyPending ? "disabled" : ""}>×</button>
         </div>
         ${settingsError ? `<div class="settings-error" role="alert">${escapeHtml(settingsError)}</div>` : ""}
-        <section class="settings-section">
-          <h3>Preferences</h3>
-          <label class="settings-preference"><input id="settings-auto-review" type="checkbox" ${settingsDraft.ignore_codex_auto_review ? "checked" : ""} ${operationRunning ? "disabled" : ""}><span><strong>Ignore "${escapeHtml(autoReviewModel)}"</strong><small>Applies only to Codex events in Codex and All views.</small></span></label>
-        </section>
-        <section class="settings-section">
-          <div class="settings-section-heading"><div><h3>Backup sources</h3><p>Unchecked snapshots stay registered but do not support active totals.</p></div></div>
-          <div class="settings-source-groups">${["codex", "claude", "opencode"].map((provider) => renderBackupGroup(provider, settingsData.backups[provider] || [])).join("")}</div>
-        </section>
-        <section class="settings-section unibase-settings">
-          <div>
-            <h3>Unibase</h3>
-            <p><code>${escapeHtml(settingsData.unibase.path)}</code> · generation ${full(settingsData.unibase.generation)} · ${escapeHtml(settingsData.unibase.state)}</p>
-            <p>${full(settingsData.unibase.counts.active_events)} active events · ${full(settingsData.unibase.counts.retained_variants)} retained variants</p>
-          </div>
-          <div class="unibase-actions">
-            <button id="full-reindex" type="button" ${dirty || operationRunning ? "disabled" : ""}>Full reindex</button>
-            <button id="reset-unibase" class="danger" type="button" ${dirty || operationRunning ? "disabled" : ""}>Reset Unibase</button>
-          </div>
-          ${operation ? `<div class="operation-progress" role="status" aria-live="polite"><div><strong>${escapeHtml(operation.kind)}</strong><span>${escapeHtml(operation.state)}</span></div><progress aria-label="${escapeHtml(operation.kind)} progress" max="${Math.max(operation.progress_total, 1)}" value="${operation.progress_current}"></progress>${operation.error ? `<code>${escapeHtml(operation.error)}</code>` : ""}</div>` : ""}
-        </section>
+        <div class="settings-tabs" role="tablist" aria-label="Settings sections">
+          <button type="button" role="tab" data-settings-tab="general" aria-selected="${settingsActiveTab === "general"}">General</button>
+          <button type="button" role="tab" data-settings-tab="models" aria-selected="${settingsActiveTab === "models"}">Models</button>
+        </div>
+        <div class="settings-tab-panel" role="tabpanel">
+          ${settingsActiveTab === "general" ? `
+            <section class="settings-section">
+              <h3>Preferences</h3>
+              <label class="settings-preference"><input id="settings-auto-review" type="checkbox" ${settingsDraft.ignore_codex_auto_review ? "checked" : ""} ${settingsLocked ? "disabled" : ""}><span><strong>Ignore "${escapeHtml(autoReviewModel)}"</strong><small>Applies only to Codex events in Codex and All views.</small></span></label>
+              <label class="settings-preference"><input id="settings-codex-deduplication" type="checkbox" ${settingsDraft.experimental_codex_deduplication ? "checked" : ""} ${settingsLocked ? "disabled" : ""}><span><strong>Experimental CODEX token deduplication</strong><small>Globally deduplicates last_token_usage + rate_limits and keeps the earliest timestamp. Changing this option reparses CODEX rollouts.</small></span></label>
+            </section>
+            <section class="settings-section">
+              <div class="settings-section-heading"><div><h3>Sources</h3><p>Original live sources are always enabled. Optional sources remain registered when unchecked.</p></div></div>
+              <div class="settings-source-groups">${["codex", "claude", "opencode"].map((provider) => renderSourceGroup(provider, settingsData.sources[provider] || [])).join("")}</div>
+            </section>
+            <section class="settings-section unibase-settings">
+              <div>
+                <h3>Unibase</h3>
+                <p><code>${escapeHtml(settingsData.unibase.path)}</code> · generation ${full(settingsData.unibase.generation)} · ${escapeHtml(settingsData.unibase.state)}</p>
+                <p>${full(settingsData.unibase.counts.active_events)} active events · ${full(settingsData.unibase.counts.retained_variants)} retained variants</p>
+              </div>
+              <div class="unibase-actions">
+                <span><button id="resync-unibase" type="button" ${dirty || settingsLocked || settingsData.unibase.state === "reset_empty" ? "disabled" : ""}>Resync</button><small>Reload every enabled source and deduplicate without deleting retained Unibase records.</small></span>
+                <span><button id="reset-unibase" class="danger" type="button" ${dirty || settingsLocked ? "disabled" : ""}>Reset</button><small>Replace all derived Unibase data with a clean rebuild from enabled sources.</small></span>
+              </div>
+              ${operation ? `<div class="operation-progress" role="status" aria-live="polite"><div><strong>${escapeHtml(operation.kind)}</strong><span>${escapeHtml(operation.state)}</span></div><progress aria-label="${escapeHtml(operation.kind)} progress" max="${Math.max(operation.progress_total, 1)}" value="${operation.progress_current}"></progress>${operation.error ? `<code>${escapeHtml(operation.error)}</code>` : ""}</div>` : ""}
+            </section>
+          ` : `
+            <section class="settings-section settings-models-section">
+              <div class="settings-section-heading"><div><h3>Models</h3><p>Disabled models are hidden from every provider, chart, statistic, and Token Usage list.</p></div></div>
+              <div class="settings-model-groups">${["gpt", "claude", "others"].map((group) => renderModelGroup(group, settingsData.models[group] || [])).join("")}</div>
+            </section>
+          `}
+        </div>
         <div class="settings-actions">
-          <button class="settings-cancel" type="button">Cancel</button>
-          <button class="settings-apply" type="submit" ${dirty && !operationRunning ? "" : "disabled"}>Apply</button>
+          <button class="settings-cancel" id="settings-cancel" type="button" ${settingsApplyPending ? "disabled" : ""}>Cancel</button>
+          <button class="settings-apply" id="settings-apply" type="submit" ${dirty && !settingsLocked ? "" : "disabled"}>${settingsApplyPending ? "Applying…" : settingsApplied && !dirty ? "Applied" : "Apply"}</button>
         </div>
       </form>
     </dialog>
@@ -1358,7 +1415,7 @@ function renderSettingsDialog() {
         <form id="reset-confirm-form">
           <span class="eyebrow danger-text">Destructive action</span>
           <h2 id="reset-confirm-title">Reset Unibase?</h2>
-          <p>Provider files and backup folders are untouched. Derived usage data is removed until Full reindex.</p>
+          <p>Provider source files are untouched. Unibase is fully cleared and automatically rebuilt from every enabled source.</p>
           <label>Type <strong>RESET UNIBASE</strong><input id="reset-confirm-input" autocomplete="off" value="${escapeHtml(resetConfirmation)}"></label>
           <div class="settings-actions"><button class="reset-cancel" type="button">Cancel</button><button class="danger" id="reset-confirm-submit" type="submit" ${resetConfirmation === "RESET UNIBASE" ? "" : "disabled"}>Reset</button></div>
         </form>
@@ -1369,19 +1426,19 @@ function renderSettingsDialog() {
 
 async function openSettings() {
   const startedAt = Date.now();
+  if (!settingsOpen) settingsActiveTab = "general";
   settingsOpen = true;
   settingsLoading = true;
   settingsError = null;
+  settingsApplyPending = false;
+  settingsApplied = false;
   render(currentData);
   console.info("[MeterMesh timing] settings fetch started");
   try {
     const response = await fetch("/api/settings", { cache: "no-store" });
     if (!response.ok) throw new Error(`Settings API returned HTTP ${response.status}`);
     settingsData = await response.json();
-    settingsDraft = {
-      ignore_codex_auto_review: settingsData.ignore_codex_auto_review,
-      backups: Object.values(settingsData.backups).flat().map(({ source_id, enabled }) => ({ source_id, enabled }))
-    };
+    settingsDraft = settingsDraftFromData(settingsData);
     console.info("[MeterMesh timing] settings fetch completed", { elapsedMs: Date.now() - startedAt });
   } catch (error) {
     console.error("[MeterMesh timing] settings fetch failed", { elapsedMs: Date.now() - startedAt, error });
@@ -1400,10 +1457,12 @@ async function openSettings() {
 }
 
 function closeSettings() {
+  if (settingsApplyPending) return;
   settingsOpen = false;
   resetConfirmOpen = false;
   resetConfirmation = "";
   settingsError = null;
+  settingsApplied = false;
   if (operationPollTimer) window.clearTimeout(operationPollTimer);
   operationPollTimer = null;
   render(currentData);
@@ -1416,12 +1475,45 @@ function invalidateDashboardCaches() {
   invalidateRequests();
 }
 
+async function refreshSourceChanges() {
+  if (manualRefreshPending) return;
+  manualRefreshPending = true;
+  render(currentData);
+  try {
+    const response = await fetch("/api/sources/refresh", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}"
+    });
+    if (response.status === 409) {
+      const conflict = await response.json();
+      if (currentData && conflict.source_sync) render({ ...currentData, sync: conflict.source_sync });
+      return;
+    }
+    if (!response.ok) throw new Error(`Source refresh returned HTTP ${response.status}`);
+    while (true) {
+      await new Promise((resolve) => window.setTimeout(resolve, 500));
+      const statusResponse = await fetch(`/api/unibase/status?provider=${encodeURIComponent(activeProvider)}`, { cache: "no-store" });
+      if (!statusResponse.ok) throw new Error(`Sync status returned HTTP ${statusResponse.status}`);
+      const status = await statusResponse.json();
+      if (status.source_sync?.state === "running") continue;
+      if (status.source_sync?.error) throw new Error(status.source_sync.error);
+      break;
+    }
+    invalidateDashboardCaches();
+    await refresh();
+  } finally {
+    manualRefreshPending = false;
+    if (currentData) render(currentData);
+  }
+}
+
 function scheduleSourceSyncPoll(data) {
   if (sourceSyncPollTimer) window.clearTimeout(sourceSyncPollTimer);
   const delay = data.sync?.state === "running" ? 1000 : 30000;
   sourceSyncPollTimer = window.setTimeout(async () => {
     try {
-      const response = await fetch("/api/unibase/status", { cache: "no-store" });
+      const response = await fetch(`/api/unibase/status?provider=${encodeURIComponent(activeProvider)}`, { cache: "no-store" });
       if (!response.ok) throw new Error(`Sync status returned HTTP ${response.status}`);
       const payload = await response.json();
       if (!currentData) return;
@@ -1432,8 +1524,9 @@ function scheduleSourceSyncPoll(data) {
         return;
       }
       const nextSync = payload.source_sync || currentData.sync;
-      if (nextSync?.state !== currentData.sync?.state) {
-        render({ ...currentData, sync: nextSync });
+      if (nextSync?.state !== currentData.sync?.state || payload.fresh_at !== currentData.fresh_at) {
+        const freshAt = Object.hasOwn(payload, "fresh_at") ? payload.fresh_at : currentData.fresh_at;
+        render({ ...currentData, sync: nextSync, fresh_at: freshAt });
       } else {
         scheduleSourceSyncPoll(currentData);
       }
@@ -1444,23 +1537,45 @@ function scheduleSourceSyncPoll(data) {
   }, delay);
 }
 
+function renderSettingsUpdate() {
+  const dialog = document.querySelector("#settings-dialog");
+  const scrollTop = dialog?.scrollTop || 0;
+  const focusedId = dialog?.contains(document.activeElement) ? document.activeElement.id : "";
+  render(currentData);
+  const nextDialog = document.querySelector("#settings-dialog");
+  if (nextDialog) nextDialog.scrollTop = scrollTop;
+  if (focusedId) document.getElementById(focusedId)?.focus({ preventScroll: true });
+}
+
 async function pollOperation(operationId) {
-  const response = await fetch(`/api/unibase/status?operation_id=${encodeURIComponent(operationId)}`, { cache: "no-store" });
-  if (!response.ok) throw new Error(`Operation status returned HTTP ${response.status}`);
-  const payload = await response.json();
+  operationPollTimer = null;
+  let payload;
+  try {
+    const params = new URLSearchParams({ operation_id: operationId, provider: activeProvider });
+    const response = await fetch(`/api/unibase/status?${params}`, { cache: "no-store" });
+    if (!response.ok) throw new Error(`Operation status returned HTTP ${response.status}`);
+    payload = await response.json();
+  } catch (error) {
+    if (!settingsOpen) return;
+    settingsError = `${error.message} Retrying…`;
+    renderSettingsUpdate();
+    if (settingsOpen) {
+      operationPollTimer = window.setTimeout(() => pollOperation(operationId), 1500);
+    }
+    return;
+  }
+  if (!settingsOpen) return;
+  settingsError = null;
   settingsData.unibase.current_operation = payload.operation;
   settingsData.unibase.generation = payload.generation;
   settingsData.unibase.state = payload.state;
-  render(currentData);
+  renderSettingsUpdate();
   if (payload.operation && ["queued", "running"].includes(payload.operation.state)) {
-    operationPollTimer = window.setTimeout(() => pollOperation(operationId).catch((error) => {
-      settingsError = error.message;
-      render(currentData);
-    }), 600);
+    if (settingsOpen) operationPollTimer = window.setTimeout(() => pollOperation(operationId), 600);
   } else if (payload.operation?.state === "succeeded") {
     invalidateDashboardCaches();
     await refresh();
-    await openSettings();
+    if (settingsOpen) await openSettings();
   }
 }
 
@@ -1559,7 +1674,11 @@ function render(data) {
   const indexingNote = data.indexing
     ? ` · ${full(data.indexing.events)} events from ${full(data.indexing.files)} JSONL files`
     : "";
-  const syncNote = data.sync?.state === "running" ? " · syncing sources in background" : "";
+  const syncRunning = data.sync?.state === "running" || manualRefreshPending;
+  const syncNote = syncRunning ? " · syncing sources" : "";
+  const freshnessLabel = data.fresh_at
+    ? `Unibase current as of ${formatTimestamp(data.fresh_at)}`
+    : "Unibase not fully synced";
   const rangeSummary = customRangePending ? "Choose custom range" : describeRange(data);
   document.documentElement.dataset.provider = provider;
   document.documentElement.classList.toggle("custom-range-modal-open", customRangeOpen || chartCustomRangeOpen);
@@ -1576,7 +1695,7 @@ function render(data) {
             <span class="brand-scope">${escapeHtml(providerLabel)}</span>
           </div>
           <div class="brand-meta">
-            <span>Generated ${escapeHtml(data.generated_at)} from ${escapeHtml(data.data_source || "Unibase")}${indexingNote}${syncNote}</span>
+            <span class="freshness-line">${escapeHtml(freshnessLabel)}${indexingNote}${syncNote}<button class="source-refresh-trigger ${syncRunning ? "is-spinning" : ""}" id="source-refresh-trigger" type="button" aria-label="Check for source changes" title="Check for source changes" ${syncRunning ? "disabled" : ""}>${icon("refresh")}</button></span>
             <strong>Showing ${escapeHtml(rangeSummary)}</strong>
           </div>
         </div>
@@ -1708,6 +1827,12 @@ function render(data) {
   });
 
   document.querySelector("#settings-trigger")?.addEventListener("click", openSettings);
+  document.querySelector("#source-refresh-trigger")?.addEventListener("click", () => {
+    refreshSourceChanges().catch((error) => {
+      console.error("[MeterMesh timing] manual source refresh failed", error);
+      window.alert(`Could not refresh sources: ${error.message}`);
+    });
+  });
 
   document.querySelectorAll("[data-range]").forEach((button) => {
     button.addEventListener("click", () => {
@@ -1809,42 +1934,71 @@ function render(data) {
     });
     const syncDirtyControls = () => {
       const dirty = settingsIsDirty();
-      settingsDialog.querySelector(".settings-apply")?.toggleAttribute("disabled", !dirty);
-      settingsDialog.querySelector("#full-reindex")?.toggleAttribute("disabled", dirty);
+      const applyButton = settingsDialog.querySelector(".settings-apply");
+      applyButton?.toggleAttribute("disabled", !dirty);
+      if (applyButton) applyButton.textContent = settingsApplied && !dirty ? "Applied" : "Apply";
+      settingsDialog.querySelector("#resync-unibase")?.toggleAttribute("disabled", dirty || settingsData.unibase.state === "reset_empty");
       settingsDialog.querySelector("#reset-unibase")?.toggleAttribute("disabled", dirty);
     };
+    settingsDialog.querySelectorAll("[data-settings-tab]").forEach((button) => {
+      button.addEventListener("click", () => {
+        settingsActiveTab = button.dataset.settingsTab;
+        renderSettingsUpdate();
+      });
+    });
     settingsDialog.querySelector("#settings-auto-review")?.addEventListener("change", (event) => {
+      settingsApplied = false;
       settingsDraft.ignore_codex_auto_review = event.target.checked;
+      syncDirtyControls();
+    });
+    settingsDialog.querySelector("#settings-codex-deduplication")?.addEventListener("change", (event) => {
+      settingsApplied = false;
+      settingsDraft.experimental_codex_deduplication = event.target.checked;
       syncDirtyControls();
     });
     settingsDialog.querySelectorAll("[data-settings-source]").forEach((input) => {
       input.addEventListener("change", () => {
-        const source = settingsDraft.backups.find((item) => item.source_id === input.dataset.settingsSource);
+        settingsApplied = false;
+        const source = settingsDraft.sources.find((item) => item.source_id === input.dataset.settingsSource);
         if (source) source.enabled = input.checked;
+        syncDirtyControls();
+      });
+    });
+    settingsDialog.querySelectorAll("[data-settings-model]").forEach((input) => {
+      input.addEventListener("change", () => {
+        settingsApplied = false;
+        const model = settingsDraft.models.find((item) => item.model === input.dataset.settingsModel);
+        if (model) model.enabled = input.checked;
         syncDirtyControls();
       });
     });
     settingsDialog.querySelector("#settings-form")?.addEventListener("submit", async (event) => {
       event.preventDefault();
+      if (settingsApplyPending || !settingsIsDirty()) return;
+      const body = JSON.stringify({ revision: settingsData.revision, ...settingsDraft });
+      settingsApplyPending = true;
+      settingsApplied = false;
       settingsError = null;
+      renderSettingsUpdate();
       try {
         const response = await fetch("/api/settings", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ revision: settingsData.revision, ...settingsDraft })
+          body
         });
         if (!response.ok) throw new Error(response.status === 409 ? "Settings changed in another window. Reopen Settings." : `Settings API returned HTTP ${response.status}`);
         settingsData = await response.json();
-        settingsDraft = {
-          ignore_codex_auto_review: settingsData.ignore_codex_auto_review,
-          backups: Object.values(settingsData.backups).flat().map(({ source_id, enabled }) => ({ source_id, enabled }))
-        };
+        settingsDraft = settingsDraftFromData(settingsData);
+        settingsApplyPending = false;
+        settingsApplied = true;
         invalidateDashboardCaches();
         syncUrl();
         await refresh();
       } catch (error) {
+        settingsApplyPending = false;
+        settingsApplied = false;
         settingsError = error.message;
-        render(data);
+        renderSettingsUpdate();
       }
     });
     settingsDialog.querySelector("#reset-unibase")?.addEventListener("click", () => {
@@ -1852,17 +2006,17 @@ function render(data) {
       resetConfirmation = "";
       render(data);
     });
-    settingsDialog.querySelector("#full-reindex")?.addEventListener("click", async () => {
+    settingsDialog.querySelector("#resync-unibase")?.addEventListener("click", async () => {
       settingsError = null;
       try {
-        const response = await fetch("/api/unibase/reindex", {
+        const response = await fetch("/api/unibase/resync", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: "{}"
         });
-        if (!response.ok) throw new Error(`Full reindex returned HTTP ${response.status}`);
+        if (!response.ok) throw new Error(`Resync returned HTTP ${response.status}`);
         const payload = await response.json();
-        settingsData.unibase.current_operation = { kind: "full_reindex", state: "queued", progress_current: 0, progress_total: 0 };
+        settingsData.unibase.current_operation = { kind: "resync", state: "queued", progress_current: 0, progress_total: 0 };
         render(data);
         await pollOperation(payload.operation_id);
       } catch (error) {
@@ -1900,15 +2054,12 @@ function render(data) {
           body: JSON.stringify({ confirmation: resetConfirmation })
         });
         if (!response.ok) throw new Error(`Reset returned HTTP ${response.status}`);
-        settingsData = await response.json();
-        settingsDraft = {
-          ignore_codex_auto_review: settingsData.ignore_codex_auto_review,
-          backups: Object.values(settingsData.backups).flat().map(({ source_id, enabled }) => ({ source_id, enabled }))
-        };
+        const payload = await response.json();
+        settingsData.unibase.current_operation = { kind: "reset", state: "queued", progress_current: 0, progress_total: 0 };
         resetConfirmOpen = false;
         resetConfirmation = "";
-        invalidateDashboardCaches();
-        await refresh();
+        render(data);
+        await pollOperation(payload.operation_id);
       } catch (error) {
         settingsError = error.message;
         resetConfirmOpen = false;

@@ -13,7 +13,7 @@ from unibase import ClosingConnection, Unibase, sanitize_error, stable_id
 
 DEFAULT_CLAUDE_PROJECTS = Path.home() / ".claude" / "projects"
 DEFAULT_CLAUDE_DB = Path.home() / ".claude" / "usage-dashboard.sqlite"
-PARSER_VERSION = 2
+PARSER_VERSION = 3
 
 
 SCHEMA = """
@@ -216,7 +216,13 @@ def _prefix_hash(path: Path, size: int) -> str:
     return digest.hexdigest()
 
 
-def import_claude_source(unibase: Unibase, source: dict) -> dict[str, int]:
+def import_claude_source(
+    unibase: Unibase,
+    source: dict,
+    *,
+    force_full_scan: bool = False,
+    non_destructive: bool = False,
+) -> dict[str, int]:
     source_id = str(source["source_id"])
     root = Path(source["root_path"])
     files = claude_usage_files(root)
@@ -241,7 +247,9 @@ def import_claude_source(unibase: Unibase, source: dict) -> dict[str, int]:
             replaced = bool(
                 previous
                 and (
-                    stat.st_size < offset
+                    force_full_scan
+                    or int(previous.get("parser_version") or 0) != PARSER_VERSION
+                    or stat.st_size < offset
                     or (stat.st_size == int(previous["size"]) and stat.st_mtime_ns != int(previous["mtime_ns"]))
                     or (
                         offset > 0
@@ -282,9 +290,14 @@ def import_claude_source(unibase: Unibase, source: dict) -> dict[str, int]:
                             processed_records += 1
                     final_offset = handle.tell()
                 if replaced:
-                    dirty_event_keys.update(
-                        unibase.replace_source_file_events(source_id, source_file_id, parsed_events, scan_generation)
-                    )
+                    if non_destructive:
+                        dirty_event_keys.update(
+                            unibase.add_events(source_id, source_file_id, parsed_events, scan_generation)
+                        )
+                    else:
+                        dirty_event_keys.update(
+                            unibase.replace_source_file_events(source_id, source_file_id, parsed_events, scan_generation)
+                        )
                 else:
                     dirty_event_keys.update(
                         unibase.add_events(source_id, source_file_id, parsed_events, scan_generation)
@@ -302,12 +315,16 @@ def import_claude_source(unibase: Unibase, source: dict) -> dict[str, int]:
                 scan_generation=scan_generation,
                 parser_version=PARSER_VERSION,
             )
+        retained_paths = set(seen_paths)
+        if non_destructive:
+            retained_paths.update(unibase.source_file_keys(source_id))
         unibase.reconcile_source_files(
             source_id,
             scan_generation,
-            seen_paths,
+            retained_paths,
             rebuild_active=False,
             dirty_event_keys=dirty_event_keys,
+            complete=not non_destructive,
         )
     except Exception as exc:
         unibase.mark_source_error(source_id, sanitize_error(exc) or "Claude import failed")

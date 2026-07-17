@@ -30,10 +30,21 @@ class AllProviderTests(unittest.TestCase):
             "error": None,
         }
 
-    def add_event(self, provider, input_tokens, cache_read, cache_write, output, cost, cost_kind):
+    def add_event(
+        self,
+        provider,
+        input_tokens,
+        cache_read,
+        cache_write,
+        output,
+        cost,
+        cost_kind,
+        *,
+        event_key="same-native-id",
+    ):
         self.db.add_event(f"{provider}-live", None, {
             "provider": provider,
-            "event_key": "same-native-id",
+            "event_key": event_key,
             "stream_key": "same-session-id",
             "timestamp_utc": "2026-07-16T12:00:00Z",
             "occurred_at": 1784203200,
@@ -199,7 +210,6 @@ class AllProviderTests(unittest.TestCase):
         totals = data["totals"]
         self.assertEqual(totals["cached_input_tokens"], totals["cache_read_input_tokens"] + totals["cache_creation_input_tokens"])
         self.assertEqual(totals["total_with_cached_tokens"], totals["total_tokens"] + totals["cached_input_tokens"])
-
 
 if __name__ == "__main__":
     unittest.main()

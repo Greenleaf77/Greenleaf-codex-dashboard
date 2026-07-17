@@ -21,9 +21,12 @@ from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from claude_usage import DEFAULT_CLAUDE_DB, DEFAULT_CLAUDE_PROJECTS, index_claude_usage, load_claude_events
+from claude_usage import DEFAULT_CLAUDE_DB, DEFAULT_CLAUDE_PROJECTS, PARSER_VERSION as CLAUDE_PARSER_VERSION
+from claude_usage import index_claude_usage, load_claude_events
 from claude_usage import import_claude_source
+from codex_usage import active_parser_version as codex_parser_version
 from codex_usage import import_codex_source
+from opencode_usage import PARSER_VERSION as OPENCODE_PARSER_VERSION
 from opencode_usage import import_opencode_source, resolve_opencode_db
 from unibase import (
     OPERATION_LOCKS,
@@ -52,15 +55,15 @@ USAGE_RESPONSE_CACHE_SECONDS = 30.0
 USAGE_RESPONSE_CACHE_MAX_ENTRIES = 32
 USAGE_RESPONSE_CACHE_LOCK = threading.Lock()
 USAGE_RESPONSE_CACHE: OrderedDict[tuple[object, ...], tuple[float, dict]] = OrderedDict()
-SOURCE_REFRESH_DEBOUNCE_SECONDS = 300.0
 SOURCE_REFRESH_STATE_LOCK = threading.Lock()
 SOURCE_REFRESH_RUNNING = False
-SOURCE_REFRESH_LAST_STARTED = 0.0
+SOURCE_REFRESH_COMPLETED_MONOTONIC = 0.0
 SOURCE_REFRESH_STARTED_AT: str | None = None
 SOURCE_REFRESH_COMPLETED_AT: str | None = None
 SOURCE_REFRESH_REASON: str | None = None
 SOURCE_REFRESH_ERROR: str | None = None
 SOURCE_REFRESH_SCHEDULER_POLL_SECONDS = 30.0
+SOURCE_REFRESH_SCHEDULER_COOLDOWN_SECONDS = 60.0
 FALLBACK_PRICING = {
     "gpt-5.5": {
         "input_cost_per_token": 0.000005,
@@ -1239,7 +1242,7 @@ def _usage_where(
     end_ts: int | None,
     ignore_auto_review: bool,
 ) -> tuple[str, list[object]]:
-    clauses = []
+    clauses = ["model not in (select model from disabled_models)"]
     params: list[object] = []
     if provider != "all":
         clauses.append("provider = ?")
@@ -1571,7 +1574,15 @@ def _diagnostics_from_unibase(unibase: Unibase, provider: str, groups: list[dict
     with unibase.connect(readonly=True) as conn:
         conflicts = int(
             conn.execute(
-                "select count(*) from canonical_events where conflict_state = 'conflict' and (? = 'all' or provider = ?)",
+                """
+                select count(*)
+                from canonical_events canonical
+                join active_events active
+                  on active.provider = canonical.provider and active.event_key = canonical.event_key
+                where canonical.conflict_state = 'conflict'
+                  and active.model not in (select model from disabled_models)
+                  and (? = 'all' or canonical.provider = ?)
+                """,
                 (provider, provider),
             ).fetchone()[0]
         )
@@ -1959,6 +1970,7 @@ def load_requests(
         if ignore_auto_review:
             clauses.append("not (provider = 'codex' and model = ?)")
             params.append(AUTO_REVIEW_MODEL)
+        clauses.append("model not in (select model from disabled_models)")
         base_where = " where " + " and ".join(clauses) if clauses else ""
         max_event_id = int(conn.execute(
             "select coalesce(max(canonical_event_id), 0) from active_events" + base_where,
@@ -1987,9 +1999,9 @@ def load_requests(
                    coalesce(sum(cost_usd), 0) cost_sum,
                    coalesce(sum(length(model)), 0) model_length_sum,
                    coalesce(sum(length(stream_key)), 0) stream_length_sum,
-                   sum(cost_kind = 'recorded') recorded_count,
-                   sum(cost_kind = 'estimated') estimated_count,
-                   sum(cost_kind = 'unavailable') unavailable_count
+                    sum(cost_kind = 'recorded') recorded_count,
+                    sum(cost_kind = 'estimated') estimated_count,
+                     sum(cost_kind = 'unavailable') unavailable_count
             from active_events
         """ + snapshot_where
         digest_started_at = time.perf_counter()
@@ -2132,27 +2144,91 @@ def display_path(path: Path) -> str:
         return path.name
 
 
+def unibase_freshness(database: Unibase, provider: str = "all") -> str | None:
+    with database.connect(readonly=True) as conn:
+        clauses = ["enabled = 1"]
+        params: list[object] = []
+        if provider != "all":
+            clauses.append("provider = ?")
+            params.append(provider)
+        row = conn.execute(
+            """
+            select count(*) enabled_count,
+                   sum(last_successful_scan is not null and stale = 0 and discovery_status = 'ready') ready_count,
+                   min(last_successful_scan) fresh_at
+            from sources where """ + " and ".join(clauses),
+            params,
+        ).fetchone()
+        if not row["enabled_count"] or row["ready_count"] != row["enabled_count"]:
+            return None
+        return row["fresh_at"]
+
+
+def source_parser_outdated(database: Unibase, source: dict) -> bool:
+    settings = database.settings()
+    expected = {
+        "codex": codex_parser_version(bool(settings["experimental_codex_deduplication"])),
+        "claude": CLAUDE_PARSER_VERSION,
+        "opencode": OPENCODE_PARSER_VERSION,
+    }[source["provider"]]
+    with database.connect(readonly=True) as conn:
+        return conn.execute(
+            "select 1 from source_files where source_id = ? and parser_version != ? limit 1",
+            (source["source_id"], expected),
+        ).fetchone() is not None
+
+
 def settings_payload(unibase_path: Path) -> dict:
     database = Unibase(unibase_path, migrate=False)
     settings = database.settings()
     groups = {provider: [] for provider in ("codex", "claude", "opencode")}
-    for row in database.sources():
-        if row["kind"] == "live":
-            continue
+    model_groups = {group: [] for group in ("gpt", "claude", "others")}
+    with database.connect(readonly=True) as conn:
+        rows = conn.execute(
+            """
+            select s.*, coalesce(sum(sf.size), 0) size_bytes
+            from sources s
+            left join source_files sf on sf.source_id = s.source_id
+            group by s.source_id
+            order by s.provider, s.priority desc, coalesce(s.snapshot_date, '') desc, s.source_id
+            """
+        ).fetchall()
+        model_rows = conn.execute(
+            """
+            select inventory.model, disabled.model is null enabled
+            from (
+                select model from active_events
+                union
+                select model from disabled_models
+            ) inventory
+            left join disabled_models disabled on disabled.model = inventory.model
+            order by lower(inventory.model), inventory.model
+            """
+        ).fetchall()
+    for row in rows:
         groups[row["provider"]].append({
             "source_id": row["source_id"],
             "label": row["label"],
             "relative_name": row["relative_name"],
+            "path": display_path(Path(row["root_path"])) if row["kind"] == "live" else row["relative_name"],
+            "kind": row["kind"],
+            "original": row["kind"] == "live",
             "enabled": bool(row["enabled"]),
-            "layout": "Normalized" if row["kind"] == "normalized_backup" else "Legacy layout",
+            "layout": "Original source" if row["kind"] == "live" else "Snapshot" if row["kind"] == "normalized_backup" else "Imported source",
             "snapshot_date": row["snapshot_date"],
             "status": row["discovery_status"],
             "stale": bool(row["stale"]),
             "file_count": row["file_count"],
             "event_count": row["event_count"],
+            "size_bytes": int(row["size_bytes"]),
             "last_successful_scan": row["last_successful_scan"],
             "error": row["error"],
         })
+    for row in model_rows:
+        model = str(row["model"])
+        normalized = model.upper()
+        group = "gpt" if "GPT" in normalized else "claude" if "CLAUDE" in normalized else "others"
+        model_groups[group].append({"model": model, "enabled": bool(row["enabled"])})
     with database.connect(readonly=True) as conn:
         counts = {
             "active_events": int(conn.execute("select count(*) from active_events").fetchone()[0]),
@@ -2162,12 +2238,15 @@ def settings_payload(unibase_path: Path) -> dict:
     return {
         "revision": settings["revision"],
         "ignore_codex_auto_review": bool(settings["ignore_codex_auto_review"]),
-        "backups": groups,
+        "experimental_codex_deduplication": bool(settings["experimental_codex_deduplication"]),
+        "sources": groups,
+        "models": model_groups,
         "unibase": {
             "path": display_path(unibase_path),
             "generation": settings["generation"],
             "state": settings["state"],
             "counts": counts,
+            "fresh_at": unibase_freshness(database),
             "current_operation": database.active_operation(),
         },
     }
@@ -2179,6 +2258,8 @@ def import_registered_source(
     opencode_live_db: Path | None = None,
     codex_state_db: Path | None = None,
     require_codex_state_inventory: bool = False,
+    force_full_scan: bool = False,
+    non_destructive: bool = False,
 ) -> None:
     with OPERATION_LOCKS.acquire("maintenance"):
         if database.settings()["state"] == "reset_empty":
@@ -2191,14 +2272,30 @@ def import_registered_source(
                         database,
                         source,
                         ignore_auto_review=False,
+                        experimental_deduplication=bool(
+                            database.settings()["experimental_codex_deduplication"]
+                        ),
                         state_path=state_path,
                         require_state_inventory=require_codex_state_inventory and source["kind"] == "live",
+                        force_full_scan=force_full_scan,
+                        non_destructive=non_destructive,
                     )
                 elif source["provider"] == "claude":
-                    import_claude_source(database, source)
+                    import_claude_source(
+                        database,
+                        source,
+                        force_full_scan=force_full_scan,
+                        non_destructive=non_destructive,
+                    )
                 else:
                     override = opencode_live_db if source["kind"] == "live" else None
-                    import_opencode_source(database, source, db_override=override)
+                    import_opencode_source(
+                        database,
+                        source,
+                        db_override=override,
+                        force_full_scan=force_full_scan,
+                        non_destructive=non_destructive,
+                    )
         except Exception as exc:
             database.mark_source_error(str(source["source_id"]), exc)
             raise
@@ -2211,13 +2308,16 @@ def refresh_enabled_sources(
     codex_root: Path | None = None,
     codex_state_db: Path | None = None,
     claude_root: Path | None = None,
+    force_full_scan: bool = False,
 ) -> None:
     started_at = time.perf_counter()
     database = Unibase(unibase_path)
+    errors = []
     with OPERATION_LOCKS.acquire("maintenance"):
-        if database.settings()["state"] == "reset_empty" or database.active_operation():
-            print("[MeterMesh timing] source refresh skipped: Unibase maintenance state", flush=True)
-            return
+        if database.settings()["state"] == "reset_empty":
+            raise OperationConflict("Unibase is empty; use Reset to rebuild it")
+        if database.active_operation():
+            raise OperationConflict("A Unibase operation is already running")
         discovery_started_at = time.perf_counter()
         register_default_sources(
             database,
@@ -2234,12 +2334,26 @@ def refresh_enabled_sources(
         for source in sources:
             if not source["enabled"] or source["discovery_status"] in {"incomplete", "ambiguous", "unavailable"}:
                 continue
-            if source["kind"] != "live" and source["discovery_status"] == "ready" and source["last_successful_scan"]:
+            if (
+                not force_full_scan
+                and not source["stale"]
+                and source["kind"] != "live"
+                and source["discovery_status"] == "ready"
+                and source["last_successful_scan"]
+                and not source_parser_outdated(database, source)
+            ):
                 continue
+            source_force_full_scan = force_full_scan or bool(source["stale"])
             source_started_at = time.perf_counter()
             source_name = f'{source["provider"]}/{source["relative_name"]}'
             try:
-                import_registered_source(database, source, opencode_live_db, codex_state_db)
+                import_registered_source(
+                    database,
+                    source,
+                    opencode_live_db,
+                    codex_state_db,
+                    force_full_scan=source_force_full_scan,
+                )
             except Exception as exc:  # noqa: BLE001
                 print(
                     f"[MeterMesh timing] source import {source_name}: "
@@ -2247,6 +2361,7 @@ def refresh_enabled_sources(
                     f"error={exc.__class__.__name__}: {exc}",
                     flush=True,
                 )
+                errors.append(f'{source["provider"]}: {sanitize_error(exc)}')
                 continue
             print(
                 f"[MeterMesh timing] source import {source_name}: "
@@ -2257,6 +2372,8 @@ def refresh_enabled_sources(
         f"[MeterMesh timing] source refresh total: {(time.perf_counter() - started_at) * 1000:.0f} ms",
         flush=True,
     )
+    if errors:
+        raise RuntimeError("; ".join(errors))
 
 
 def source_refresh_running() -> bool:
@@ -2275,6 +2392,32 @@ def source_refresh_status() -> dict[str, object]:
         }
 
 
+def wait_for_source_refresh() -> None:
+    while source_refresh_running():
+        time.sleep(0.1)
+
+
+def source_refresh_cooldown_remaining(now: float | None = None) -> float:
+    with SOURCE_REFRESH_STATE_LOCK:
+        completed_at = SOURCE_REFRESH_COMPLETED_MONOTONIC
+    if not completed_at:
+        return 0.0
+    current = time.monotonic() if now is None else now
+    return max(SOURCE_REFRESH_SCHEDULER_COOLDOWN_SECONDS - (current - completed_at), 0.0)
+
+
+def wait_for_source_refresh_window() -> None:
+    while True:
+        if source_refresh_running():
+            wait_for_source_refresh()
+            continue
+        cooldown = source_refresh_cooldown_remaining()
+        if cooldown:
+            time.sleep(cooldown)
+            continue
+        return
+
+
 def schedule_enabled_sources_refresh(
     unibase_path: Path,
     opencode_live_db: Path | None = None,
@@ -2283,26 +2426,31 @@ def schedule_enabled_sources_refresh(
     codex_state_db: Path | None = None,
     claude_root: Path | None = None,
     reason: str,
+    force_full_scan: bool = False,
+    respect_cooldown: bool = False,
 ) -> bool:
-    global SOURCE_REFRESH_ERROR, SOURCE_REFRESH_LAST_STARTED, SOURCE_REFRESH_REASON
+    global SOURCE_REFRESH_ERROR, SOURCE_REFRESH_REASON
     global SOURCE_REFRESH_RUNNING, SOURCE_REFRESH_STARTED_AT
 
-    now = time.monotonic()
+    if Unibase(unibase_path, migrate=False).settings()["state"] == "reset_empty":
+        print(f"[MeterMesh timing] source refresh not scheduled: Unibase is empty; reason={reason}", flush=True)
+        return False
     with SOURCE_REFRESH_STATE_LOCK:
         if SOURCE_REFRESH_RUNNING:
             print(f"[MeterMesh timing] source refresh not scheduled: already running; reason={reason}", flush=True)
             return False
-        if now - SOURCE_REFRESH_LAST_STARTED < SOURCE_REFRESH_DEBOUNCE_SECONDS:
-            print(f"[MeterMesh timing] source refresh not scheduled: debounced; reason={reason}", flush=True)
-            return False
+        if respect_cooldown and SOURCE_REFRESH_COMPLETED_MONOTONIC:
+            elapsed = time.monotonic() - SOURCE_REFRESH_COMPLETED_MONOTONIC
+            if elapsed < SOURCE_REFRESH_SCHEDULER_COOLDOWN_SECONDS:
+                print(f"[MeterMesh timing] source refresh not scheduled: cooldown; reason={reason}", flush=True)
+                return False
         SOURCE_REFRESH_RUNNING = True
-        SOURCE_REFRESH_LAST_STARTED = now
         SOURCE_REFRESH_STARTED_AT = dt.datetime.now(dt.timezone.utc).isoformat()
         SOURCE_REFRESH_REASON = reason
         SOURCE_REFRESH_ERROR = None
 
     def worker() -> None:
-        global SOURCE_REFRESH_COMPLETED_AT, SOURCE_REFRESH_ERROR, SOURCE_REFRESH_LAST_STARTED
+        global SOURCE_REFRESH_COMPLETED_AT, SOURCE_REFRESH_COMPLETED_MONOTONIC, SOURCE_REFRESH_ERROR
         global SOURCE_REFRESH_RUNNING
         try:
             print(f"[MeterMesh timing] source refresh started; reason={reason}", flush=True)
@@ -2312,6 +2460,7 @@ def schedule_enabled_sources_refresh(
                 codex_root=codex_root,
                 codex_state_db=codex_state_db,
                 claude_root=claude_root,
+                force_full_scan=force_full_scan,
             )
         except Exception as exc:  # noqa: BLE001
             with SOURCE_REFRESH_STATE_LOCK:
@@ -2320,10 +2469,16 @@ def schedule_enabled_sources_refresh(
         finally:
             with SOURCE_REFRESH_STATE_LOCK:
                 SOURCE_REFRESH_RUNNING = False
-                SOURCE_REFRESH_LAST_STARTED = time.monotonic()
+                SOURCE_REFRESH_COMPLETED_MONOTONIC = time.monotonic()
                 SOURCE_REFRESH_COMPLETED_AT = dt.datetime.now(dt.timezone.utc).isoformat()
 
-    threading.Thread(target=worker, name="metermesh-source-refresh", daemon=True).start()
+    try:
+        threading.Thread(target=worker, name="metermesh-source-refresh", daemon=True).start()
+    except Exception as exc:
+        with SOURCE_REFRESH_STATE_LOCK:
+            SOURCE_REFRESH_RUNNING = False
+            SOURCE_REFRESH_ERROR = sanitize_error(exc)
+        raise
     return True
 
 
@@ -2336,16 +2491,26 @@ def start_source_refresh_scheduler(
     claude_root: Path | None = None,
 ) -> None:
     def worker() -> None:
+        time.sleep(SOURCE_REFRESH_SCHEDULER_POLL_SECONDS)
         while True:
-            time.sleep(SOURCE_REFRESH_SCHEDULER_POLL_SECONDS)
-            schedule_enabled_sources_refresh(
-                unibase_path,
-                opencode_live_db,
-                codex_root=codex_root,
-                codex_state_db=codex_state_db,
-                claude_root=claude_root,
-                reason="periodic",
-            )
+            wait_for_source_refresh_window()
+            try:
+                scheduled = schedule_enabled_sources_refresh(
+                    unibase_path,
+                    opencode_live_db,
+                    codex_root=codex_root,
+                    codex_state_db=codex_state_db,
+                    claude_root=claude_root,
+                    reason="periodic",
+                    respect_cooldown=True,
+                )
+            except Exception as exc:  # noqa: BLE001
+                print(f"[MeterMesh timing] periodic source refresh could not start: {exc}", flush=True)
+                scheduled = False
+            if scheduled:
+                wait_for_source_refresh()
+            else:
+                time.sleep(SOURCE_REFRESH_SCHEDULER_POLL_SECONDS)
 
     threading.Thread(target=worker, name="metermesh-source-scheduler", daemon=True).start()
 
@@ -2355,7 +2520,47 @@ def _checkpoint_database(path: Path) -> None:
         conn.execute("pragma wal_checkpoint(truncate)")
 
 
-def reindex_worker(
+def resync_worker(
+    main_path: Path,
+    operation_id: str,
+    opencode_live_db: Path | None = None,
+    codex_state_db: Path | None = None,
+) -> None:
+    database = Unibase(main_path)
+    errors = []
+    try:
+        if database.settings()["state"] == "reset_empty":
+            raise RuntimeError("Cannot resync an empty Unibase; use Reset to rebuild it")
+        enabled_sources = [source for source in database.sources() if source["enabled"]]
+        total = len(enabled_sources)
+        database.update_operation(operation_id, state="running", current=0, total=total)
+        for index, source in enumerate(enabled_sources, 1):
+            try:
+                import_registered_source(
+                    database,
+                    source,
+                    opencode_live_db,
+                    codex_state_db,
+                    force_full_scan=True,
+                    non_destructive=True,
+                )
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f'{source["provider"]}: {sanitize_error(exc)}')
+            database.update_operation(operation_id, state="running", current=index, total=total)
+        if errors:
+            raise RuntimeError("; ".join(errors))
+        database.update_operation(
+            operation_id,
+            state="succeeded",
+            current=total,
+            total=total,
+            generation=database.settings()["generation"],
+        )
+    except Exception as exc:  # noqa: BLE001
+        database.update_operation(operation_id, state="failed", error=exc)
+
+
+def reset_worker(
     main_path: Path,
     operation_id: str,
     opencode_live_db: Path | None = None,
@@ -2388,6 +2593,7 @@ def reindex_worker(
                 opencode_live_db,
                 codex_state_db,
                 require_codex_state_inventory=codex_live_requires_state,
+                force_full_scan=True,
             )
             main.update_operation(operation_id, state="running", current=index, total=total)
         if not staging.integrity_check():
@@ -2888,11 +3094,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if parsed.path == "/api/settings":
                 self.apply_settings_request()
                 return
+            if parsed.path == "/api/sources/refresh":
+                self.refresh_sources_request()
+                return
             if parsed.path == "/api/unibase/reset":
                 self.reset_unibase_request()
                 return
-            if parsed.path == "/api/unibase/reindex":
-                self.reindex_unibase_request()
+            if parsed.path == "/api/unibase/resync":
+                self.resync_unibase_request()
                 return
             self.send_error(404)
         finally:
@@ -2911,7 +3120,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             try:
                 database = Unibase(self.unibase_path, migrate=False)
                 self.seed_legacy_preference(database)
-                default_ignore = bool(database.settings()["ignore_codex_auto_review"])
+                persisted = database.settings()
+                default_ignore = bool(persisted["ignore_codex_auto_review"])
             except Exception:
                 default_ignore = False
         timezone_name = query.get("timezone", ["UTC"])[0]
@@ -2980,6 +3190,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     while len(USAGE_RESPONSE_CACHE) > USAGE_RESPONSE_CACHE_MAX_ENTRIES:
                         USAGE_RESPONSE_CACHE.popitem(last=False)
             payload["sync"] = source_refresh_status()
+            payload["fresh_at"] = unibase_freshness(Unibase(self.unibase_path, migrate=False), str(filters["provider"]))
             return payload
         return load_usage(
             self.db_path,
@@ -3136,13 +3347,39 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return
         try:
             payload = self.read_json_body()
-            if set(payload) != {"revision", "ignore_codex_auto_review", "backups"}:
+            if set(payload) != {
+                "revision",
+                "ignore_codex_auto_review",
+                "experimental_codex_deduplication",
+                "sources",
+                "models",
+            }:
                 raise ValueError("Unexpected settings fields")
-            if not isinstance(payload["revision"], int) or not isinstance(payload["ignore_codex_auto_review"], bool) or not isinstance(payload["backups"], list):
+            if (
+                not isinstance(payload["revision"], int)
+                or not isinstance(payload["ignore_codex_auto_review"], bool)
+                or not isinstance(payload["experimental_codex_deduplication"], bool)
+                or not isinstance(payload["sources"], list)
+                or not isinstance(payload["models"], list)
+                or not all(
+                    isinstance(item, dict) and set(item) == {"source_id", "enabled"}
+                    for item in payload["sources"]
+                )
+                or not all(
+                    isinstance(item, dict) and set(item) == {"model", "enabled"}
+                    for item in payload["models"]
+                )
+            ):
                 raise ValueError("Invalid settings fields")
             database = Unibase(self.unibase_path)
-            database.apply_settings(payload["revision"], payload["ignore_codex_auto_review"], payload["backups"])
-            schedule_enabled_sources_refresh(
+            database.apply_settings(
+                payload["revision"],
+                payload["ignore_codex_auto_review"],
+                payload["experimental_codex_deduplication"],
+                payload["sources"],
+                payload["models"],
+            )
+            scheduled = schedule_enabled_sources_refresh(
                 self.unibase_path,
                 self.opencode_db_path,
                 codex_root=self.db_path.parent,
@@ -3159,6 +3396,42 @@ class DashboardHandler(BaseHTTPRequestHandler):
         except Exception:
             self.send_json(503, {"error": "Could not apply MeterMesh settings."})
 
+    def refresh_sources_request(self) -> None:
+        if not self.unibase_path:
+            self.send_json(503, {"error": "Unibase is not configured."})
+            return
+        try:
+            payload = self.read_json_body()
+            if payload:
+                raise ValueError("Refresh body must be empty")
+            database = Unibase(self.unibase_path)
+            if database.settings()["state"] == "reset_empty":
+                raise OperationConflict("Unibase is empty; use Reset to rebuild it")
+            if database.active_operation():
+                raise OperationConflict("A Unibase operation is already running")
+            scheduled = schedule_enabled_sources_refresh(
+                self.unibase_path,
+                self.opencode_db_path,
+                codex_root=self.db_path.parent,
+                codex_state_db=self.db_path,
+                claude_root=self.claude_projects_path.parent
+                if self.claude_projects_path.name == "projects" else self.claude_projects_path,
+                reason="manual incremental refresh",
+            )
+            if not scheduled:
+                self.send_json(409, {
+                    "error": "A source refresh is already running",
+                    "source_sync": source_refresh_status(),
+                })
+                return
+            self.send_json(202, source_refresh_status())
+        except OperationConflict as exc:
+            self.send_json(409, {"error": str(exc)})
+        except (ValueError, json.JSONDecodeError):
+            self.send_json(400, {"error": "Invalid refresh payload."})
+        except Exception:
+            self.send_json(503, {"error": "Could not refresh sources."})
+
     def reset_unibase_request(self) -> None:
         if not self.unibase_path:
             self.send_json(503, {"error": "Unibase is not configured."})
@@ -3167,9 +3440,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
             payload = self.read_json_body()
             if payload != {"confirmation": "RESET UNIBASE"}:
                 raise ValueError("Invalid reset confirmation")
-            database = Unibase(self.unibase_path)
-            database.reset()
-            self.send_json(200, settings_payload(self.unibase_path))
+            operation_id = Unibase(self.unibase_path).create_operation("reset")
+            threading.Thread(
+                target=reset_worker,
+                args=(self.unibase_path, operation_id, self.opencode_db_path, self.db_path),
+                name=f"metermesh-reset-{operation_id}",
+                daemon=True,
+            ).start()
+            self.send_json(202, {"operation_id": operation_id})
         except OperationConflict as exc:
             self.send_json(409, {"error": str(exc)})
         except (ValueError, json.JSONDecodeError):
@@ -3177,28 +3455,31 @@ class DashboardHandler(BaseHTTPRequestHandler):
         except Exception:
             self.send_json(503, {"error": "Could not reset Unibase."})
 
-    def reindex_unibase_request(self) -> None:
+    def resync_unibase_request(self) -> None:
         if not self.unibase_path:
             self.send_json(503, {"error": "Unibase is not configured."})
             return
         try:
             payload = self.read_json_body()
             if payload:
-                raise ValueError("Reindex body must be empty")
-            operation_id = Unibase(self.unibase_path).create_operation("full_reindex")
+                raise ValueError("Resync body must be empty")
+            database = Unibase(self.unibase_path)
+            if database.settings()["state"] == "reset_empty":
+                raise OperationConflict("Unibase is empty; use Reset to rebuild it")
+            operation_id = database.create_operation("resync")
             threading.Thread(
-                target=reindex_worker,
+                target=resync_worker,
                 args=(self.unibase_path, operation_id, self.opencode_db_path, self.db_path),
-                name=f"metermesh-reindex-{operation_id}",
+                name=f"metermesh-resync-{operation_id}",
                 daemon=True,
             ).start()
             self.send_json(202, {"operation_id": operation_id})
         except OperationConflict as exc:
             self.send_json(409, {"error": str(exc)})
         except (ValueError, json.JSONDecodeError):
-            self.send_json(400, {"error": "Invalid reindex payload."})
+            self.send_json(400, {"error": "Invalid resync payload."})
         except Exception:
-            self.send_json(503, {"error": "Could not start Full reindex."})
+            self.send_json(503, {"error": "Could not start Resync."})
 
     def serve_unibase_status(self, query_string: str) -> None:
         if not self.unibase_path:
@@ -3206,8 +3487,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return
         query = parse_qs(query_string)
         try:
-            status = Unibase(self.unibase_path, migrate=False).operation_status(query.get("operation_id", [None])[0])
+            database = Unibase(self.unibase_path, migrate=False)
+            status = database.operation_status(query.get("operation_id", [None])[0])
             status["source_sync"] = source_refresh_status()
+            status["fresh_at"] = unibase_freshness(database, normalize_provider(query.get("provider", ["all"])[0]))
             self.send_json(200, status)
         except Exception:
             self.send_json(503, {"error": "Could not read Unibase operation status."})

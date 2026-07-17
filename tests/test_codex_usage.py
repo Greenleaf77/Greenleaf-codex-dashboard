@@ -26,8 +26,16 @@ def exact(timestamp, response_id, token_usage):
     return {"timestamp": timestamp, "type": "event_msg", "payload": {"type": "raw_response_completed", "response_id": response_id, "token_usage": token_usage}}
 
 
-def token(timestamp, last, total):
-    return {"timestamp": timestamp, "type": "event_msg", "payload": {"type": "token_count", "info": {"last_token_usage": last, "total_token_usage": total}}}
+def token(timestamp, last, total=None, rate_limits=None):
+    return {
+        "timestamp": timestamp,
+        "type": "event_msg",
+        "payload": {
+            "type": "token_count",
+            "info": {"last_token_usage": last, "total_token_usage": total or last},
+            "rate_limits": rate_limits,
+        },
+    }
 
 
 def write_rows(path, rows):
@@ -55,8 +63,12 @@ class CodexUsageAdapterTests(unittest.TestCase):
         )
         self.unibase.register_source(self.source)
 
-    def import_source(self):
-        return codex_usage.import_codex_source(self.unibase, self.unibase.sources("codex")[0])
+    def import_source(self, *, experimental=False):
+        return codex_usage.import_codex_source(
+            self.unibase,
+            self.unibase.sources("codex")[0],
+            experimental_deduplication=experimental,
+        )
 
     def test_identical_and_prefix_copies_are_consolidated(self):
         first = [session_meta("session-1"), exact("2026-07-16T12:00:00Z", "response-1", usage(10, 2, 3))]
@@ -194,6 +206,120 @@ class CodexUsageAdapterTests(unittest.TestCase):
         stream_key, _ = codex_usage.rollout_metadata(path, "hash")
         expected = unibase.stable_id("codex", "stream", "123e4567-e89b-12d3-a456-426614174000")
         self.assertEqual(stream_key, expected)
+
+    def test_experimental_deduplication_consolidates_copies_across_rollouts(self):
+        record = token(
+            "2026-07-16T12:00:00Z",
+            {**usage(100, 80, 20, 12), "total_tokens": 120},
+            rate_limits={"primary": {"used_percent": 17}},
+        )
+        for index in range(20):
+            write_rows(
+                self.codex_root / "sessions" / str(index) / f"rollout-{index}.jsonl",
+                [session_meta(f"session-{index}"), record],
+            )
+
+        result = self.import_source(experimental=True)
+        events = self.unibase.active_event_rows("codex")
+
+        self.assertEqual(result["token_count_events"], 20)
+        self.assertEqual(result["unique_usage_records"], 1)
+        self.assertEqual(result["duplicate_usage_events"], 19)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["input_tokens"], 20)
+        self.assertEqual(events[0]["cache_read_tokens"], 80)
+        self.assertEqual(events[0]["output_tokens"], 20)
+        self.assertEqual(events[0]["reasoning_tokens"], 12)
+
+    def test_experimental_deduplication_canonicalizes_rate_limit_key_order(self):
+        last = {**usage(10, 2, 3), "total_tokens": 13}
+        write_rows(self.codex_root / "sessions" / "a" / "rollout-a.jsonl", [
+            session_meta("a"),
+            token("2026-07-16T12:00:00Z", last, rate_limits={"b": 2, "a": {"y": 2, "x": 1}}),
+        ])
+        write_rows(self.codex_root / "sessions" / "b" / "rollout-b.jsonl", [
+            session_meta("b"),
+            token("2026-07-16T12:01:00Z", last, rate_limits={"a": {"x": 1, "y": 2}, "b": 2}),
+        ])
+
+        self.import_source(experimental=True)
+
+        self.assertEqual(len(self.unibase.active_event_rows("codex")), 1)
+
+    def test_experimental_deduplication_keeps_distinct_rate_limits(self):
+        last = {**usage(10, 2, 3), "total_tokens": 13}
+        write_rows(self.codex_root / "sessions" / "a" / "rollout-a.jsonl", [
+            session_meta("a"), token("2026-07-16T12:00:00Z", last, rate_limits={"used": 1}),
+        ])
+        write_rows(self.codex_root / "sessions" / "b" / "rollout-b.jsonl", [
+            session_meta("b"), token("2026-07-16T12:01:00Z", last, rate_limits={"used": 2}),
+        ])
+
+        self.import_source(experimental=True)
+
+        self.assertEqual(len(self.unibase.active_event_rows("codex")), 2)
+
+    def test_experimental_deduplication_uses_earliest_timestamp(self):
+        last = {**usage(10, 2, 3), "total_tokens": 13}
+        limits = {"used": 1}
+        write_rows(self.codex_root / "sessions" / "a-later" / "rollout-later.jsonl", [
+            session_meta("later"), token("2026-07-16T12:05:00Z", last, rate_limits=limits),
+        ])
+        write_rows(self.codex_root / "sessions" / "z-earlier" / "rollout-earlier.jsonl", [
+            session_meta("earlier"), token("2026-07-16T12:00:00Z", last, rate_limits=limits),
+        ])
+
+        self.import_source(experimental=True)
+
+        self.assertEqual(self.unibase.active_event_rows("codex")[0]["timestamp_utc"], "2026-07-16T12:00:00Z")
+
+    def test_experimental_parser_skips_malformed_json_and_normalizes_null_fields(self):
+        path = self.codex_root / "sessions" / "a" / "rollout-a.jsonl"
+        path.parent.mkdir(parents=True)
+        normalized = token(
+            "2026-07-16T12:00:00Z",
+            {
+                "input_tokens": 10,
+                "cached_input_tokens": None,
+                "output_tokens": 4,
+                "reasoning_output_tokens": 3,
+                "total_tokens": 14,
+            },
+            rate_limits=None,
+        )
+        path.write_text(
+            json.dumps(session_meta("a")) + "\n{broken json\n" + json.dumps(normalized) + "\n",
+            encoding="utf-8",
+        )
+
+        result = self.import_source(experimental=True)
+        event = self.unibase.active_event_rows("codex")[0]
+
+        self.assertEqual(result["malformed_lines"], 1)
+        self.assertEqual(event["cache_read_tokens"], 0)
+        self.assertEqual(event["input_tokens"] + event["output_tokens"], 14)
+        self.assertEqual(event["reasoning_tokens"], 3)
+
+    def test_experimental_setting_selects_a_distinct_parser_version(self):
+        path = self.codex_root / "sessions" / "a" / "rollout-a.jsonl"
+        write_rows(path, [
+            session_meta("a"),
+            token("2026-07-16T12:00:00Z", {**usage(10, 2, 3), "total_tokens": 13}),
+        ])
+        sources = [{"source_id": "codex-live", "enabled": True}]
+        self.unibase.apply_settings(1, False, True, sources, [])
+
+        dashboard_api.import_registered_source(self.unibase, self.unibase.sources("codex")[0])
+
+        checkpoint = next(iter(self.unibase.source_file_keys("codex-live")))
+        self.assertEqual(
+            self.unibase.file_checkpoint("codex-live", checkpoint)["parser_version"],
+            codex_usage.DEDUP_PARSER_VERSION,
+        )
+        self.assertFalse(dashboard_api.source_parser_outdated(self.unibase, self.unibase.sources("codex")[0]))
+
+        self.unibase.apply_settings(2, False, False, sources, [])
+        self.assertTrue(dashboard_api.source_parser_outdated(self.unibase, self.unibase.sources("codex")[0]))
 
 
 if __name__ == "__main__":

@@ -10,7 +10,7 @@ import unibase
 
 
 def assistant_event(event_id, session_id, timestamp, model, *, input_tokens=0, cache_creation=0, cache_read=0, output_tokens=0):
-    return {
+    event = {
         "type": "assistant",
         "uuid": event_id,
         "sessionId": session_id,
@@ -27,6 +27,7 @@ def assistant_event(event_id, session_id, timestamp, model, *, input_tokens=0, c
             },
         },
     }
+    return event
 
 
 def write_rows(path, rows, mode="w"):
@@ -174,7 +175,8 @@ class ClaudeUnibaseAdapterTests(unittest.TestCase):
         self.source_root = root / ".claude"
         self.projects_path = self.source_root / "projects"
         self.projects_path.mkdir(parents=True)
-        self.unibase = unibase.Unibase(root / "metermesh" / "unibase.sqlite3")
+        self.unibase_path = root / "metermesh" / "unibase.sqlite3"
+        self.unibase = unibase.Unibase(self.unibase_path)
         self.source = unibase.DiscoveredSource(
             "claude-live", "claude", "live", self.source_root, "live", "Live Claude",
             True, 1000, None, None, "not_indexed",
@@ -263,6 +265,28 @@ class ClaudeUnibaseAdapterTests(unittest.TestCase):
         transcript.unlink()
         removed = self.import_source()
         self.assertEqual(removed["events"], 0)
+
+    def test_normal_refresh_reconciles_deletions_retained_by_resync(self):
+        transcript = self.projects_path / "session.jsonl"
+        first = assistant_event("event-1", "session-1", "2026-07-16T12:00:00Z", "claude-sonnet-5", input_tokens=5)
+        second = assistant_event("event-2", "session-1", "2026-07-16T12:01:00Z", "claude-sonnet-5", input_tokens=7)
+        write_rows(transcript, [first, second])
+        self.import_source()
+        transcript.write_text(json.dumps(first) + "\n", encoding="utf-8")
+
+        claude_usage.import_claude_source(
+            self.unibase,
+            self.unibase.sources("claude")[0],
+            force_full_scan=True,
+            non_destructive=True,
+        )
+
+        self.assertEqual(len(self.unibase.active_event_rows("claude")), 2)
+        self.assertTrue(self.unibase.sources("claude")[0]["stale"])
+        with patch.object(dashboard_api, "register_default_sources"):
+            dashboard_api.refresh_enabled_sources(self.unibase_path)
+        self.assertEqual(len(self.unibase.active_event_rows("claude")), 1)
+        self.assertFalse(self.unibase.sources("claude")[0]["stale"])
 
 
 if __name__ == "__main__":
