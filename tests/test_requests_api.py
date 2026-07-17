@@ -27,7 +27,7 @@ class RequestsApiTests(unittest.TestCase):
             "error": None,
         }
 
-    def add_event(self, index, timestamp, provider="codex"):
+    def add_event(self, index, timestamp, provider="codex", model="gpt-5.5"):
         parsed = dt.datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
         self.db.add_event(f"{provider}-live", None, {
             "provider": provider,
@@ -35,7 +35,7 @@ class RequestsApiTests(unittest.TestCase):
             "stream_key": f"private-session-{index % 3}",
             "timestamp_utc": timestamp,
             "occurred_at": int(parsed.timestamp()),
-            "model": "gpt-5.5",
+            "model": model,
             "native_provider_id": "openai",
             "semantics": "exact" if provider == "codex" else "claude_metadata" if provider == "claude" else "opencode_recorded",
             "classification": "usage_update",
@@ -69,7 +69,7 @@ class RequestsApiTests(unittest.TestCase):
         self.assertTrue(second["has_previous"])
         self.assertEqual(stable["items"][0]["timestamp"], first_timestamp)
 
-    def test_grouped_page_size_counts_branches_and_keeps_all_children(self):
+    def test_grouped_page_size_counts_branches_without_loading_children(self):
         for minute in range(12):
             self.add_event(minute * 2, f"2026-07-16T12:{minute:02d}:10Z")
             self.add_event(minute * 2 + 1, f"2026-07-16T12:{minute:02d}:40Z", provider="claude")
@@ -79,7 +79,64 @@ class RequestsApiTests(unittest.TestCase):
 
         self.assertEqual(payload["total_top_level_rows"], 12)
         self.assertEqual(len(payload["items"]), 10)
-        self.assertTrue(all(branch["count"] == 2 and len(branch["children"]) == 2 for branch in payload["items"]))
+        self.assertTrue(all(branch["count"] == 2 for branch in payload["items"]))
+        self.assertTrue(all(branch["children"] == [] and branch["child_page"] == 0 for branch in payload["items"]))
+
+    def test_grouped_children_use_page_size_and_snapshot(self):
+        for index in range(25):
+            self.add_event(index, f"2026-07-16T12:{index:02d}:00Z")
+        self.db.rebuild_active_events()
+        initial = self.load(group="1h", page_size=10)
+        bucket = initial["items"][0]["bucket_start"]
+        original = dashboard_api._request_item
+
+        with patch.object(dashboard_api, "load_pricing", return_value=self.pricing), patch.object(
+            dashboard_api, "_request_item", wraps=original
+        ) as request_item:
+            second = dashboard_api.load_requests(
+                self.path,
+                group="1h",
+                page_size=10,
+                snapshot=initial["snapshot"],
+                bucket_start=bucket,
+                child_page=2,
+            )
+        third = self.load(
+            group="1h",
+            page_size=10,
+            snapshot=initial["snapshot"],
+            bucket_start=bucket,
+            child_page=3,
+        )
+
+        self.assertEqual(initial["items"][0]["count"], 25)
+        self.assertEqual(initial["items"][0]["child_total_pages"], 3)
+        self.assertEqual(len(second["items"][0]["children"]), 10)
+        self.assertEqual(second["items"][0]["child_page"], 2)
+        self.assertTrue(second["items"][0]["child_has_previous"])
+        self.assertTrue(second["items"][0]["child_has_next"])
+        self.assertEqual(second["items"][0]["children"][0]["input"], 15)
+        self.assertEqual(second["items"][0]["children"][-1]["input"], 6)
+        self.assertEqual(len(third["items"][0]["children"]), 5)
+        self.assertFalse(third["items"][0]["child_has_next"])
+        self.assertEqual(request_item.call_count, 10)
+
+    def test_grouped_windows_and_totals_use_requested_timezone(self):
+        self.add_event(1, "2026-07-16T21:01:00Z")
+        self.add_event(2, "2026-07-16T21:14:00Z")
+        self.add_event(3, "2026-07-16T21:15:00Z")
+        self.db.rebuild_active_events()
+
+        payload = self.load(group="15m", page_size=10, timezone_name="Europe/Moscow")
+
+        self.assertEqual(payload["timezone"], "Europe/Moscow")
+        self.assertEqual(
+            [(item["bucket_start"], item["bucket_end"], item["count"], item["input"]) for item in payload["items"]],
+            [
+                ("2026-07-17T00:15:00+03:00", "2026-07-17T00:30:00+03:00", 1, 4),
+                ("2026-07-17T00:00:00+03:00", "2026-07-17T00:15:00+03:00", 2, 5),
+            ],
+        )
 
     def test_dst_fall_back_hours_are_distinct(self):
         self.add_event(1, "2026-11-01T05:30:00Z")
@@ -90,6 +147,10 @@ class RequestsApiTests(unittest.TestCase):
 
         self.assertEqual(len(payload["items"]), 2)
         self.assertNotEqual(payload["items"][0]["bucket_start"], payload["items"][1]["bucket_start"])
+        self.assertEqual(
+            {item["bucket_end"] for item in payload["items"]},
+            {"2026-11-01T01:00:00-05:00", "2026-11-01T02:00:00-05:00"},
+        )
 
     def test_all_provider_fields_and_privacy(self):
         self.add_event(1, "2026-07-16T12:00:00Z", provider="codex")
@@ -105,6 +166,19 @@ class RequestsApiTests(unittest.TestCase):
         for forbidden in ("private-event", "private-session", "/private/source", "response_id", "event_key", "stream_key"):
             self.assertNotIn(forbidden, encoded)
 
+    def test_committed_auto_review_preference_is_ignored(self):
+        self.add_event(1, "2026-07-16T12:00:00Z")
+        self.add_event(2, "2026-07-16T12:01:00Z", model=dashboard_api.AUTO_REVIEW_MODEL)
+        self.db.update_settings(1, True)
+        self.db.rebuild_active_events()
+
+        payload = self.load()
+
+        self.assertEqual(
+            [item["model"] for item in payload["items"]],
+            ["Codex · codex-auto-review", "Codex · gpt-5.5"],
+        )
+
     def test_invalid_parameters_and_empty_page(self):
         self.db.rebuild_active_events()
         empty = self.load(page=1, page_size=25)
@@ -116,6 +190,10 @@ class RequestsApiTests(unittest.TestCase):
             self.load(page_size=12)
         with self.assertRaises(ValueError):
             self.load(page=0)
+        with self.assertRaises(ValueError):
+            self.load(child_page=0)
+        with self.assertRaises(ValueError):
+            self.load(bucket_start="2026-07-16T12:00:00+00:00")
 
     def test_snapshot_rejects_updates_to_existing_rows(self):
         self.add_event(1, "2026-07-16T12:00:00Z")

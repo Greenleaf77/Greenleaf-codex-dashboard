@@ -12,7 +12,7 @@ from pathlib import Path
 from unibase import Unibase, default_opencode_data_dir, open_source_sqlite_readonly, sanitize_error, stable_id
 
 
-PARSER_VERSION = 1
+PARSER_VERSION = 2
 OVERLAP_MILLISECONDS = 5 * 60 * 1000
 REQUIRED_MESSAGE_COLUMNS = {"id", "session_id", "time_created", "time_updated", "data"}
 ALLOWED_READ_TABLES = {"message", "session"}
@@ -170,7 +170,14 @@ where json_valid(data)
 """
 
 
-def import_opencode_source(unibase: Unibase, source: dict, db_override: Path | None = None) -> dict[str, int | float | str | None]:
+def import_opencode_source(
+    unibase: Unibase,
+    source: dict,
+    db_override: Path | None = None,
+    *,
+    force_full_scan: bool = False,
+    non_destructive: bool = False,
+) -> dict[str, int | float | str | None]:
     source_id = str(source["source_id"])
     source_root = Path(source["root_path"])
     db_path = db_override or (source_root if source_root.name == "opencode.db" else source_root / "opencode.db")
@@ -188,7 +195,8 @@ def import_opencode_source(unibase: Unibase, source: dict, db_override: Path | N
                 raise RuntimeError("Unsupported OpenCode message schema")
             cursor_time = 0
             previous_cursor = (0, "")
-            if previous and previous.get("change_cursor"):
+            parser_changed = bool(previous and int(previous.get("parser_version") or 0) != PARSER_VERSION)
+            if previous and previous.get("change_cursor") and not force_full_scan and not parser_changed:
                 try:
                     previous_cursor = tuple(json.loads(previous["change_cursor"]))
                     cursor_time = max(int(previous_cursor[0]) - OVERLAP_MILLISECONDS, 0)
@@ -214,11 +222,12 @@ def import_opencode_source(unibase: Unibase, source: dict, db_override: Path | N
                 previous
                 and (
                     previous.get("content_hash") != file_identity
+                    or parser_changed
                     or max_source_time < int(previous_cursor[0])
                     or missing_older_event
                 )
             )
-            if replaced:
+            if replaced or force_full_scan:
                 cursor_time = 0
             rows = conn.execute(MESSAGE_USAGE_SQL, (cursor_time,)).fetchall()
             session_diagnostic = None
@@ -265,9 +274,12 @@ def import_opencode_source(unibase: Unibase, source: dict, db_override: Path | N
             imported += 1
 
         all_event_keys = {stable_id("opencode", "message", str(row["id"] or "")) for row in active_ids if row["id"]}
-        unibase.replace_source_event_updates(
-            source_id, source_file_id, "opencode", parsed_events, all_event_keys, scan_generation
-        )
+        if non_destructive:
+            dirty_event_keys = unibase.add_events(source_id, source_file_id, parsed_events, scan_generation)
+        else:
+            dirty_event_keys = unibase.replace_source_event_updates(
+                source_id, source_file_id, "opencode", parsed_events, all_event_keys, scan_generation
+            )
         cursor = (
             max_cursor
             if max_cursor != (0, "")
@@ -292,14 +304,20 @@ def import_opencode_source(unibase: Unibase, source: dict, db_override: Path | N
         source_changed = bool(
             previous is None
             or replaced
+            or force_full_scan
             or stat.st_mtime_ns != int(previous["mtime_ns"])
             or any(event_key not in all_event_keys for event_key in existing_keys)
         )
+        retained_paths = {relative_path}
+        if non_destructive:
+            retained_paths.update(unibase.source_file_keys(source_id))
         unibase.reconcile_source_files(
             source_id,
             scan_generation,
-            [relative_path],
-            rebuild_active=source_changed,
+            retained_paths,
+            rebuild_active=False,
+            dirty_event_keys=dirty_event_keys if source_changed else (),
+            complete=not non_destructive,
         )
         active = unibase.active_event_rows("opencode")
         message_sums = {

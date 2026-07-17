@@ -1,5 +1,15 @@
 # Changelog
 
+## 2.2.0 - 2026-07-17
+
+- Replaced the misleading raw telemetry Diagnostics view with a compact Data Health workspace for Unibase integrity, provider coverage, and source freshness.
+- Reordered Usage Details to Models, Requests, and Data Health.
+- Added readable Requests timestamps and exact grouped time windows with an explicit calculation timezone footer.
+- Added short Active time presets and a fixed 24-hour daily scale.
+- Added optional cross-provider model merging in the All scope and retained known model inventory across index resets.
+- Improved Codex deduplication when overlapping sources disagree on an unknown model and kept freshness anchored to live sources.
+- Updated the release screenshot at a 2560x1440 viewport using synthetic privacy-safe data.
+
 ## 2.1.0 - 2026-07-16
 
 - Added automatic Codex discovery for valid rollout paths registered in `state_5.sqlite`, including sessions outside the default `~/.codex` root.

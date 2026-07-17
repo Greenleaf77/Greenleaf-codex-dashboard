@@ -15,7 +15,7 @@ from pathlib import Path, PurePosixPath
 from typing import Iterable, Iterator
 
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 8
 DEFAULT_UNIBASE_DB = Path.home() / ".metermesh" / "unibase.sqlite3"
 PROVIDERS = ("codex", "claude", "opencode")
 SOURCE_PRIORITIES = {"live": 1000, "normalized_backup": 500, "legacy_backup": 400}
@@ -126,12 +126,26 @@ MIGRATION_1 = """
 create table app_settings (
     id integer primary key check (id = 1),
     revision integer not null default 1,
+    merge_models_across_providers integer not null default 0,
     ignore_codex_auto_review integer not null default 0,
+    experimental_codex_deduplication integer not null default 0,
+    ignore_failed_requests integer not null default 0,
     legacy_preference_migrated integer not null default 0,
     generation integer not null default 0,
     state text not null default 'ready',
     created_at text not null,
     updated_at text not null
+);
+
+create table disabled_models (
+    model text primary key,
+    created_at text not null
+);
+
+create table known_models (
+    model text primary key,
+    first_seen_at text not null,
+    last_seen_at text not null
 );
 
 create table sources (
@@ -234,6 +248,7 @@ create table event_variants (
     reasoning_tokens integer not null default 0,
     cost_usd real,
     cost_kind text not null default 'unavailable',
+    failed integer not null default 0,
     payload_hash text not null,
     created_at text not null,
     unique(provider, event_key, payload_hash)
@@ -278,7 +293,8 @@ create table active_events (
     output_tokens integer not null,
     reasoning_tokens integer not null,
     cost_usd real,
-    cost_kind text not null
+    cost_kind text not null,
+    failed integer not null default 0
 );
 
 create index active_events_provider_time on active_events(provider, occurred_at desc, canonical_event_id desc);
@@ -477,13 +493,76 @@ class Unibase:
                         commit;
                         """
                     )
+                    version = 5
+                if version == 5:
+                    conn.execute("begin immediate")
+                    migrations = (
+                        ("app_settings", "ignore_failed_requests", "integer not null default 0"),
+                        ("event_variants", "failed", "integer not null default 0"),
+                        ("active_events", "failed", "integer not null default 0"),
+                    )
+                    for table, column, declaration in migrations:
+                        columns = {row[1] for row in conn.execute(f"pragma table_info({table})")}
+                        if column not in columns:
+                            conn.execute(f"alter table {table} add column {column} {declaration}")
+                    conn.execute("pragma user_version = 6")
+                    conn.commit()
+                    version = 6
+                if version == 6:
+                    conn.execute("begin immediate")
+                    columns = {row[1] for row in conn.execute("pragma table_info(app_settings)")}
+                    if "experimental_codex_deduplication" not in columns:
+                        conn.execute(
+                            "alter table app_settings add column experimental_codex_deduplication integer not null default 0"
+                        )
+                    conn.execute(
+                        "create table if not exists disabled_models (model text primary key, created_at text not null)"
+                    )
+                    conn.execute("pragma user_version = 7")
+                    conn.commit()
+                    version = 7
+                if version == 7:
+                    conn.execute("begin immediate")
+                    columns = {row[1] for row in conn.execute("pragma table_info(app_settings)")}
+                    if "merge_models_across_providers" not in columns:
+                        conn.execute(
+                            "alter table app_settings add column merge_models_across_providers integer not null default 0"
+                        )
+                    conn.execute(
+                        """
+                        create table if not exists known_models (
+                            model text primary key,
+                            first_seen_at text not null,
+                            last_seen_at text not null
+                        )
+                        """
+                    )
+                    now = utc_now()
+                    conn.execute(
+                        """
+                        insert or ignore into known_models(model, first_seen_at, last_seen_at)
+                        select model, ?, ? from active_events
+                        where trim(model) != '' and lower(trim(model)) != '(unknown)'
+                        union
+                        select model, ?, ? from disabled_models
+                        where trim(model) != '' and lower(trim(model)) != '(unknown)'
+                        """,
+                        (now, now, now, now),
+                    )
+                    conn.execute("delete from disabled_models where lower(trim(model)) = '(unknown)'")
+                    conn.execute("pragma user_version = 8")
+                    conn.commit()
 
     def settings(self) -> dict:
         with self.connect(readonly=True) as conn:
             row = conn.execute("select * from app_settings where id = 1").fetchone()
         return dict(row)
 
-    def update_settings(self, revision: int, ignore_codex_auto_review: bool) -> dict:
+    def update_settings(
+        self,
+        revision: int,
+        ignore_codex_auto_review: bool,
+    ) -> dict:
         with OPERATION_LOCKS.acquire("settings"):
             with self.connect() as conn:
                 conn.execute("begin immediate")
@@ -491,7 +570,7 @@ class Unibase:
                 if int(current[0]) != revision:
                     raise RevisionConflict("Settings changed since this draft was opened")
                 conn.execute(
-                    "update app_settings set revision = revision + 1, ignore_codex_auto_review = ?, legacy_preference_migrated = 1, updated_at = ? where id = 1",
+                    "update app_settings set revision = revision + 1, ignore_codex_auto_review = ?, ignore_failed_requests = 0, legacy_preference_migrated = 1, updated_at = ? where id = 1",
                     (int(ignore_codex_auto_review), utc_now()),
                 )
             return self.settings()
@@ -514,7 +593,13 @@ class Unibase:
             ).fetchone()
         return dict(row) if row else None
 
-    def apply_settings(self, revision: int, ignore_codex_auto_review: bool, backups: list[dict]) -> dict:
+    def apply_settings(
+        self,
+        revision: int,
+        merge_models_across_providers: bool,
+        sources: list[dict],
+        models: list[dict],
+    ) -> dict:
         with OPERATION_LOCKS.acquire("maintenance"):
             if self.active_operation():
                 raise OperationConflict("A Unibase operation is already running")
@@ -523,23 +608,38 @@ class Unibase:
                 current = conn.execute("select revision from app_settings where id = 1").fetchone()
                 if int(current[0]) != revision:
                     raise RevisionConflict("Settings changed since this draft was opened")
-                expected = {
-                    row["source_id"]
-                    for row in conn.execute("select source_id from sources where kind != 'live'").fetchall()
+                registry = {
+                    row["source_id"]: row["kind"]
+                    for row in conn.execute("select source_id, kind from sources").fetchall()
                 }
-                provided = {str(item.get("source_id")) for item in backups}
-                if provided != expected or len(provided) != len(backups):
-                    raise ValueError("Backup source list does not match the current registry")
-                for item in backups:
+                provided = {str(item.get("source_id")) for item in sources}
+                if provided != set(registry) or len(provided) != len(sources):
+                    raise ValueError("Source list does not match the current registry")
+                for item in sources:
                     if not isinstance(item.get("enabled"), bool):
-                        raise ValueError("Backup enabled value must be boolean")
+                        raise ValueError("Source enabled value must be boolean")
+                    source_id = str(item["source_id"])
+                    if registry[source_id] == "live" and not item["enabled"]:
+                        raise ValueError("Original sources cannot be disabled")
                     conn.execute(
                         "update sources set enabled = ?, updated_at = ? where source_id = ? and kind != 'live'",
-                        (int(item["enabled"]), utc_now(), item["source_id"]),
+                        (int(item["enabled"]), utc_now(), source_id),
                     )
+                model_names = [str(item.get("model") or "") for item in models]
+                if (
+                    len(set(model_names)) != len(model_names)
+                    or any(not name or len(name) > 500 for name in model_names)
+                    or not all(isinstance(item.get("enabled"), bool) for item in models)
+                ):
+                    raise ValueError("Invalid model settings")
+                conn.execute("delete from disabled_models")
+                conn.executemany(
+                    "insert into disabled_models(model, created_at) values (?, ?)",
+                    [(name, utc_now()) for name, item in zip(model_names, models) if not item["enabled"]],
+                )
                 conn.execute(
-                    "update app_settings set revision = revision + 1, ignore_codex_auto_review = ?, legacy_preference_migrated = 1, updated_at = ? where id = 1",
-                    (int(ignore_codex_auto_review), utc_now()),
+                    "update app_settings set revision = revision + 1, merge_models_across_providers = ?, ignore_codex_auto_review = 0, experimental_codex_deduplication = 1, ignore_failed_requests = 0, legacy_preference_migrated = 1, updated_at = ? where id = 1",
+                    (int(merge_models_across_providers), utc_now()),
                 )
             self.rebuild_active_events()
             return self.settings()
@@ -549,7 +649,7 @@ class Unibase:
         with self.connect() as conn:
             previous = conn.execute(
                 """
-                select source_id, inventory_signature, stable_inventory_count, enabled
+                select source_id, root_path, discovery_status, inventory_signature, stable_inventory_count, enabled
                 from sources
                 where source_id = ? or (provider = ? and kind = ? and relative_name = ?)
                 order by source_id = ? desc
@@ -560,6 +660,13 @@ class Unibase:
             effective_source_id = previous["source_id"] if previous else source.source_id
             stable_count = 0
             status = source.status
+            if (
+                previous
+                and source.kind == "live"
+                and source.status == "not_indexed"
+                and previous["root_path"] == str(source.root_path)
+            ):
+                status = previous["discovery_status"]
             if source.kind == "legacy_backup" and source.inventory_signature:
                 stable_count = 1
                 if previous and previous["inventory_signature"] == source.inventory_signature:
@@ -777,6 +884,16 @@ class Unibase:
             )
         }
         payload_hash = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        model = str(payload["model"] or "").strip()
+        if model and model.lower() != "(unknown)":
+            now = utc_now()
+            conn.execute(
+                """
+                insert into known_models(model, first_seen_at, last_seen_at) values (?, ?, ?)
+                on conflict(model) do update set last_seen_at = excluded.last_seen_at
+                """,
+                (model, now, now),
+            )
         conn.execute(
                 """
                 insert into event_variants(
@@ -815,7 +932,12 @@ class Unibase:
             ).fetchone()[0]
         )
         conn.execute(
-            "insert or ignore into event_occurrences(event_variant_id, source_id, source_file_id, scan_generation) values (?, ?, ?, ?)",
+            """
+            insert into event_occurrences(event_variant_id, source_id, source_file_id, scan_generation)
+            values (?, ?, ?, ?)
+            on conflict(event_variant_id, source_id, source_file_id)
+            do update set scan_generation = excluded.scan_generation
+            """,
             (variant_id, source_id, source_file_id, scan_generation),
         )
         conn.execute(
@@ -830,11 +952,13 @@ class Unibase:
         source_file_id: int | None,
         events: Iterable[dict],
         scan_generation: int,
-    ) -> None:
+    ) -> set[tuple[str, str]]:
+        event_list = list(events)
         with self.connect() as conn:
             conn.execute("begin immediate")
-            for event in events:
+            for event in event_list:
                 self._add_event_conn(conn, source_id, source_file_id, event, scan_generation)
+        return {(str(event["provider"]), str(event["event_key"])) for event in event_list}
 
     def replace_source_file_events(
         self,
@@ -842,12 +966,25 @@ class Unibase:
         source_file_id: int,
         events: Iterable[dict],
         scan_generation: int,
-    ) -> None:
+    ) -> set[tuple[str, str]]:
+        event_list = list(events)
         with self.connect() as conn:
             conn.execute("begin immediate")
+            previous = conn.execute(
+                """
+                select distinct ev.provider, ev.event_key
+                from event_occurrences eo
+                join event_variants ev on ev.event_variant_id = eo.event_variant_id
+                where eo.source_id = ? and eo.source_file_id = ?
+                """,
+                (source_id, source_file_id),
+            ).fetchall()
             conn.execute("delete from event_occurrences where source_id = ? and source_file_id = ?", (source_id, source_file_id))
-            for event in events:
+            for event in event_list:
                 self._add_event_conn(conn, source_id, source_file_id, event, scan_generation)
+        dirty = {(str(row["provider"]), str(row["event_key"])) for row in previous}
+        dirty.update((str(event["provider"]), str(event["event_key"])) for event in event_list)
+        return dirty
 
     def replace_source_event_updates(
         self,
@@ -857,7 +994,7 @@ class Unibase:
         events: Iterable[dict],
         active_event_keys: set[str],
         scan_generation: int,
-    ) -> None:
+    ) -> set[tuple[str, str]]:
         event_list = list(events)
         updated_keys = {str(event["event_key"]) for event in event_list}
         with self.connect() as conn:
@@ -884,6 +1021,7 @@ class Unibase:
                 )
             for event in event_list:
                 self._add_event_conn(conn, source_id, source_file_id, event, scan_generation)
+        return {(provider, str(event_key)) for event_key in keys_to_remove | updated_keys}
 
     def register_content_blob(self, sha256: str, size: int, provider: str, parser_version: int) -> tuple[int, bool]:
         with self.connect() as conn:
@@ -906,21 +1044,44 @@ class Unibase:
         seen_paths: Iterable[str],
         *,
         rebuild_active: bool = True,
+        dirty_event_keys: Iterable[tuple[str, str]] = (),
+        complete: bool = True,
     ) -> bool:
         seen = set(seen_paths)
         removed = False
+        dirty = set(dirty_event_keys)
         with self.connect() as conn:
             rows = conn.execute("select source_file_id, relative_path from source_files where source_id = ?", (source_id,)).fetchall()
             for row in rows:
                 if row["relative_path"] not in seen:
                     removed = True
+                    dirty.update(
+                        (str(event["provider"]), str(event["event_key"]))
+                        for event in conn.execute(
+                            """
+                            select distinct ev.provider, ev.event_key
+                            from event_occurrences eo
+                            join event_variants ev on ev.event_variant_id = eo.event_variant_id
+                            where eo.source_id = ? and eo.source_file_id = ?
+                            """,
+                            (source_id, row["source_file_id"]),
+                        ).fetchall()
+                    )
                     conn.execute("delete from event_occurrences where source_id = ? and source_file_id = ?", (source_id, row["source_file_id"]))
                     conn.execute("delete from source_files where source_file_id = ?", (row["source_file_id"],))
-            conn.execute(
-                "update sources set discovery_status = 'ready', stale = 0, error = null, last_successful_generation = ?, last_successful_scan = ?, file_count = ?, updated_at = ? where source_id = ?",
-                (scan_generation, utc_now(), len(seen), utc_now(), source_id),
-            )
-        if rebuild_active or removed:
+            if complete:
+                conn.execute(
+                    "update sources set discovery_status = 'ready', stale = 0, error = null, last_successful_generation = ?, last_successful_scan = ?, file_count = ?, updated_at = ? where source_id = ?",
+                    (scan_generation, utc_now(), len(seen), utc_now(), source_id),
+                )
+            else:
+                conn.execute(
+                    "update sources set discovery_status = 'ready', stale = 1, error = null, file_count = ?, updated_at = ? where source_id = ?",
+                    (len(seen), utc_now(), source_id),
+                )
+        if dirty:
+            self.rebuild_active_events(dirty)
+        elif rebuild_active or removed:
             self.rebuild_active_events()
         return rebuild_active or removed
 
@@ -931,66 +1092,116 @@ class Unibase:
                 (sanitize_error(error), utc_now(), source_id),
             )
 
-    def rebuild_active_events(self) -> int:
+    def rebuild_active_events(self, event_keys: Iterable[tuple[str, str]] | None = None) -> int:
+        dirty = None if event_keys is None else set(event_keys)
+        if dirty == set():
+            return int(self.settings()["generation"])
         with OPERATION_LOCKS.acquire("active-events"):
             with self.connect() as conn:
                 conn.execute("begin immediate")
                 generation = int(conn.execute("select generation from app_settings where id = 1").fetchone()[0]) + 1
-                conn.execute("delete from active_events")
-                canonical_rows = conn.execute("select canonical_event_id, provider, event_key from canonical_events").fetchall()
-                for canonical in canonical_rows:
-                    variants = conn.execute(
-                        """
+                conn.execute("drop table if exists temp.dirty_event_keys")
+                if dirty is not None:
+                    conn.execute(
+                        "create temp table dirty_event_keys(provider text not null, event_key text not null, primary key(provider, event_key))"
+                    )
+                    conn.executemany(
+                        "insert into dirty_event_keys(provider, event_key) values (?, ?)",
+                        sorted(dirty),
+                    )
+                conn.execute("drop table if exists temp.active_event_winners")
+                conn.execute(
+                    f"""
+                    create temp table active_event_winners as
+                    with ranked_sources as (
                         select ev.*, s.priority, coalesce(s.snapshot_date, '') snapshot_date,
-                               s.source_id stable_source_id
+                               s.source_id stable_source_id, eo.scan_generation,
+                                row_number() over (
+                                    partition by ev.event_variant_id
+                                    order by s.priority desc, coalesce(s.snapshot_date, '') desc, s.source_id asc,
+                                             eo.scan_generation desc, coalesce(eo.source_file_id, 0) asc
+                                ) source_rank
                         from event_variants ev
-                        join sources s on s.source_id = (
-                            select s2.source_id
-                            from event_occurrences eo2
-                            join sources s2 on s2.source_id = eo2.source_id
-                            where eo2.event_variant_id = ev.event_variant_id and s2.enabled = 1
-                            order by s2.priority desc, coalesce(s2.snapshot_date, '') desc, s2.source_id asc
-                            limit 1
-                        )
-                        where ev.provider = ? and ev.event_key = ?
-                        order by priority desc, snapshot_date desc, stable_source_id asc, ev.payload_hash asc
-                        """,
-                        (canonical["provider"], canonical["event_key"]),
-                    ).fetchall()
-                    if not variants:
-                        conn.execute(
-                            "update canonical_events set selected_variant_id = null, conflict_state = 'clean' where canonical_event_id = ?",
-                            (canonical["canonical_event_id"],),
-                        )
-                        continue
-                    winner = variants[0]
-                    conflict = "conflict" if len(variants) > 1 else "clean"
+                        join event_occurrences eo on eo.event_variant_id = ev.event_variant_id
+                        join sources s on s.source_id = eo.source_id and s.enabled = 1
+                        {"join dirty_event_keys dirty on dirty.provider = ev.provider and dirty.event_key = ev.event_key" if dirty is not None else ""}
+                    ), ranked_variants as (
+                        select ranked_sources.*,
+                                row_number() over (
+                                    partition by provider, event_key
+                                    order by case when semantics = 'codex_global_dedup' then occurred_at end asc,
+                                             case when semantics = 'codex_global_dedup' and lower(trim(model)) = '(unknown)' then 1 else 0 end asc,
+                                             priority desc, snapshot_date desc, stable_source_id asc,
+                                             scan_generation desc, payload_hash asc
+                                ) variant_rank,
+                               count(*) over (partition by provider, event_key) variant_count
+                        from ranked_sources
+                        where source_rank = 1
+                    )
+                    select * from ranked_variants where variant_rank = 1
+                    """
+                )
+                if dirty is None:
+                    conn.execute("delete from active_events")
+                    conn.execute("update canonical_events set selected_variant_id = null, conflict_state = 'clean'")
+                else:
                     conn.execute(
-                        "update canonical_events set selected_variant_id = ?, conflict_state = ? where canonical_event_id = ?",
-                        (winner["event_variant_id"], conflict, canonical["canonical_event_id"]),
+                        """
+                        delete from active_events
+                        where exists (
+                            select 1 from dirty_event_keys dirty
+                            where dirty.provider = active_events.provider and dirty.event_key = active_events.event_key
+                        )
+                        """
                     )
                     conn.execute(
                         """
-                        insert into active_events(
-                            canonical_event_id, event_variant_id, generation, provider, event_key, stream_key,
-                            timestamp_utc, occurred_at, model, native_provider_id, semantics, classification,
-                            input_tokens, cache_read_tokens, cache_write_tokens, output_tokens, reasoning_tokens,
-                            cost_usd, cost_kind
-                        ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        (
-                            canonical["canonical_event_id"], winner["event_variant_id"], generation,
-                            winner["provider"], winner["event_key"], winner["stream_key"], winner["timestamp_utc"],
-                            winner["occurred_at"], winner["model"], winner["native_provider_id"], winner["semantics"],
-                            winner["classification"], winner["input_tokens"], winner["cache_read_tokens"],
-                            winner["cache_write_tokens"], winner["output_tokens"], winner["reasoning_tokens"],
-                            winner["cost_usd"], winner["cost_kind"],
-                        ),
+                        update canonical_events
+                        set selected_variant_id = null, conflict_state = 'clean'
+                        where exists (
+                            select 1 from dirty_event_keys dirty
+                            where dirty.provider = canonical_events.provider and dirty.event_key = canonical_events.event_key
+                        )
+                        """
                     )
+                conn.execute(
+                    """
+                    update canonical_events as canonical
+                    set selected_variant_id = winner.event_variant_id,
+                        conflict_state = case
+                            when winner.semantics = 'codex_global_dedup' then 'clean'
+                            when winner.variant_count > 1 then 'conflict'
+                            else 'clean'
+                        end
+                    from active_event_winners as winner
+                    where canonical.provider = winner.provider and canonical.event_key = winner.event_key
+                    """
+                )
+                conn.execute(
+                    """
+                    insert into active_events(
+                        canonical_event_id, event_variant_id, generation, provider, event_key, stream_key,
+                        timestamp_utc, occurred_at, model, native_provider_id, semantics, classification,
+                        input_tokens, cache_read_tokens, cache_write_tokens, output_tokens, reasoning_tokens,
+                        cost_usd, cost_kind
+                    )
+                    select canonical.canonical_event_id, winner.event_variant_id, ?, winner.provider,
+                           winner.event_key, winner.stream_key, winner.timestamp_utc, winner.occurred_at,
+                           winner.model, winner.native_provider_id, winner.semantics, winner.classification,
+                            winner.input_tokens, winner.cache_read_tokens, winner.cache_write_tokens,
+                            winner.output_tokens, winner.reasoning_tokens, winner.cost_usd, winner.cost_kind
+                    from active_event_winners winner
+                    join canonical_events canonical
+                      on canonical.provider = winner.provider and canonical.event_key = winner.event_key
+                    """,
+                    (generation,),
+                )
                 conn.execute("update app_settings set generation = ?, state = 'ready', updated_at = ? where id = 1", (generation, utc_now()))
                 conn.execute(
                     "update sources set event_count = (select count(distinct eo.event_variant_id) from event_occurrences eo where eo.source_id = sources.source_id)"
                 )
+                conn.execute("drop table temp.active_event_winners")
+                conn.execute("drop table if exists temp.dirty_event_keys")
                 conn.commit()
                 return generation
 
@@ -1039,7 +1250,7 @@ class Unibase:
                     "content_blobs", "source_files",
                 ):
                     conn.execute(f"delete from {table}")
-                conn.execute("update sources set discovery_status = 'not_indexed', stale = 0, file_count = 0, event_count = 0, error = null")
+                conn.execute("update sources set discovery_status = 'not_indexed', stale = 0, last_successful_generation = null, file_count = 0, event_count = 0, last_successful_scan = null, error = null")
                 conn.execute("update app_settings set generation = generation + 1, state = 'reset_empty', updated_at = ? where id = 1", (utc_now(),))
 
     def integrity_check(self) -> bool:

@@ -9,6 +9,7 @@ import unibase
 
 class AllProviderTests(unittest.TestCase):
     def setUp(self):
+        dashboard_api.USAGE_RESPONSE_CACHE.clear()
         self.temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp_dir.cleanup)
         self.path = Path(self.temp_dir.name) / "unibase.sqlite3"
@@ -29,10 +30,21 @@ class AllProviderTests(unittest.TestCase):
             "error": None,
         }
 
-    def add_event(self, provider, input_tokens, cache_read, cache_write, output, cost, cost_kind):
+    def add_event(
+        self,
+        provider,
+        input_tokens,
+        cache_read,
+        cache_write,
+        output,
+        cost,
+        cost_kind,
+        *,
+        event_key="same-native-id",
+    ):
         self.db.add_event(f"{provider}-live", None, {
             "provider": provider,
-            "event_key": "same-native-id",
+            "event_key": event_key,
             "stream_key": "same-session-id",
             "timestamp_utc": "2026-07-16T12:00:00Z",
             "occurred_at": 1784203200,
@@ -62,8 +74,27 @@ class AllProviderTests(unittest.TestCase):
         self.assertEqual(all_data["totals"]["sessions"], 3)
         self.assertEqual(len(all_data["models"]), 3)
         self.assertEqual({row["model"] for row in all_data["models"]}, {"Codex · gpt-5.5", "Claude · gpt-5.5", "OpenCode · gpt-5.5"})
+        self.assertEqual(all_data["activity"]["total_seconds"], 10 * 60)
+        self.assertEqual(sum(scope["activity"]["total_seconds"] for scope in scopes), 30 * 60)
         self.assertEqual(all_data["cost"]["recorded"], 0.5)
         self.assertGreater(all_data["cost"]["estimated"], 0)
+
+    def test_all_can_merge_matching_models_across_providers(self):
+        with self.db.connect() as conn:
+            conn.execute("update app_settings set merge_models_across_providers = 1")
+
+        data = self.load("all")
+
+        self.assertTrue(data["merge_models_across_providers"])
+        self.assertEqual(len(data["models"]), 1)
+        model = data["models"][0]
+        self.assertEqual(model["model"], "gpt-5.5")
+        self.assertEqual(model["model_key"], "gpt-5.5")
+        self.assertEqual(model["provider"], "all")
+        self.assertEqual(model["sessions"], 3)
+        self.assertEqual(model["total_tokens"], data["totals"]["total_tokens"])
+        self.assertEqual([row["model"] for row in data["chart"]["models"]], ["gpt-5.5"])
+        self.assertEqual([row["model"] for row in data["chart"]["days"][0]["models"]], ["gpt-5.5"])
 
     def test_opencode_endpoints_share_one_model_row(self):
         self.db.add_event("opencode-live", None, {
@@ -141,6 +172,10 @@ class AllProviderTests(unittest.TestCase):
         )
         self.assertEqual(timezone_day["start_day"], "2026-07-17")
         self.assertEqual(timezone_day["end_day"], "2026-07-17")
+        for range_name, expected_start in (("3d", "2026-07-15"), ("14d", "2026-07-04"), ("21d", "2026-06-27")):
+            resolved = dashboard_api.resolve_chart_range(range_name, today=dashboard_api.dt.date(2026, 7, 17))
+            self.assertEqual(resolved["start_day"], expected_start)
+            self.assertEqual(resolved["end_day"], "2026-07-17")
 
     def test_production_usage_payload_does_not_call_provider_scanners(self):
         handler = object.__new__(dashboard_api.DashboardHandler)
@@ -158,7 +193,7 @@ class AllProviderTests(unittest.TestCase):
             payload = handler.usage_payload(filters)
         self.assertEqual(payload["provider"], "all")
 
-    def test_production_usage_payload_waits_for_refresh_before_reading(self):
+    def test_production_usage_payload_reads_committed_generation_without_waiting(self):
         handler = object.__new__(dashboard_api.DashboardHandler)
         handler.unibase_path = self.path
         source_root = Path(self.temp_dir.name) / "sources"
@@ -167,27 +202,35 @@ class AllProviderTests(unittest.TestCase):
         handler.opencode_db_path = source_root / "opencode" / "opencode.db"
         filters = handler.filters_from_query("provider=all&range=all&chart_range=all")
         with patch.object(dashboard_api, "schedule_enabled_sources_refresh") as refresh, patch.object(
-            dashboard_api, "wait_for_source_refresh", return_value=True
-        ) as wait, patch.object(
             dashboard_api, "load_pricing", return_value=self.pricing
         ):
-            handler.usage_payload(filters)
-        refresh.assert_called_once_with(
-            self.path,
-            handler.opencode_db_path,
-            codex_root=handler.db_path.parent,
-            codex_state_db=handler.db_path,
-            claude_root=handler.claude_projects_path.parent,
-            reason="usage request",
-        )
-        wait.assert_called_once_with()
+            payload = handler.usage_payload(filters)
+        refresh.assert_not_called()
+        self.assertEqual(payload["sync"]["state"], "idle")
+
+    def test_production_usage_payload_reuses_generation_cache(self):
+        handler = object.__new__(dashboard_api.DashboardHandler)
+        handler.unibase_path = self.path
+        source_root = Path(self.temp_dir.name) / "sources"
+        handler.db_path = source_root / ".codex" / "state_5.sqlite"
+        handler.claude_projects_path = source_root / ".claude" / "projects"
+        handler.opencode_db_path = source_root / "opencode" / "opencode.db"
+        filters = handler.filters_from_query("provider=all&range=all&chart_range=all")
+
+        with patch.object(dashboard_api, "load_pricing", return_value=self.pricing), patch.object(
+            dashboard_api, "load_unibase_usage", wraps=dashboard_api.load_unibase_usage
+        ) as load_usage:
+            first = handler.usage_payload(filters)
+            second = handler.usage_payload(filters)
+
+        self.assertEqual(first["generation"], second["generation"])
+        self.assertEqual(load_usage.call_count, 1)
 
     def test_cache_alias_does_not_double_count(self):
         data = self.load("all")
         totals = data["totals"]
         self.assertEqual(totals["cached_input_tokens"], totals["cache_read_input_tokens"] + totals["cache_creation_input_tokens"])
         self.assertEqual(totals["total_with_cached_tokens"], totals["total_tokens"] + totals["cached_input_tokens"])
-
 
 if __name__ == "__main__":
     unittest.main()

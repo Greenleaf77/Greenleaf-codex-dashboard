@@ -1,5 +1,5 @@
 import "./styles.css";
-import { compactNumber } from "./format.js";
+import { compactNumber, formatDuration } from "./format.js";
 import { chartBarSizing, chartHeightPercent } from "./chart-scale.js";
 import { normalizeProvider, providerOptions } from "./provider-state.js";
 import { paginateRows, truncateModelName, USAGE_TABLE_PAGE_SIZE } from "./usage-table.js";
@@ -7,8 +7,7 @@ import {
   WITH_CACHE,
   WITHOUT_CACHE,
   metricValue,
-  resolveCacheMode,
-  resolveIgnoreAutoReview
+  resolveCacheMode
 } from "./visualization-accounting.js";
 
 const app = document.querySelector("#app");
@@ -35,11 +34,20 @@ const chartRangeOptions = [
   { value: "all", label: "All" },
   { value: "custom", label: "Custom" }
 ];
+const activityChartRangeOptions = [
+  { value: "3d", label: "3d" },
+  { value: "7d", label: "7d" },
+  { value: "14d", label: "14d" },
+  { value: "21d", label: "21d" },
+  { value: "30d", label: "30d" },
+  { value: "custom", label: "Custom" }
+];
 const visualizationOptions = [
   { value: "heatmap", label: "Daily heatmap" },
-  { value: "tokens", label: "Tokens over time" }
+  { value: "tokens", label: "Tokens over time" },
+  { value: "activity", label: "Active time" }
 ];
-const chartRangeDefaults = { heatmap: "all", tokens: "30d" };
+const chartRangeDefaults = { heatmap: "all", tokens: "30d", activity: "30d" };
 const accountingOptions = [
   { value: WITH_CACHE, label: "With cache" },
   { value: WITHOUT_CACHE, label: "Without cache" }
@@ -63,6 +71,7 @@ const iconPaths = {
   chart: '<line x1="4" y1="20" x2="20" y2="20"/><line x1="6" y1="20" x2="6" y2="12"/><line x1="11" y1="20" x2="11" y2="7"/><line x1="16" y1="20" x2="16" y2="4"/><polyline points="4 8 9 5 13 7 20 3"/>',
   database: '<rect x="4" y="4" width="16" height="16" rx="2"/><line x1="4" y1="9" x2="20" y2="9"/><line x1="4" y1="15" x2="20" y2="15"/><circle cx="8" cy="6.5" r=".8"/><circle cx="8" cy="12" r=".8"/><circle cx="8" cy="18" r=".8"/><line x1="11" y1="6.5" x2="17" y2="6.5"/><line x1="11" y1="12" x2="17" y2="12"/><line x1="11" y1="18" x2="17" y2="18"/>',
   settings: '<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.8 2.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6V21h-4v-.1a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1L4.2 17l.1-.1a1.7 1.7 0 0 0 .3-1.9A1.7 1.7 0 0 0 3 14H3v-4h.1a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9L4.2 7 7 4.2l.1.1a1.7 1.7 0 0 0 1.9.3A1.7 1.7 0 0 0 10 3h4v.1a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1L19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.1v4H21a1.7 1.7 0 0 0-1.6 1Z"/>',
+  refresh: '<path d="M20 6v5h-5"/><path d="M18.2 9A7 7 0 1 0 19 15"/>',
   info: '<circle cx="12" cy="12" r="9"/><line x1="12" y1="10.5" x2="12" y2="16"/><circle cx="12" cy="7.5" r=".7"/>',
   usage: '<polyline points="3 13 7 13 9.5 6 14 18 16.5 11 21 11"/>',
   models: '<rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/><line x1="10" y1="7" x2="14" y2="7"/><line x1="7" y1="10" x2="7" y2="14"/><line x1="17" y1="10" x2="17" y2="14"/>'
@@ -73,11 +82,8 @@ const providerLogoPaths = {
   claude: 'm4.7144 15.9555 4.7174-2.6471.079-.2307-.079-.1275h-.2307l-.7893-.0486-2.6956-.0729-2.3375-.0971-2.2646-.1214-.5707-.1215-.5343-.7042.0546-.3522.4797-.3218.686.0608 1.5179.1032 2.2767.1578 1.6514.0972 2.4468.255h.3886l.0546-.1579-.1336-.0971-.1032-.0972L6.973 9.8356l-2.55-1.6879-1.3356-.9714-.7225-.4918-.3643-.4614-.1578-1.0078.6557-.7225.8803.0607.2246.0607.8925.686 1.9064 1.4754 2.4893 1.8336.3643.3035.1457-.1032.0182-.0728-.164-.2733-1.3539-2.4467-1.445-2.4893-.6435-1.032-.17-.6194c-.0607-.255-.1032-.4674-.1032-.7285L6.287.1335 6.6997 0l.9957.1336.419.3642.6192 1.4147 1.0018 2.2282 1.5543 3.0296.4553.8985.2429.8318.091.255h.1579v-.1457l.1275-1.706.2368-2.0947.2307-2.6957.0789-.7589.3764-.9107.7468-.4918.5828.2793.4797.686-.0668.4433-.2853 1.8517-.5586 2.9021-.3643 1.9429h.2125l.2429-.2429.9835-1.3053 1.6514-2.0643.7286-.8196.85-.9046.5464-.4311h1.0321l.759 1.1293-.34 1.1657-1.0625 1.3478-.8804 1.1414-1.2628 1.7-.7893 1.36.0729.1093.1882-.0183 2.8535-.607 1.5421-.2794 1.8396-.3157.8318.3886.091.3946-.3278.8075-1.967.4857-2.3072.4614-3.4364.8136-.0425.0304.0486.0607 1.5482.1457.6618.0364h1.621l3.0175.2247.7892.522.4736.6376-.079.4857-1.2142.6193-1.6393-.3886-3.825-.9107-1.3113-.3279h-.1822v.1093l1.0929 1.0686 2.0035 1.8092 2.5075 2.3314.1275.5768-.3218.4554-.34-.0486-2.2039-1.6575-.85-.7468-1.9246-1.621h-.1275v.17l.4432.6496 2.3436 3.5214.1214 1.0807-.17.3521-.6071.2125-.6679-.1214-1.3721-1.9246L14.38 17.959l-1.1414-1.9428-.1397.079-.674 7.2552-.3156.3703-.7286.2793-.6071-.4614-.3218-.7468.3218-1.4753.3886-1.9246.3157-1.53.2853-1.9004.17-.6314-.0121-.0425-.1397.0182-1.4328 1.9672-2.1796 2.9446-1.7243 1.8456-.4128.164-.7164-.3704.0667-.6618.4008-.5889 2.386-3.0357 1.4389-1.882.929-1.0868-.0062-.1579h-.0546l-6.3385 4.1164-1.1293.1457-.4857-.4554.0608-.7467.2307-.2429 1.9064-1.3114Z',
   opencode: 'M7 4.5h10l3 7.5-3 7.5H7L4 12l3-7.5Zm2.5 4L8 12l1.5 3.5h5L16 12l-1.5-3.5h-5Z'
 };
-const autoReviewModel = "codex-auto-review";
-const ignoreAutoReviewCookie = "ignore_codex_auto_review_v2";
 
 const initialState = readUrlState();
-const legacyIgnoreCookie = readCookie(ignoreAutoReviewCookie);
 let activeProvider = initialState.provider;
 let activeRange = initialState.range;
 let customRangePending = false;
@@ -85,9 +91,12 @@ let customRangeOpen = false;
 let customStartDate = initialState.start;
 let customEndDate = initialState.end;
 let activeChartRange = initialState.chartRange;
+let chartCustomRangePending = false;
+let chartCustomRangeOpen = false;
 const chartStateByVisualization = {
   heatmap: { range: chartRangeDefaults.heatmap, start: "", end: "" },
   tokens: { range: chartRangeDefaults.tokens, start: "", end: "" },
+  activity: { range: chartRangeDefaults.activity, start: "", end: "" },
   [initialState.visualization]: {
     range: initialState.chartRange,
     start: initialState.chartStart,
@@ -98,8 +107,6 @@ let chartStartDate = initialState.chartStart;
 let chartEndDate = initialState.chartEnd;
 let activeVisualization = initialState.visualization;
 let cacheMode = initialState.cacheMode;
-let ignoreAutoReview = resolveIgnoreAutoReview(initialState.ignoreAutoReview, legacyIgnoreCookie);
-let legacyIgnoreOverride = initialState.ignoreAutoReview ?? legacyIgnoreCookie;
 let activeTableView = initialState.view;
 let currentData = null;
 let diagnosticsController = null;
@@ -107,6 +114,8 @@ let diagnosticsRequestKey = null;
 let diagnosticsTimer = null;
 let usageLoadTimer = null;
 let usageController = null;
+let sourceSyncPollTimer = null;
+const usageCache = new Map();
 const diagnosticsCache = new Map();
 const diagnosticsErrors = new Map();
 const expandedModels = new Set();
@@ -121,14 +130,22 @@ let requestGroup = initialState.requestGroup;
 let requestPage = initialState.requestPage;
 let requestPageSize = initialState.requestPageSize;
 let requestSnapshot = null;
+const expandedRequestGroups = new Set();
+const requestChildrenLoading = new Set();
+const requestChildrenErrors = new Map();
+const requestChildrenControllers = new Map();
 let settingsOpen = false;
 let settingsLoading = false;
 let settingsData = null;
 let settingsDraft = null;
 let settingsError = null;
+let settingsApplyPending = false;
+let settingsApplied = false;
+let settingsActiveTab = "general";
 let resetConfirmOpen = false;
 let resetConfirmation = "";
 let operationPollTimer = null;
+let manualRefreshPending = false;
 
 const numberFormatter = new Intl.NumberFormat("en-US");
 const percentageFormatter = new Intl.NumberFormat("en-US", { minimumFractionDigits: 1, maximumFractionDigits: 1 });
@@ -143,18 +160,88 @@ function money(value) {
   return moneyFormatter.format(Number(value || 0));
 }
 
+function formatTimestamp(value, fallback = "Not synced") {
+  if (!value) return fallback;
+  const timestamp = new Date(value);
+  if (Number.isNaN(timestamp.getTime())) return fallback;
+  return timestamp.toLocaleString([], { dateStyle: "medium", timeStyle: "short" });
+}
+
+function requestDayKey(value, timezone) {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    timeZone: timezone
+  }).formatToParts(value);
+  const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  return `${values.year}-${values.month}-${values.day}`;
+}
+
+function formatRequestDateTime(value, timezone, includeSeconds = true) {
+  const timestamp = new Date(value);
+  if (Number.isNaN(timestamp.getTime())) return String(value || "");
+  return new Intl.DateTimeFormat("en-US", {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: includeSeconds ? "2-digit" : undefined,
+    hourCycle: "h23",
+    timeZone: timezone
+  }).format(timestamp);
+}
+
+function formatRequestWindow(startValue, endValue, timezone) {
+  const start = new Date(startValue);
+  const end = new Date(endValue);
+  if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) return String(startValue || "");
+  if (requestDayKey(start, timezone) !== requestDayKey(end, timezone)) {
+    return `${formatRequestDateTime(startValue, timezone, false)} – ${formatRequestDateTime(endValue, timezone, false)}`;
+  }
+  const date = new Intl.DateTimeFormat("en-US", {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+    timeZone: timezone
+  }).format(start);
+  const time = new Intl.DateTimeFormat("en-US", {
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+    timeZone: timezone
+  });
+  return `${date} · ${time.format(start)}–${time.format(end)}`;
+}
+
+function requestTimezoneLabel(payload) {
+  const values = payload.items.flatMap((item) => [item.bucket_start, item.bucket_end, item.local_timestamp]).filter(Boolean);
+  const offsets = new Set(values.map((value) => {
+    const match = String(value).match(/(Z|[+-]\d{2}:\d{2})$/);
+    if (!match) return null;
+    return match[1] === "Z" ? "+00:00" : match[1];
+  }).filter(Boolean));
+  const offset = offsets.size === 1 ? ` (UTC${[...offsets][0]})` : "";
+  return `${payload.timezone || "UTC"}${offset}`;
+}
+
+function formatMegabytes(bytes) {
+  return `${(Number(bytes || 0) / (1024 * 1024)).toFixed(2)} MB`;
+}
+
 function resetUsageTablePages() {
   dailyUsagePage = 1;
   modelUsagePage = 1;
 }
 
 function usageTableScopeKey(data) {
-  return [data.provider, data.range, data.range_start || "", data.range_end || ""].join(":");
+  return [data.provider, data.range, data.range_start || "", data.range_end || "", data.merge_models_across_providers ? "merged" : "split"].join(":");
 }
 
 function modelDisplayName(data, row) {
   const model = String(row.model || "");
-  if (data.provider !== "all") return model;
+  if (data.provider !== "all" || data.merge_models_across_providers) return model;
   const providerLabel = providerOptions.find((option) => option.value === row.provider)?.label || row.provider;
   if (model.toLowerCase().startsWith(`${providerLabel.toLowerCase()} ·`)) return model;
   return `${providerLabel} · ${model}`;
@@ -212,6 +299,10 @@ function restoreChartState(visualization) {
   chartEndDate = state.end;
 }
 
+function chartRangeOptionsFor(visualization) {
+  return visualization === "activity" ? activityChartRangeOptions : chartRangeOptions;
+}
+
 function positionCustomRangeDialog(dialog, anchor) {
   const margin = 8;
   const gap = 8;
@@ -248,32 +339,18 @@ function readUrlState() {
     range: rangeOptions.some((option) => option.value === range) ? range : "all",
     start: params.get("start") || "",
     end: params.get("end") || "",
-    chartRange: chartRangeOptions.some((option) => option.value === chartRange)
+    chartRange: chartRangeOptionsFor(normalizedVisualization).some((option) => option.value === chartRange)
       ? chartRange
       : chartRangeDefaults[normalizedVisualization],
     chartStart: params.get("chart_start") || "",
     chartEnd: params.get("chart_end") || "",
     visualization: normalizedVisualization,
     cacheMode: resolveCacheMode(params.get("cache")),
-    ignoreAutoReview: params.get("ignore_auto_review"),
     view: ["usage", "diagnostics", "requests"].includes(params.get("view")) ? params.get("view") : "usage",
     requestGroup: requestGroupOptions.includes(params.get("group")) ? params.get("group") : "none",
     requestPage: Math.max(Number.parseInt(params.get("page") || "1", 10) || 1, 1),
     requestPageSize: requestPageSizes.includes(selectedPageSize) ? selectedPageSize : 25
   };
-}
-
-function readCookie(name) {
-  const encodedName = `${encodeURIComponent(name)}=`;
-  const parts = document.cookie.split(";").map((part) => part.trim());
-  const match = parts.find((part) => part.startsWith(encodedName));
-  if (!match) return null;
-  return decodeURIComponent(match.slice(encodedName.length));
-}
-
-function writeCookie(name, value, days = 365) {
-  const expires = new Date(Date.now() + days * 24 * 60 * 60 * 1000).toUTCString();
-  document.cookie = `${encodeURIComponent(name)}=${encodeURIComponent(value)}; expires=${expires}; path=/; SameSite=Lax`;
 }
 
 function escapeHtml(value) {
@@ -290,7 +367,6 @@ function buildQuery(rangeName, includeDiagnostics = false) {
   params.set("provider", activeProvider);
   params.set("range", rangeName);
   params.set("chart_range", activeChartRange);
-  if (legacyIgnoreOverride !== null) params.set("ignore_auto_review", ignoreAutoReview ? "1" : "0");
   params.set("visualization", activeVisualization);
   params.set("cache", cacheMode);
   params.set("timezone", Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC");
@@ -334,7 +410,11 @@ function describeChartRange(chart) {
   if (chart.range === "custom" && chart.range_start && chart.range_end) {
     return `${chart.range_start} - ${chart.range_end}`;
   }
+  if (chart.range === "3d") return "Last 3 days";
   if (chart.range === "30d") return "Last 30 days";
+  if (chart.range === "21d") return "Last 21 days";
+  if (chart.range === "14d") return "Last 14 days";
+  if (chart.range === "7d") return "Last 7 days";
   if (chart.range === "90d") return "Last 90 days";
   if (chart.range === "6m") return "Last 6 months";
   if (chart.range === "1y") return "Last year";
@@ -387,6 +467,15 @@ function heatmapCells(daily, rangeName, rangeStart, rangeEnd, accountingMode) {
 
 function renderVisualizationPanel(data, heat, months, heatColumns) {
   const accountingLabel = cacheMode === WITH_CACHE ? "With cache" : "Without cache";
+  const activityMode = activeVisualization === "activity";
+  const title = {
+    heatmap: "Daily Heatmap",
+    tokens: "Tokens over time",
+    activity: "Active time"
+  }[activeVisualization];
+  const note = activityMode
+    ? `Showing ${escapeHtml(describeChartRange(data.chart))} · ${full(data.activity?.idle_timeout_minutes || 10)}-minute inactivity timeout · all models combined`
+    : `Showing ${escapeHtml(describeChartRange(data.chart))} · ${accountingLabel}`;
   return `
     <div class="daily-visualization">
       <div class="viz-header">
@@ -394,35 +483,48 @@ function renderVisualizationPanel(data, heat, months, heatColumns) {
           <div class="section-title">
             <span class="section-icon tone-cyan">${icon("usage")}</span>
             <div>
-              <h2>${activeVisualization === "tokens" ? "Tokens over time" : "Daily Heatmap"}</h2>
-              <div class="viz-note">Showing ${escapeHtml(describeChartRange(data.chart))} · ${accountingLabel}</div>
+              <h2>${title}</h2>
+              <div class="viz-note">${note}</div>
             </div>
           </div>
         </div>
         <div class="viz-controls">
-          <div class="viz-primary-controls">
+          ${activityMode ? "" : `<div class="viz-primary-controls">
             <nav class="segments accounting-tabs" aria-label="Token accounting">
               ${accountingOptions.map((option) => `<button class="seg ${cacheMode === option.value ? "active" : ""}" type="button" data-cache-mode="${option.value}" aria-pressed="${cacheMode === option.value}">${option.label}</button>`).join("")}
             </nav>
-            <nav class="segments viz-tabs" aria-label="Visualization">
-              ${visualizationOptions.map((option) => `<button class="seg ${activeVisualization === option.value ? "active" : ""}" type="button" data-visualization="${option.value}" aria-pressed="${activeVisualization === option.value}">${option.label}</button>`).join("")}
-            </nav>
-          </div>
+          </div>`}
           <div class="chart-filter">
             <nav class="segments chart-range-tabs" aria-label="Visualization range">
-              ${chartRangeOptions.map((option) => `<button class="seg ${activeChartRange === option.value ? "active" : ""}" type="button" data-chart-range="${option.value}" aria-pressed="${activeChartRange === option.value}">${option.label}</button>`).join("")}
+              ${chartRangeOptionsFor(activeVisualization).map((option) => `<button class="seg ${activeChartRange === option.value ? "active" : ""}" type="button" data-chart-range="${option.value}" aria-pressed="${activeChartRange === option.value}" ${option.value === "custom" ? `id="chart-range-trigger" aria-haspopup="dialog" aria-expanded="${chartCustomRangeOpen}"` : ""}>${option.label}</button>`).join("")}
             </nav>
-            ${activeChartRange === "custom" ? `
-              <form class="custom-range chart-custom-range" id="chart-range-form">
-                <label>From<input type="date" name="chart_start" value="${escapeHtml(chartStartDate)}" required></label>
-                <label>To<input type="date" name="chart_end" value="${escapeHtml(chartEndDate)}" required></label>
-                <button class="custom-apply" type="submit">Apply</button>
-              </form>
-            ` : ""}
           </div>
         </div>
       </div>
-      ${activeVisualization === "tokens" ? renderTokensOverTime(data.chart, cacheMode) : renderHeatmap(heat, months, heatColumns, cacheMode)}
+      ${chartCustomRangeOpen ? `
+        <dialog class="custom-range-dialog" id="chart-range-dialog" aria-labelledby="chart-range-title">
+          <form class="custom-range" id="chart-range-form">
+            <div class="custom-range-heading">
+              <strong id="chart-range-title">Custom visualization range</strong>
+              <button class="custom-range-close" type="button" aria-label="Close custom visualization range">×</button>
+            </div>
+            <label>
+              <span>From</span>
+              <input id="chart-custom-start" type="date" name="chart_start" value="${escapeHtml(chartStartDate)}" required>
+            </label>
+            <label>
+              <span>To</span>
+              <input id="chart-custom-end" type="date" name="chart_end" value="${escapeHtml(chartEndDate)}" required>
+            </label>
+            <button class="custom-apply" type="submit">Apply</button>
+          </form>
+        </dialog>
+      ` : ""}
+      ${activeVisualization === "activity"
+        ? renderActiveTime(data.activity)
+        : activeVisualization === "tokens"
+          ? renderTokensOverTime(data.chart, cacheMode)
+          : renderHeatmap(heat, months, heatColumns, cacheMode)}
     </div>
   `;
 }
@@ -475,6 +577,60 @@ function renderTokensOverTime(chart, accountingMode) {
       </div>
     </div>
     ${renderChartLegend(models)}
+  `;
+}
+
+function renderActiveTime(activity) {
+  if (!activity) {
+    return '<div class="chart-empty">Active-time data is unavailable.</div>';
+  }
+  const days = activity.days || [];
+  const dailyScale = activity.granularity === "day";
+  const maxSeconds = dailyScale ? 24 * 60 * 60 : Math.max(1, ...days.map((day) => Number(day.active_seconds || 0)));
+  const ticks = dailyScale
+    ? [24, 18, 12, 6, 0].map((hours) => hours * 60 * 60)
+    : [1, 0.75, 0.5, 0.25, 0].map((ratio) => Math.round(maxSeconds * ratio));
+  const labelEvery = Math.max(1, Math.ceil(days.length / 10));
+  const { barGap, barFill, barMax } = chartBarSizing(activity.granularity, days.length);
+  const activitySummary = `${full(activity.focus_blocks)} sessions`;
+  return `
+    <div class="activity-summary" aria-label="Active time summary">
+      <div><span>Total active time</span><strong>${formatDuration(activity.total_seconds)}</strong><small>${full(activity.request_count)} requests</small></div>
+      <div><span>Average per day</span><strong>${formatDuration(activity.average_seconds_per_day)}</strong><small>Across the selected period</small></div>
+      <div><span>Average active day</span><strong>${formatDuration(activity.average_seconds_per_active_day)}</strong><small>Days with recorded activity</small></div>
+      <div><span>Activity coverage</span><strong>${full(activity.active_days)} / ${full(activity.period_days)} days</strong><small>${activitySummary}</small></div>
+    </div>
+    ${days.length ? `
+      <div class="chart-shell activity-chart-shell">
+        <div class="chart-y-axis">
+          ${ticks.map((tick) => `<span>${dailyScale && tick === 0 ? "" : formatDuration(tick)}</span>`).join("")}
+        </div>
+        <div class="chart-scroll">
+          <div class="bar-chart" style="--bar-count: ${days.length}; --bar-gap: ${barGap}px; --bar-fill: ${barFill}%; --bar-max: ${barMax}px">
+            <div class="chart-grid">${ticks.map(() => '<span></span>').join("")}</div>
+            <div class="chart-v-grid">${days.map(() => "<span></span>").join("")}</div>
+            <div class="chart-bars">
+              ${days.map((day, index) => renderActivityBar(day, maxSeconds, index, labelEvery, days.length)).join("")}
+            </div>
+          </div>
+        </div>
+      </div>
+    ` : '<div class="chart-empty">No requests in this chart range.</div>'}
+  `;
+}
+
+function renderActivityBar(day, maxSeconds, index, labelEvery, dayCount) {
+  const seconds = Number(day.active_seconds || 0);
+  const height = chartHeightPercent(seconds, maxSeconds);
+  const label = index % labelEvery === 0 || index === dayCount - 1 ? dayLabel(day.label, day.day) : "";
+  const title = day.bucket_start && day.bucket_end && day.bucket_start !== day.bucket_end
+    ? `${day.bucket_start} - ${day.bucket_end}`
+    : day.day;
+  return `
+    <div class="bar-slot" data-tooltip-title="${escapeHtml(title)}" data-tooltip-body="${formatDuration(seconds)} active · ${full(day.request_count)} requests">
+      <div class="stacked-bar activity-time-bar ${seconds ? "" : "empty"}" style="height: ${height}%"></div>
+      <div class="bar-label">${escapeHtml(label)}</div>
+    </div>
   `;
 }
 
@@ -534,18 +690,24 @@ async function load(rangeName) {
   usageController = new AbortController();
   const controller = usageController;
   const startedAt = Date.now();
+  const query = buildQuery(rangeName);
   const renderLoading = () => {
     const elapsedSeconds = Math.floor((Date.now() - startedAt) / 1000);
     const elapsed = elapsedSeconds >= 2 ? `<span>${full(elapsedSeconds)}s elapsed</span>` : "";
     app.innerHTML = `<section class="state usage-loading" aria-live="polite"><span class="diagnostics-spinner" aria-hidden="true"></span><strong>MeterMesh is loading Unibase…</strong>${elapsed}</section>`;
   };
-  renderLoading();
-  usageLoadTimer = window.setInterval(renderLoading, 1000);
+  if (currentData) {
+    document.documentElement.classList.add("usage-refreshing");
+  } else {
+    renderLoading();
+    usageLoadTimer = window.setInterval(renderLoading, 1000);
+  }
   console.info("[MeterMesh timing] usage fetch started", { range: rangeName, provider: activeProvider });
   try {
-    const response = await fetch(`/data.json?${buildQuery(rangeName)}`, { cache: "no-store", signal: controller.signal });
+    const response = await fetch(`/data.json?${query}`, { cache: "no-store", signal: controller.signal });
     if (!response.ok) throw new Error(`Usage API returned HTTP ${response.status}`);
     const data = await response.json();
+    usageCache.set(query, data);
     console.info("[MeterMesh timing] usage fetch completed", { elapsedMs: Date.now() - startedAt });
     return data;
   } catch (error) {
@@ -559,6 +721,7 @@ async function load(rangeName) {
       usageLoadTimer = null;
       usageController = null;
     }
+    document.documentElement.classList.remove("usage-refreshing");
   }
 }
 
@@ -614,11 +777,16 @@ function diagnosticsKey(data) {
 
 function invalidateRequests() {
   if (requestsController) requestsController.abort();
+  requestChildrenControllers.forEach((controller) => controller.abort());
   requestsController = null;
+  requestChildrenControllers.clear();
   requestsPayload = null;
   requestsError = null;
   requestSnapshot = null;
   requestPage = 1;
+  expandedRequestGroups.clear();
+  requestChildrenLoading.clear();
+  requestChildrenErrors.clear();
 }
 
 function renderUsageTables(data) {
@@ -637,11 +805,68 @@ function renderUsageTables(data) {
   const heat = heatmapCells(chartDaily, data.chart.range, data.chart.range_start, data.chart.range_end, cacheMode);
   const months = monthLabels(heat);
   const heatColumns = Math.max(1, Math.ceil(heat.length / 7));
+  const supportsDiagnostics = Boolean(data.supports_diagnostics);
+  if (!supportsDiagnostics && activeTableView === "diagnostics") activeTableView = "usage";
+  const diagnosticsCacheKey = diagnosticsKey(data);
+  let rightPanelContent = `
+    <div class="usage-table-block models-table-block">
+      <div class="table-scroll">
+      <table class="usage-data-table models-table">
+        <thead><tr><th>Model</th><th class="num">Days</th><th class="num">Sessions</th><th class="num">Input</th><th class="num">Output</th><th class="num">Total w/o cached</th><th class="num">Cached</th><th class="num">Total</th><th class="num">Cost</th><th class="num">Share</th></tr></thead>
+        <tbody>
+          ${modelPage.items.map((row) => {
+            const modelKey = row.model_key || row.model;
+            const expanded = expandedModels.has(modelKey);
+            const displayName = modelDisplayName(data, row);
+            const shortName = truncateModelName(displayName);
+            const isTruncated = shortName !== displayName;
+            const share = (row.total_tokens / Math.max(totals.total_tokens, 1)) * 100;
+            return `
+              <tr class="model-row ${expanded ? "expanded" : ""}">
+                <td>
+                  <button class="model-toggle" type="button" data-model="${escapeHtml(modelKey)}" ${isTruncated ? `data-model-tooltip="${escapeHtml(displayName)}"` : ""} aria-expanded="${expanded}" aria-label="${escapeHtml(displayName)}">
+                    <span class="model-chevron">${expanded ? "▾" : "▸"}</span>
+                    <span class="model-name">${escapeHtml(shortName)}</span>
+                  </button>
+                </td>
+                <td class="num">${full(row.active_days)}</td>
+                <td class="num">${full(row.sessions)}</td>
+                <td class="num">${full(row.input_tokens)}</td>
+                <td class="num">${full(row.output_tokens)}</td>
+                <td class="num">${full(row.total_tokens)}</td>
+                <td class="num">${full(row.cached_input_tokens)}</td>
+                <td class="num">${full(row.total_with_cached_tokens)}</td>
+                <td class="num">${money(row.cost_usd)}</td>
+                <td class="num share-cell">
+                  <div class="share-meter" aria-label="${share.toFixed(1)}% of total usage">
+                    <span class="share-track"><span class="share-fill" style="width:${Math.min(share, 100).toFixed(1)}%"></span></span>
+                    <span class="share-value">${share.toFixed(1)}%</span>
+                  </div>
+                </td>
+              </tr>
+              ${expanded ? `<tr class="model-detail-row"><td colspan="10">${renderModelDetails(row)}</td></tr>` : ""}
+            `;
+          }).join("") || '<tr><td colspan="10" class="empty">No models in this range.</td></tr>'}
+        </tbody>
+      </table>
+      </div>
+      ${renderUsagePagination("models", modelPage.page, modelPage.totalPages)}
+    </div>
+  `;
+  if (activeTableView === "diagnostics") {
+    if (diagnosticsCache.has(diagnosticsCacheKey)) rightPanelContent = renderDataHealth(diagnosticsCache.get(diagnosticsCacheKey));
+    else if (diagnosticsErrors.has(diagnosticsCacheKey)) rightPanelContent = renderDiagnosticsError(diagnosticsErrors.get(diagnosticsCacheKey));
+    else rightPanelContent = renderDiagnosticsLoading();
+  }
+  if (activeTableView === "requests") rightPanelContent = renderRequestsState();
   return `
     <div class="tables">
       <section class="usage-table-panel daily-usage-panel" data-table-panel="daily">
-        <header class="usage-panel-heading">
+        <header class="usage-panel-heading daily-panel-heading">
           <h2 class="section-title"><span class="section-icon tone-lime">${icon("usage")}</span><span>Daily Usage</span></h2>
+          <nav class="segments viz-tabs" aria-label="Visualization">
+            ${visualizationOptions.map((option) => `<button class="seg ${activeVisualization === option.value ? "active" : ""}" type="button" data-visualization="${option.value}" aria-pressed="${activeVisualization === option.value}">${option.label}</button>`).join("")}
+          </nav>
         </header>
         ${renderVisualizationPanel(data, heat, months, heatColumns)}
         <div class="usage-table-block">
@@ -660,107 +885,150 @@ function renderUsageTables(data) {
       </section>
 
       <section class="usage-table-panel models-panel" data-table-panel="models">
-        <header class="usage-panel-heading">
-          <h2 class="section-title"><span class="section-icon tone-violet">${icon("models")}</span><span>Models</span></h2>
+        <header class="usage-panel-heading workspace-panel-heading">
+          <h2 class="section-title"><span class="section-icon tone-violet">${icon("models")}</span><span>Usage Details</span></h2>
+          <nav class="segments workspace-panel-tabs" aria-label="Details view">
+            <button class="seg ${activeTableView === "usage" ? "active" : ""}" type="button" data-table-view="usage" aria-pressed="${activeTableView === "usage"}">Models</button>
+            <button class="seg ${activeTableView === "requests" ? "active" : ""}" type="button" data-table-view="requests" aria-pressed="${activeTableView === "requests"}">Requests</button>
+            ${supportsDiagnostics ? `<button class="seg ${activeTableView === "diagnostics" ? "active" : ""}" type="button" data-table-view="diagnostics" aria-pressed="${activeTableView === "diagnostics"}">Data Health</button>` : ""}
+          </nav>
         </header>
-        <div class="usage-table-block models-table-block">
-          <div class="table-scroll">
-          <table class="usage-data-table models-table">
-            <thead><tr><th>Model</th><th class="num">Days</th><th class="num">Sessions</th><th class="num">Input</th><th class="num">Output</th><th class="num">Total w/o cached</th><th class="num">Cached</th><th class="num">Total</th><th class="num">Cost</th><th class="num">Share</th></tr></thead>
-            <tbody>
-              ${modelPage.items.map((row) => {
-                const modelKey = row.model_key || row.model;
-                const expanded = expandedModels.has(modelKey);
-                const displayName = modelDisplayName(data, row);
-                const shortName = truncateModelName(displayName);
-                const isTruncated = shortName !== displayName;
-                const share = (row.total_tokens / Math.max(totals.total_tokens, 1)) * 100;
-                return `
-                  <tr class="model-row ${expanded ? "expanded" : ""}">
-                    <td>
-                      <button class="model-toggle" type="button" data-model="${escapeHtml(modelKey)}" ${isTruncated ? `data-model-tooltip="${escapeHtml(displayName)}"` : ""} aria-expanded="${expanded}" aria-label="${escapeHtml(displayName)}">
-                        <span class="model-chevron">${expanded ? "▾" : "▸"}</span>
-                        <span class="model-name">${escapeHtml(shortName)}</span>
-                      </button>
-                    </td>
-                    <td class="num">${full(row.active_days)}</td>
-                    <td class="num">${full(row.sessions)}</td>
-                    <td class="num">${full(row.input_tokens)}</td>
-                    <td class="num">${full(row.output_tokens)}</td>
-                    <td class="num">${full(row.total_tokens)}</td>
-                    <td class="num">${full(row.cached_input_tokens)}</td>
-                    <td class="num">${full(row.total_with_cached_tokens)}</td>
-                    <td class="num">${money(row.cost_usd)}</td>
-                    <td class="num share-cell">
-                      <div class="share-meter" aria-label="${share.toFixed(1)}% of total usage">
-                        <span class="share-track"><span class="share-fill" style="width:${Math.min(share, 100).toFixed(1)}%"></span></span>
-                        <span class="share-value">${share.toFixed(1)}%</span>
-                      </div>
-                    </td>
-                  </tr>
-                  ${expanded ? `<tr class="model-detail-row"><td colspan="10">${renderModelDetails(row)}</td></tr>` : ""}
-                `;
-              }).join("") || '<tr><td colspan="10" class="empty">No models in this range.</td></tr>'}
-            </tbody>
-          </table>
-          </div>
-          ${renderUsagePagination("models", modelPage.page, modelPage.totalPages)}
-        </div>
+        <div class="workspace-panel-content" id="right-panel-content">${rightPanelContent}</div>
       </section>
     </div>
   `;
 }
 
-function renderDiagnostics(diagnostics) {
+function renderDataHealth(diagnostics) {
   const summary = diagnostics.summary;
-  return `
-    <section class="diagnostics-panel">
-      <div class="diagnostics-heading">
-        <div>
-          <h2 class="section-title"><span class="section-icon tone-cyan">${icon("usage")}</span><span>Telemetry Diagnostics</span></h2>
-          <p>Local replay analysis, not server billing. Deduplicated usage can be closer to upstream usage but is not proof that a request was accepted.</p>
+  const sources = diagnostics.sources || [];
+  const enabledSources = sources.filter((source) => source.enabled);
+  const readySources = enabledSources.filter((source) => source.status === "ready" && !source.stale && !source.error);
+  const staleSources = enabledSources.filter((source) => source.stale);
+  const errorSources = enabledSources.filter((source) => source.status === "error" || source.error);
+  const conflicts = Number(summary.conflicts || 0);
+  const unverifiable = Number(summary.unverifiable_events || 0);
+  let healthTone = "good";
+  let healthLabel = "Healthy";
+  let healthMessage = `All ${full(enabledSources.length)} enabled sources are ready.`;
+  if (!enabledSources.length) {
+    healthTone = "warn";
+    healthLabel = "No active sources";
+    healthMessage = "Enable at least one source to keep the Unibase index current.";
+  } else if (errorSources.length || conflicts) {
+    healthTone = "bad";
+    healthLabel = "Needs attention";
+    healthMessage = `${full(errorSources.length)} source errors · ${full(conflicts)} index conflicts`;
+  } else if (staleSources.length || unverifiable) {
+    healthTone = "warn";
+    healthLabel = "Review recommended";
+    healthMessage = `${full(staleSources.length)} stale sources · ${full(unverifiable)} unverifiable updates`;
+  }
+  const successfulScans = enabledSources
+    .map((source) => new Date(source.last_successful_scan || "").getTime())
+    .filter(Number.isFinite);
+  const latestScan = successfulScans.length ? new Date(Math.max(...successfulScans)).toISOString() : null;
+  const providerOrder = ["codex", "claude", "opencode"];
+  const providerCards = providerOrder.map((provider) => {
+    const breakdown = diagnostics.provider_breakdown?.[provider] || {};
+    const providerSources = enabledSources.filter((source) => source.provider === provider);
+    const providerReady = providerSources.filter((source) => source.status === "ready" && !source.stale && !source.error).length;
+    const providerIssue = providerSources.some((source) => source.status === "error" || source.error)
+      ? "bad"
+      : providerSources.some((source) => source.stale) || !providerSources.length ? "warn" : "good";
+    const label = providerOptions.find((option) => option.value === provider)?.label || provider;
+    return `
+      <article class="health-provider-card" data-provider="${provider}">
+        <div class="health-provider-head">
+          <span class="health-provider-mark">${providerLogo(provider, "health-provider-logo")}</span>
+          <strong>${escapeHtml(label)}</strong>
+          <span class="health-state-dot health-${providerIssue}" aria-label="${providerIssue === "good" ? "Healthy" : providerIssue === "bad" ? "Error" : "Review"}"></span>
         </div>
-        <div class="diagnostics-source">${full(summary.exact_usage_events)} exact · ${full(summary.fallback_usage_events)} cumulative fallback</div>
+        <div class="health-provider-value">${full(breakdown.events)}</div>
+        <div class="health-provider-caption">indexed events</div>
+        <div class="health-provider-foot"><span>${full(providerReady)}/${full(providerSources.length)} sources ready</span></div>
+      </article>
+    `;
+  }).join("");
+  const sourceCards = [...sources]
+    .sort((left, right) => Number(right.enabled) - Number(left.enabled) || providerOrder.indexOf(left.provider) - providerOrder.indexOf(right.provider))
+    .map((source) => {
+      let state = "good";
+      let stateLabel = "Ready";
+      if (!source.enabled) {
+        state = "muted";
+        stateLabel = "Disabled";
+      } else if (source.status === "error" || source.error) {
+        state = "bad";
+        stateLabel = "Error";
+      } else if (source.stale) {
+        state = "warn";
+        stateLabel = "Stale";
+      } else if (source.status !== "ready") {
+        state = "warn";
+        stateLabel = String(source.status || "Pending");
+      }
+      const providerLabel = providerOptions.find((option) => option.value === source.provider)?.label || source.provider;
+      return `
+        <article class="health-source-row ${source.enabled ? "" : "is-disabled"}">
+          <div class="health-source-identity">
+            <span class="health-source-logo provider-${escapeHtml(source.provider)}">${providerLogo(source.provider, "health-source-provider-logo")}</span>
+            <span><strong>${escapeHtml(source.label)}</strong><small>${escapeHtml(providerLabel)} · ${escapeHtml(String(source.kind || "source").replaceAll("_", " "))}</small></span>
+          </div>
+          <div class="health-source-stat"><strong>${compactNumber(source.event_count)}</strong><small>source records</small></div>
+          <div class="health-source-sync"><strong>${escapeHtml(formatTimestamp(source.last_successful_scan, "Never synced"))}</strong><small>last successful scan</small></div>
+          <span class="health-status health-${state}"><i></i>${escapeHtml(stateLabel)}</span>
+        </article>
+      `;
+    }).join("");
+  return `
+    <div class="data-health-panel">
+      <div class="data-health-heading">
+        <div>
+          <h2 class="section-title"><span class="section-icon tone-cyan">${icon("database")}</span><span>Data Health</span></h2>
+          <p>Unibase index integrity, provider coverage, and source freshness for the selected usage range.</p>
+        </div>
+        <span class="health-status health-${healthTone}"><i></i>${healthLabel}</span>
       </div>
-      <div class="diagnostics-summary">
-        <div><span>Raw token events</span><strong>${full(summary.raw_token_events)}</strong></div>
-        <div><span>Deduplicated updates</span><strong>${full(summary.deduplicated_usage_updates)}</strong></div>
-        <div><span>Replayed events</span><strong>${full(summary.replayed_events)} <small>${(summary.replay_rate * 100).toFixed(1)}%</small></strong></div>
-        <div><span>Estimated local overcount</span><strong>${compactNumber(summary.estimated_local_overcount_tokens)}</strong></div>
+      <div class="health-overview health-overview-${healthTone}">
+        <span class="health-overview-icon">${icon("database")}</span>
+        <div><span>Unibase status</span><strong>${healthLabel}</strong><p>${escapeHtml(healthMessage)}</p></div>
+        <div class="health-last-sync"><span>Latest successful scan</span><strong>${escapeHtml(formatTimestamp(latestScan, "Not synced"))}</strong></div>
       </div>
-      <div class="diagnostics-integrity">
-        Baselines ${full(summary.baseline_events)} · Resets ${full(summary.counter_resets)} · Unverifiable ${full(summary.unverifiable_events)}
+      <div class="health-metrics">
+        <article><span>Indexed updates</span><strong>${full(summary.deduplicated_usage_updates)}</strong><small>active events in this range</small></article>
+        <article><span>Ready sources</span><strong>${full(readySources.length)}/${full(enabledSources.length)}</strong><small>${full(sources.length)} registered total</small></article>
+        <article><span>Index conflicts</span><strong>${full(conflicts)}</strong><small>canonical event conflicts</small></article>
+        <article><span>Integrity signals</span><strong>${full(Number(summary.counter_resets || 0) + unverifiable)}</strong><small>${full(summary.counter_resets)} resets · ${full(unverifiable)} unverifiable</small></article>
       </div>
-      <div class="table-scroll">
-        <table class="diagnostics-table">
-          <thead><tr><th>Hour</th><th>Model</th><th class="num">Raw events</th><th class="num">Updates</th><th class="num">Replayed</th><th class="num">Replay rate</th><th class="num">Reported total</th><th class="num">Deduplicated total</th><th class="num">Est. overcount</th></tr></thead>
-          <tbody>
-            ${diagnostics.rows.map((row) => `<tr><td>${escapeHtml(row.hour)}</td><td>${escapeHtml(row.model)}</td><td class="num">${full(row.raw_token_events)}</td><td class="num">${full(row.deduplicated_usage_updates)}</td><td class="num">${full(row.replayed_events)}</td><td class="num">${(row.replay_rate * 100).toFixed(1)}%</td><td class="num">${full(row.reported_tokens)}</td><td class="num">${full(row.deduplicated_tokens)}</td><td class="num diagnostic-overcount">${full(row.estimated_local_overcount_tokens)}</td></tr>`).join("") || '<tr><td colspan="9" class="empty">No token telemetry in this range.</td></tr>'}
-          </tbody>
-        </table>
+      <div class="health-section-heading"><div><span>Provider coverage</span><strong>Indexed activity by provider</strong></div></div>
+      <div class="health-provider-grid">${providerCards}</div>
+      <div class="health-section-heading health-sources-heading"><div><span>Source registry</span><strong>Freshness and ingestion status</strong></div><small>${full(enabledSources.length)} enabled · ${full(sources.length)} registered</small></div>
+      <div class="health-source-list">
+        ${sourceCards || '<div class="health-empty">No registered sources.</div>'}
       </div>
-    </section>
+    </div>
   `;
 }
 
 function renderDiagnosticsLoading(elapsedSeconds = 0) {
   const elapsed = elapsedSeconds >= 2 ? `<span>${full(elapsedSeconds)}s elapsed</span>` : "";
-  return `<section class="diagnostics-state" aria-live="polite"><span class="diagnostics-spinner" aria-hidden="true"></span><strong>Analyzing rollout telemetry…</strong>${elapsed}</section>`;
+  return `<div class="diagnostics-state" aria-live="polite"><span class="diagnostics-spinner" aria-hidden="true"></span><strong>Checking Unibase health…</strong>${elapsed}</div>`;
 }
 
 function renderDiagnosticsError(message) {
-  return `<section class="diagnostics-state error"><strong>Could not analyze rollout telemetry.</strong><code>${escapeHtml(message)}</code><button class="diagnostics-retry" type="button">Retry</button></section>`;
+  return `<div class="diagnostics-state error"><strong>Could not load Data Health.</strong><code>${escapeHtml(message)}</code><button class="diagnostics-retry" type="button">Retry</button></div>`;
 }
 
 function renderRequestValues(item) {
   return `<span>In ${full(item.input)}</span><span>Out ${full(item.output)}</span><span>Cache R ${full(item.cache_read)}</span><span>Cache W ${full(item.cache_write)}</span><strong>${full(item.total_with_cache)} total</strong>`;
 }
 
-function renderRequestEvent(item) {
+function renderRequestEvent(item, timezone) {
   return `
     <article class="request-event">
       <div class="request-event-main">
-        <time datetime="${escapeHtml(item.timestamp)}">${escapeHtml(item.local_timestamp || item.timestamp)}</time>
+        <time datetime="${escapeHtml(item.timestamp)}">${escapeHtml(formatRequestDateTime(item.local_timestamp || item.timestamp, timezone))}</time>
         <strong>${escapeHtml(item.model)}</strong>
         <span class="request-provider provider-${escapeHtml(item.provider)}">${escapeHtml(item.provider)}</span>
       </div>
@@ -770,19 +1038,39 @@ function renderRequestEvent(item) {
   `;
 }
 
+function renderRequestChildren(item, timezone) {
+  const bucket = escapeHtml(item.bucket_start);
+  const loading = requestChildrenLoading.has(item.bucket_start);
+  const error = requestChildrenErrors.get(item.bucket_start);
+  const children = item.children.map((child) => renderRequestEvent(child, timezone)).join("");
+  const status = loading
+    ? '<div class="request-child-state"><span class="diagnostics-spinner" aria-hidden="true"></span><span>Loading requests…</span></div>'
+    : error
+      ? `<div class="request-child-state error"><span>${escapeHtml(error)}</span><button type="button" data-request-child-retry="${bucket}">Retry</button></div>`
+      : "";
+  const pagination = item.child_page > 0 ? `
+    <nav class="request-pagination request-child-pagination" aria-label="Requests in ${bucket}">
+      <button type="button" data-request-bucket="${bucket}" data-request-child-page="${item.child_page - 1}" ${item.child_has_previous && !loading ? "" : "disabled"}>Previous</button>
+      <span>Page ${full(item.child_page)} of ${full(item.child_total_pages)}</span>
+      <button type="button" data-request-bucket="${bucket}" data-request-child-page="${item.child_page + 1}" ${item.child_has_next && !loading ? "" : "disabled"}>Next</button>
+    </nav>
+  ` : "";
+  return `<div class="request-children">${status}${children}${pagination}</div>`;
+}
+
 function renderRequests(payload) {
   const grouped = payload.group !== "none";
   const rows = payload.items.map((item) => grouped ? `
-    <details class="request-group">
+    <details class="request-group" data-request-group="${escapeHtml(item.bucket_start)}" ${expandedRequestGroups.has(item.bucket_start) ? "open" : ""}>
       <summary>
-        <span><strong>${escapeHtml(item.bucket_start)}</strong><small>${full(item.count)} requests</small></span>
+        <span><time datetime="${escapeHtml(item.bucket_start)}">${escapeHtml(formatRequestWindow(item.bucket_start, item.bucket_end, payload.timezone))}</time><small>${full(item.count)} requests · summed in this window</small></span>
         <span class="request-values">${renderRequestValues(item)}</span>
       </summary>
-      <div class="request-children">${item.children.map(renderRequestEvent).join("")}</div>
+      ${renderRequestChildren(item, payload.timezone)}
     </details>
-  ` : renderRequestEvent(item)).join("");
+  ` : renderRequestEvent(item, payload.timezone)).join("");
   return `
-    <section class="requests-panel">
+    <div class="requests-panel">
       <div class="requests-heading">
         <div>
           <h2 class="section-title"><span class="section-icon tone-cyan">${icon("usage")}</span><span>Requests</span></h2>
@@ -799,37 +1087,19 @@ function renderRequests(payload) {
         <span>Page ${full(payload.page)} of ${full(payload.total_pages)}</span>
         <button type="button" data-request-page="${payload.page + 1}" ${payload.has_next ? "" : "disabled"}>Next</button>
       </nav>
-    </section>
+      <footer class="requests-footer">Times, date boundaries, and grouped totals are calculated in <strong>${escapeHtml(requestTimezoneLabel(payload))}</strong>.</footer>
+    </div>
   `;
 }
 
 function renderRequestsState() {
-  if (requestsError) return `<section class="diagnostics-state error"><strong>Could not load Requests.</strong><code>${escapeHtml(requestsError)}</code><button class="requests-retry" type="button">Retry</button></section>`;
+  if (requestsError) return `<div class="diagnostics-state error"><strong>Could not load Requests.</strong><code>${escapeHtml(requestsError)}</code><button class="requests-retry" type="button">Retry</button></div>`;
   if (requestsPayload) return renderRequests(requestsPayload);
-  return `<section class="diagnostics-state" aria-live="polite"><span class="diagnostics-spinner" aria-hidden="true"></span><strong>Loading Requests from Unibase…</strong></section>`;
+  return `<div class="diagnostics-state" aria-live="polite"><span class="diagnostics-spinner" aria-hidden="true"></span><strong>Loading Requests from Unibase…</strong></div>`;
 }
 
 function renderTableView(data) {
-  const supportsDiagnostics = Boolean(data.supports_diagnostics);
-  if (!supportsDiagnostics && activeTableView === "diagnostics") activeTableView = "usage";
-  const key = diagnosticsKey(data);
-  let workspace = renderUsageTables(data);
-  if (supportsDiagnostics && activeTableView === "diagnostics") {
-    if (diagnosticsCache.has(key)) workspace = renderDiagnostics(diagnosticsCache.get(key));
-    else if (diagnosticsErrors.has(key)) workspace = renderDiagnosticsError(diagnosticsErrors.get(key));
-    else workspace = renderDiagnosticsLoading();
-  }
-  if (activeTableView === "requests") workspace = renderRequestsState();
-  const toolbar = `
-    <div class="table-view-toolbar">
-      <nav class="segments" aria-label="Table view">
-        <button class="seg ${activeTableView === "usage" ? "active" : ""}" type="button" data-table-view="usage" aria-pressed="${activeTableView === "usage"}">Usage</button>
-        ${supportsDiagnostics ? `<button class="seg ${activeTableView === "diagnostics" ? "active" : ""}" type="button" data-table-view="diagnostics" aria-pressed="${activeTableView === "diagnostics"}">Diagnostics</button>` : ""}
-        <button class="seg ${activeTableView === "requests" ? "active" : ""}" type="button" data-table-view="requests" aria-pressed="${activeTableView === "requests"}">Requests</button>
-      </nav>
-    </div>
-  `;
-  return `${toolbar}<div id="table-workspace">${workspace}</div>`;
+  return `<div id="table-workspace">${renderUsageTables(data)}</div>`;
 }
 
 function clearDiagnosticsTimer() {
@@ -912,27 +1182,81 @@ function bindTableView(data) {
         chartStartDate = isIsoDate(chartStartDate) ? chartStartDate : data.chart.range_start || todayKey();
         chartEndDate = isIsoDate(chartEndDate) ? chartEndDate : data.chart.range_end || chartStartDate;
         normalizeChartCustomRange();
-        saveActiveChartState();
+        chartCustomRangePending = data.chart?.range !== "custom";
+        chartCustomRangeOpen = true;
         render(data);
         return;
       }
+      chartCustomRangePending = false;
+      chartCustomRangeOpen = false;
       saveActiveChartState();
       syncUrl();
       refresh();
     });
   });
 
-  document.querySelector("#chart-range-form")?.addEventListener("submit", (event) => {
-    event.preventDefault();
-    const form = new FormData(event.currentTarget);
-    chartStartDate = String(form.get("chart_start") || "");
-    chartEndDate = String(form.get("chart_end") || "");
-    normalizeChartCustomRange();
-    activeChartRange = "custom";
-    saveActiveChartState();
-    syncUrl();
-    refresh();
-  });
+  const chartRangeDialog = document.querySelector("#chart-range-dialog");
+  const chartRangeTrigger = document.querySelector("#chart-range-trigger");
+  const chartRangeForm = document.querySelector("#chart-range-form");
+  if (chartRangeDialog && chartRangeTrigger && chartRangeForm) {
+    let listenersAttached = true;
+    const repositionDialog = () => positionCustomRangeDialog(chartRangeDialog, chartRangeTrigger);
+    const removePositionListeners = () => {
+      if (!listenersAttached) return;
+      listenersAttached = false;
+      window.removeEventListener("resize", repositionDialog);
+      window.visualViewport?.removeEventListener("resize", repositionDialog);
+      window.visualViewport?.removeEventListener("scroll", repositionDialog);
+    };
+    const dismissDialog = () => {
+      removePositionListeners();
+      chartCustomRangeOpen = false;
+      if (chartCustomRangePending) {
+        restoreChartState(activeVisualization);
+        chartCustomRangePending = false;
+      }
+      document.documentElement.classList.toggle("custom-range-modal-open", customRangeOpen);
+      chartRangeDialog.close();
+      render(data);
+    };
+
+    chartRangeDialog.showModal();
+    repositionDialog();
+    chartRangeDialog.classList.add("positioned");
+    document.querySelector("#chart-custom-start")?.focus();
+    window.addEventListener("resize", repositionDialog);
+    window.visualViewport?.addEventListener("resize", repositionDialog);
+    window.visualViewport?.addEventListener("scroll", repositionDialog);
+    chartRangeDialog.addEventListener("close", removePositionListeners, { once: true });
+    chartRangeDialog.addEventListener("cancel", (event) => {
+      event.preventDefault();
+      dismissDialog();
+    });
+    chartRangeDialog.addEventListener("click", (event) => {
+      if (event.target !== chartRangeDialog) return;
+      const rect = chartRangeDialog.getBoundingClientRect();
+      const inside = event.clientX >= rect.left && event.clientX <= rect.right
+        && event.clientY >= rect.top && event.clientY <= rect.bottom;
+      if (!inside) dismissDialog();
+    });
+    chartRangeDialog.querySelector(".custom-range-close")?.addEventListener("click", dismissDialog);
+    chartRangeForm.addEventListener("submit", (event) => {
+      event.preventDefault();
+      const form = new FormData(chartRangeForm);
+      chartStartDate = String(form.get("chart_start") || "");
+      chartEndDate = String(form.get("chart_end") || "");
+      normalizeChartCustomRange();
+      activeChartRange = "custom";
+      chartCustomRangePending = false;
+      chartCustomRangeOpen = false;
+      saveActiveChartState();
+      removePositionListeners();
+      document.documentElement.classList.toggle("custom-range-modal-open", customRangeOpen);
+      chartRangeDialog.close();
+      syncUrl();
+      refresh();
+    });
+  }
 
   document.querySelectorAll("[data-cache-mode]").forEach((button) => {
     button.addEventListener("click", () => {
@@ -971,29 +1295,84 @@ function bindTableView(data) {
     ensureRequests(data, true);
   });
   document.querySelector("#request-group")?.addEventListener("change", (event) => {
+    requestChildrenControllers.forEach((controller) => controller.abort());
+    requestChildrenControllers.clear();
     requestGroup = event.target.value;
     requestPage = 1;
     requestSnapshot = null;
     requestsPayload = null;
+    expandedRequestGroups.clear();
+    requestChildrenLoading.clear();
+    requestChildrenErrors.clear();
     syncUrl();
     ensureRequests(data, true);
   });
   document.querySelector("#request-page-size")?.addEventListener("change", (event) => {
+    requestChildrenControllers.forEach((controller) => controller.abort());
+    requestChildrenControllers.clear();
     requestPageSize = Number(event.target.value);
     requestPage = 1;
     requestSnapshot = null;
     requestsPayload = null;
+    expandedRequestGroups.clear();
+    requestChildrenLoading.clear();
+    requestChildrenErrors.clear();
     syncUrl();
     ensureRequests(data, true);
   });
   document.querySelectorAll("[data-request-page]").forEach((button) => {
     button.addEventListener("click", () => {
+      requestChildrenControllers.forEach((controller) => controller.abort());
+      requestChildrenControllers.clear();
       requestPage = Number(button.dataset.requestPage);
       requestsPayload = null;
+      expandedRequestGroups.clear();
+      requestChildrenLoading.clear();
+      requestChildrenErrors.clear();
       syncUrl();
       ensureRequests(data, true);
     });
   });
+  document.querySelectorAll("[data-request-group]").forEach((details) => {
+    details.addEventListener("toggle", () => {
+      const bucket = details.dataset.requestGroup;
+      if (!details.open) {
+        expandedRequestGroups.delete(bucket);
+        return;
+      }
+      expandedRequestGroups.add(bucket);
+      const item = requestsPayload?.items.find((candidate) => candidate.bucket_start === bucket);
+      if (item?.child_page === 0 && !requestChildrenLoading.has(bucket)) loadRequestChildren(data, bucket, 1);
+    });
+  });
+  document.querySelectorAll("[data-request-child-page]").forEach((button) => {
+    button.addEventListener("click", () => {
+      loadRequestChildren(data, button.dataset.requestBucket, Number(button.dataset.requestChildPage));
+    });
+  });
+  document.querySelectorAll("[data-request-child-retry]").forEach((button) => {
+    button.addEventListener("click", () => loadRequestChildren(data, button.dataset.requestChildRetry, 1));
+  });
+}
+
+function requestsParams(bucketStart = null, childPage = 1) {
+  const params = new URLSearchParams();
+  params.set("provider", activeProvider);
+  params.set("range", activeRange);
+  params.set("timezone", Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC");
+  params.set("group", requestGroup);
+  params.set("page", String(requestPage));
+  params.set("page_size", String(requestPageSize));
+  if (activeRange === "custom") {
+    params.set("start", customStartDate);
+    params.set("end", customEndDate);
+  }
+  if (requestSnapshot) params.set("snapshot", requestSnapshot);
+  if (bucketStart) {
+    params.set("bucket_start", bucketStart);
+    params.set("child_page", String(childPage));
+  }
+  return params;
 }
 
 async function ensureRequests(data, force = false, allowSnapshotRetry = true) {
@@ -1006,19 +1385,7 @@ async function ensureRequests(data, force = false, allowSnapshotRetry = true) {
   const controller = requestsController;
   requestsError = null;
   if (activeTableView === "requests") updateTableView(data);
-  const params = new URLSearchParams();
-  params.set("provider", activeProvider);
-  params.set("range", activeRange);
-  params.set("timezone", Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC");
-  params.set("group", requestGroup);
-  params.set("page", String(requestPage));
-  params.set("page_size", String(requestPageSize));
-  if (activeRange === "custom") {
-    params.set("start", customStartDate);
-    params.set("end", customEndDate);
-  }
-  if (legacyIgnoreOverride !== null) params.set("ignore_auto_review", ignoreAutoReview ? "1" : "0");
-  if (requestSnapshot) params.set("snapshot", requestSnapshot);
+  const params = requestsParams();
   try {
     const response = await fetch(`/api/requests?${params}`, { cache: "no-store", signal: controller.signal });
     if (!response.ok) {
@@ -1043,35 +1410,111 @@ async function ensureRequests(data, force = false, allowSnapshotRetry = true) {
   }
 }
 
+async function loadRequestChildren(data, bucket, childPage) {
+  if (!requestsPayload || requestGroup === "none" || childPage < 1) return;
+  requestChildrenControllers.get(bucket)?.abort();
+  const controller = new AbortController();
+  requestChildrenControllers.set(bucket, controller);
+  requestChildrenErrors.delete(bucket);
+  requestChildrenLoading.add(bucket);
+  if (activeTableView === "requests") updateTableView(data);
+  try {
+    const response = await fetch(`/api/requests?${requestsParams(bucket, childPage)}`, {
+      cache: "no-store",
+      signal: controller.signal
+    });
+    if (!response.ok) {
+      if (response.status === 409 && requestSnapshot) {
+        invalidateRequests();
+        syncUrl();
+        return ensureRequests(data, true, false);
+      }
+      throw new Error(`Requests API returned HTTP ${response.status}`);
+    }
+    const payload = await response.json();
+    const nextItem = payload.items[0];
+    if (!nextItem || !requestsPayload || payload.snapshot !== requestSnapshot) return;
+    requestsPayload = {
+      ...requestsPayload,
+      items: requestsPayload.items.map((item) => item.bucket_start === bucket ? nextItem : item)
+    };
+  } catch (error) {
+    if (error.name === "AbortError") return;
+    requestChildrenErrors.set(bucket, error.message);
+  } finally {
+    if (requestChildrenControllers.get(bucket) === controller) {
+      requestChildrenLoading.delete(bucket);
+      requestChildrenControllers.delete(bucket);
+      if (activeTableView === "requests") updateTableView(data);
+    }
+  }
+}
+
 function settingsIsDirty() {
   if (!settingsData || !settingsDraft) return false;
   const original = {
-    ignore_codex_auto_review: settingsData.ignore_codex_auto_review,
-    backups: Object.values(settingsData.backups).flat().map(({ source_id, enabled }) => ({ source_id, enabled }))
+    merge_models_across_providers: settingsData.merge_models_across_providers,
+    sources: Object.values(settingsData.sources).flat().map(({ source_id, enabled }) => ({ source_id, enabled })),
+    models: Object.values(settingsData.models).flat().map(({ model, enabled }) => ({ model, enabled }))
   };
   return JSON.stringify(original) !== JSON.stringify(settingsDraft);
 }
 
-function renderBackupGroup(provider, sources) {
+function settingsDraftFromData(payload) {
+  return {
+    merge_models_across_providers: payload.merge_models_across_providers,
+    sources: Object.values(payload.sources).flat().map(({ source_id, enabled }) => ({ source_id, enabled })),
+    models: Object.values(payload.models).flat().map(({ model, enabled }) => ({ model, enabled }))
+  };
+}
+
+function renderSourceGroup(provider, sources) {
   const label = providerOptions.find((option) => option.value === provider)?.label || provider;
-  const operationRunning = ["queued", "running"].includes(settingsData?.unibase?.current_operation?.state);
+  const settingsLocked = settingsApplyPending || ["queued", "running"].includes(settingsData?.unibase?.current_operation?.state);
   return `
     <div class="settings-source-group">
       <h3>${escapeHtml(label)}</h3>
-      ${sources.length ? sources.map((source) => {
-        const draft = settingsDraft?.backups.find((item) => item.source_id === source.source_id);
+      <div class="settings-source-list">${sources.length ? sources.map((source) => {
+        const draft = settingsDraft?.sources.find((item) => item.source_id === source.source_id);
         return `
-          <label class="settings-source">
-            <input type="checkbox" data-settings-source="${escapeHtml(source.source_id)}" ${draft?.enabled ? "checked" : ""} ${operationRunning || ["ambiguous", "incomplete"].includes(source.status) ? "disabled" : ""}>
+          <label class="settings-source ${source.original ? "settings-source-original" : ""}">
+            <input type="checkbox" data-settings-source="${escapeHtml(source.source_id)}" ${draft?.enabled ? "checked" : ""} ${source.original || settingsLocked || ["ambiguous", "incomplete"].includes(source.status) ? "disabled" : ""}>
             <span>
-              <strong>${escapeHtml(source.label)}</strong>
-              <small>${escapeHtml(source.relative_name)} · ${escapeHtml(source.layout)}${source.snapshot_date ? ` · ${escapeHtml(source.snapshot_date)}` : ""}</small>
-              <em class="source-status status-${escapeHtml(source.status)}">${escapeHtml(source.status)}${source.stale ? " · stale" : ""} · ${full(source.event_count)} events</em>
+              <strong>${escapeHtml(source.label)}${source.original ? '<span class="source-origin-badge">Original</span>' : ""}</strong>
+              <small title="${escapeHtml(source.path)}">${escapeHtml(source.path)} · ${formatMegabytes(source.size_bytes)} · ${full(source.event_count)} events</small>
             </span>
+            <em class="source-status status-${escapeHtml(source.status)}">${escapeHtml(source.status)}${source.stale ? " · stale" : ""}</em>
           </label>
         `;
-      }).join("") : '<p class="settings-empty">No backup snapshots discovered.</p>'}
+      }).join("") : '<p class="settings-empty">No sources discovered.</p>'}</div>
     </div>
+  `;
+}
+
+function renderModelGroup(group, models) {
+  const settingsLocked = settingsApplyPending || ["queued", "running"].includes(settingsData?.unibase?.current_operation?.state);
+  const metadata = {
+    gpt: { label: "GPT", description: "OpenAI and Codex", provider: "codex" },
+    claude: { label: "Claude", description: "Anthropic models", provider: "claude" },
+    others: { label: "Others", description: "OpenCode and custom", provider: "opencode" }
+  }[group];
+  const enabledCount = models.filter((item) => settingsDraft?.models.find((model) => model.model === item.model)?.enabled).length;
+  return `
+    <section class="settings-model-group settings-model-group-${escapeHtml(group)}">
+      <div class="settings-model-heading">
+        <div class="settings-model-identity">
+          <span class="settings-model-logo">${providerLogo(metadata.provider)}</span>
+          <div><h3>${escapeHtml(metadata.label)}</h3><p>${escapeHtml(metadata.description)}</p></div>
+        </div>
+        <span class="settings-model-count">${full(enabledCount)}/${full(models.length)} on</span>
+      </div>
+      <div class="settings-model-list">
+        ${models.length ? models.map((item) => {
+          const draft = settingsDraft?.models.find((model) => model.model === item.model);
+          return `<label class="settings-model"><input type="checkbox" data-settings-model="${escapeHtml(item.model)}" ${draft?.enabled ? "checked" : ""} ${settingsLocked ? "disabled" : ""}><span title="${escapeHtml(item.model)}">${escapeHtml(item.model)}</span></label>`;
+        }).join("") : '<p class="settings-empty">No models found.</p>'}
+      </div>
+    </section>
   `;
 }
 
@@ -1085,38 +1528,52 @@ function renderSettingsDialog() {
   }
   const operation = settingsData.unibase.current_operation;
   const operationRunning = operation && ["queued", "running"].includes(operation.state);
+  const settingsLocked = operationRunning || settingsApplyPending;
   const dirty = settingsIsDirty();
   return `
     <dialog class="settings-dialog" id="settings-dialog" aria-labelledby="settings-title">
       <form class="settings-shell" id="settings-form">
         <div class="settings-header">
           <div><span class="eyebrow">MeterMesh control plane</span><h2 id="settings-title">Settings</h2></div>
-          <button class="settings-close" type="button" aria-label="Close Settings">×</button>
+          <button class="settings-close" id="settings-close" type="button" aria-label="Close Settings" ${settingsApplyPending ? "disabled" : ""}>×</button>
         </div>
         ${settingsError ? `<div class="settings-error" role="alert">${escapeHtml(settingsError)}</div>` : ""}
-        <section class="settings-section">
-          <h3>Preferences</h3>
-          <label class="settings-preference"><input id="settings-auto-review" type="checkbox" ${settingsDraft.ignore_codex_auto_review ? "checked" : ""} ${operationRunning ? "disabled" : ""}><span><strong>Ignore "${escapeHtml(autoReviewModel)}"</strong><small>Applies only to Codex events in Codex and All views.</small></span></label>
-        </section>
-        <section class="settings-section">
-          <div class="settings-section-heading"><div><h3>Backup sources</h3><p>Unchecked snapshots stay registered but do not support active totals.</p></div></div>
-          <div class="settings-source-groups">${["codex", "claude", "opencode"].map((provider) => renderBackupGroup(provider, settingsData.backups[provider] || [])).join("")}</div>
-        </section>
-        <section class="settings-section unibase-settings">
-          <div>
-            <h3>Unibase</h3>
-            <p><code>${escapeHtml(settingsData.unibase.path)}</code> · generation ${full(settingsData.unibase.generation)} · ${escapeHtml(settingsData.unibase.state)}</p>
-            <p>${full(settingsData.unibase.counts.active_events)} active events · ${full(settingsData.unibase.counts.retained_variants)} retained variants</p>
-          </div>
-          <div class="unibase-actions">
-            <button id="full-reindex" type="button" ${dirty || operationRunning ? "disabled" : ""}>Full reindex</button>
-            <button id="reset-unibase" class="danger" type="button" ${dirty || operationRunning ? "disabled" : ""}>Reset Unibase</button>
-          </div>
-          ${operation ? `<div class="operation-progress" role="status" aria-live="polite"><div><strong>${escapeHtml(operation.kind)}</strong><span>${escapeHtml(operation.state)}</span></div><progress aria-label="${escapeHtml(operation.kind)} progress" max="${Math.max(operation.progress_total, 1)}" value="${operation.progress_current}"></progress>${operation.error ? `<code>${escapeHtml(operation.error)}</code>` : ""}</div>` : ""}
-        </section>
+        <div class="settings-tabs" role="tablist" aria-label="Settings sections">
+          <button type="button" role="tab" data-settings-tab="general" aria-selected="${settingsActiveTab === "general"}">General</button>
+          <button type="button" role="tab" data-settings-tab="models" aria-selected="${settingsActiveTab === "models"}">Models</button>
+        </div>
+        <div class="settings-tab-panel" role="tabpanel">
+          ${settingsActiveTab === "general" ? `
+            <section class="settings-section">
+              <h3>Preferences</h3>
+              <label class="settings-preference"><input id="settings-merge-models" type="checkbox" ${settingsDraft.merge_models_across_providers ? "checked" : ""} ${settingsLocked ? "disabled" : ""}><span><strong>Merge matching models in "All" mode</strong><small>Combines the same model name across Codex, Claude, and OpenCode in charts and model usage tables.</small></span></label>
+            </section>
+            <section class="settings-section">
+              <div class="settings-section-heading"><div><h3>Sources</h3><p>Original live sources are always enabled. Optional sources remain registered when unchecked.</p></div></div>
+              <div class="settings-source-groups">${["codex", "claude", "opencode"].map((provider) => renderSourceGroup(provider, settingsData.sources[provider] || [])).join("")}</div>
+            </section>
+            <section class="settings-section unibase-settings">
+              <div>
+                <h3>Unibase</h3>
+                <p><code>${escapeHtml(settingsData.unibase.path)}</code> · generation ${full(settingsData.unibase.generation)} · ${escapeHtml(settingsData.unibase.state)}</p>
+                <p>${full(settingsData.unibase.counts.active_events)} active events · ${full(settingsData.unibase.counts.retained_variants)} retained variants</p>
+              </div>
+              <div class="unibase-actions">
+                <span><button id="resync-unibase" type="button" ${dirty || settingsLocked || settingsData.unibase.state === "reset_empty" ? "disabled" : ""}>Resync</button><small>Reload every enabled source and deduplicate without deleting retained Unibase records.</small></span>
+                <span><button id="reset-unibase" class="danger" type="button" ${dirty || settingsLocked ? "disabled" : ""}>Reset</button><small>Replace all derived Unibase data with a clean rebuild from enabled sources.</small></span>
+              </div>
+              ${operation ? `<div class="operation-progress" role="status" aria-live="polite"><div><strong>${escapeHtml(operation.kind)}</strong><span>${escapeHtml(operation.state)}</span></div><progress aria-label="${escapeHtml(operation.kind)} progress" max="${Math.max(operation.progress_total, 1)}" value="${operation.progress_current}"></progress>${operation.error ? `<code>${escapeHtml(operation.error)}</code>` : ""}</div>` : ""}
+            </section>
+          ` : `
+            <section class="settings-section settings-models-section">
+              <div class="settings-section-heading"><div><span class="eyebrow">Global visibility</span><h3>Models</h3><p>Disabled models are hidden from every provider, chart, statistic, and Token Usage list. Disable codex-auto-review here when it should be excluded.</p></div></div>
+              <div class="settings-model-groups">${["gpt", "claude", "others"].map((group) => renderModelGroup(group, settingsData.models[group] || [])).join("")}</div>
+            </section>
+          `}
+        </div>
         <div class="settings-actions">
-          <button class="settings-cancel" type="button">Cancel</button>
-          <button class="settings-apply" type="submit" ${dirty && !operationRunning ? "" : "disabled"}>Apply</button>
+          <button class="settings-cancel" id="settings-cancel" type="button" ${settingsApplyPending ? "disabled" : ""}>Cancel</button>
+          <button class="settings-apply" id="settings-apply" type="submit" ${dirty && !settingsLocked ? "" : "disabled"}>${settingsApplyPending ? '<span class="settings-apply-spinner" aria-hidden="true"></span><span>Applying…</span>' : settingsApplied && !dirty ? "Applied" : "Apply"}</button>
         </div>
       </form>
     </dialog>
@@ -1125,7 +1582,7 @@ function renderSettingsDialog() {
         <form id="reset-confirm-form">
           <span class="eyebrow danger-text">Destructive action</span>
           <h2 id="reset-confirm-title">Reset Unibase?</h2>
-          <p>Provider files and backup folders are untouched. Derived usage data is removed until Full reindex.</p>
+          <p>Provider source files are untouched. Unibase is fully cleared and automatically rebuilt from every enabled source.</p>
           <label>Type <strong>RESET UNIBASE</strong><input id="reset-confirm-input" autocomplete="off" value="${escapeHtml(resetConfirmation)}"></label>
           <div class="settings-actions"><button class="reset-cancel" type="button">Cancel</button><button class="danger" id="reset-confirm-submit" type="submit" ${resetConfirmation === "RESET UNIBASE" ? "" : "disabled"}>Reset</button></div>
         </form>
@@ -1136,19 +1593,19 @@ function renderSettingsDialog() {
 
 async function openSettings() {
   const startedAt = Date.now();
+  if (!settingsOpen) settingsActiveTab = "general";
   settingsOpen = true;
   settingsLoading = true;
   settingsError = null;
+  settingsApplyPending = false;
+  settingsApplied = false;
   render(currentData);
   console.info("[MeterMesh timing] settings fetch started");
   try {
     const response = await fetch("/api/settings", { cache: "no-store" });
     if (!response.ok) throw new Error(`Settings API returned HTTP ${response.status}`);
     settingsData = await response.json();
-    settingsDraft = {
-      ignore_codex_auto_review: settingsData.ignore_codex_auto_review,
-      backups: Object.values(settingsData.backups).flat().map(({ source_id, enabled }) => ({ source_id, enabled }))
-    };
+    settingsDraft = settingsDraftFromData(settingsData);
     console.info("[MeterMesh timing] settings fetch completed", { elapsedMs: Date.now() - startedAt });
   } catch (error) {
     console.error("[MeterMesh timing] settings fetch failed", { elapsedMs: Date.now() - startedAt, error });
@@ -1167,38 +1624,125 @@ async function openSettings() {
 }
 
 function closeSettings() {
+  if (settingsApplyPending) return;
   settingsOpen = false;
   resetConfirmOpen = false;
   resetConfirmation = "";
   settingsError = null;
+  settingsApplied = false;
   if (operationPollTimer) window.clearTimeout(operationPollTimer);
   operationPollTimer = null;
   render(currentData);
 }
 
 function invalidateDashboardCaches() {
+  usageCache.clear();
   diagnosticsCache.clear();
   diagnosticsErrors.clear();
   invalidateRequests();
 }
 
+async function refreshSourceChanges() {
+  if (manualRefreshPending) return;
+  manualRefreshPending = true;
+  render(currentData);
+  try {
+    const response = await fetch("/api/sources/refresh", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}"
+    });
+    if (response.status === 409) {
+      const conflict = await response.json();
+      if (currentData && conflict.source_sync) render({ ...currentData, sync: conflict.source_sync });
+      return;
+    }
+    if (!response.ok) throw new Error(`Source refresh returned HTTP ${response.status}`);
+    while (true) {
+      await new Promise((resolve) => window.setTimeout(resolve, 500));
+      const statusResponse = await fetch(`/api/unibase/status?provider=${encodeURIComponent(activeProvider)}`, { cache: "no-store" });
+      if (!statusResponse.ok) throw new Error(`Sync status returned HTTP ${statusResponse.status}`);
+      const status = await statusResponse.json();
+      if (status.source_sync?.state === "running") continue;
+      if (status.source_sync?.error) throw new Error(status.source_sync.error);
+      break;
+    }
+    invalidateDashboardCaches();
+    await refresh();
+  } finally {
+    manualRefreshPending = false;
+    if (currentData) render(currentData);
+  }
+}
+
+function scheduleSourceSyncPoll(data) {
+  if (sourceSyncPollTimer) window.clearTimeout(sourceSyncPollTimer);
+  const delay = data.sync?.state === "running" ? 1000 : 30000;
+  sourceSyncPollTimer = window.setTimeout(async () => {
+    try {
+      const response = await fetch(`/api/unibase/status?provider=${encodeURIComponent(activeProvider)}`, { cache: "no-store" });
+      if (!response.ok) throw new Error(`Sync status returned HTTP ${response.status}`);
+      const payload = await response.json();
+      if (!currentData) return;
+      const generationChanged = Number(payload.generation) !== Number(currentData.generation);
+      if (generationChanged && payload.source_sync?.state !== "running") {
+        usageCache.clear();
+        await refresh();
+        return;
+      }
+      const nextSync = payload.source_sync || currentData.sync;
+      if (nextSync?.state !== currentData.sync?.state || payload.fresh_at !== currentData.fresh_at) {
+        const freshAt = Object.hasOwn(payload, "fresh_at") ? payload.fresh_at : currentData.fresh_at;
+        render({ ...currentData, sync: nextSync, fresh_at: freshAt });
+      } else {
+        scheduleSourceSyncPoll(currentData);
+      }
+    } catch (error) {
+      console.warn("[MeterMesh timing] sync status poll failed", error);
+      if (currentData) scheduleSourceSyncPoll(currentData);
+    }
+  }, delay);
+}
+
+function renderSettingsUpdate() {
+  const dialog = document.querySelector("#settings-dialog");
+  const scrollTop = dialog?.scrollTop || 0;
+  const focusedId = dialog?.contains(document.activeElement) ? document.activeElement.id : "";
+  render(currentData);
+  const nextDialog = document.querySelector("#settings-dialog");
+  if (nextDialog) nextDialog.scrollTop = scrollTop;
+  if (focusedId) document.getElementById(focusedId)?.focus({ preventScroll: true });
+}
+
 async function pollOperation(operationId) {
-  const response = await fetch(`/api/unibase/status?operation_id=${encodeURIComponent(operationId)}`, { cache: "no-store" });
-  if (!response.ok) throw new Error(`Operation status returned HTTP ${response.status}`);
-  const payload = await response.json();
+  operationPollTimer = null;
+  let payload;
+  try {
+    const params = new URLSearchParams({ operation_id: operationId, provider: activeProvider });
+    const response = await fetch(`/api/unibase/status?${params}`, { cache: "no-store" });
+    if (!response.ok) throw new Error(`Operation status returned HTTP ${response.status}`);
+    payload = await response.json();
+  } catch (error) {
+    if (!settingsOpen) return;
+    settingsError = `${error.message} Retrying…`;
+    renderSettingsUpdate();
+    if (settingsOpen) {
+      operationPollTimer = window.setTimeout(() => pollOperation(operationId), 1500);
+    }
+    return;
+  }
+  if (!settingsOpen) return;
+  settingsError = null;
   settingsData.unibase.current_operation = payload.operation;
   settingsData.unibase.generation = payload.generation;
   settingsData.unibase.state = payload.state;
-  render(currentData);
+  renderSettingsUpdate();
   if (payload.operation && ["queued", "running"].includes(payload.operation.state)) {
-    operationPollTimer = window.setTimeout(() => pollOperation(operationId).catch((error) => {
-      settingsError = error.message;
-      render(currentData);
-    }), 600);
+    if (settingsOpen) operationPollTimer = window.setTimeout(() => pollOperation(operationId), 600);
   } else if (payload.operation?.state === "succeeded") {
     invalidateDashboardCaches();
     await refresh();
-    await openSettings();
+    if (settingsOpen) await openSettings();
   }
 }
 
@@ -1220,8 +1764,8 @@ async function ensureDiagnostics(data, force = false) {
   if (activeTableView === "diagnostics") updateTableView(data);
   diagnosticsTimer = window.setInterval(() => {
     if (activeTableView !== "diagnostics" || diagnosticsKey(currentData || data) !== key) return;
-    const workspace = document.querySelector("#table-workspace");
-    if (workspace) workspace.innerHTML = renderDiagnosticsLoading(Math.floor((Date.now() - startedAt) / 1000));
+      const panel = document.querySelector("#right-panel-content");
+      if (panel) panel.innerHTML = renderDiagnosticsLoading(Math.floor((Date.now() - startedAt) / 1000));
   }, 1000);
 
   try {
@@ -1297,9 +1841,14 @@ function render(data) {
   const indexingNote = data.indexing
     ? ` · ${full(data.indexing.events)} events from ${full(data.indexing.files)} JSONL files`
     : "";
+  const syncRunning = data.sync?.state === "running" || manualRefreshPending;
+  const syncNote = syncRunning ? " · syncing sources" : "";
+  const freshnessLabel = data.fresh_at
+    ? `Unibase current as of ${formatTimestamp(data.fresh_at)}`
+    : "Unibase not fully synced";
   const rangeSummary = customRangePending ? "Choose custom range" : describeRange(data);
   document.documentElement.dataset.provider = provider;
-  document.documentElement.classList.toggle("custom-range-modal-open", customRangeOpen);
+  document.documentElement.classList.toggle("custom-range-modal-open", customRangeOpen || chartCustomRangeOpen);
   document.documentElement.classList.toggle("settings-modal-open", settingsOpen);
   document.title = `MeterMesh · ${providerLabel}`;
 
@@ -1313,7 +1862,7 @@ function render(data) {
             <span class="brand-scope">${escapeHtml(providerLabel)}</span>
           </div>
           <div class="brand-meta">
-            <span>Generated ${escapeHtml(data.generated_at)} from ${escapeHtml(data.data_source || "Unibase")}${indexingNote}</span>
+            <span class="freshness-line">${escapeHtml(freshnessLabel)}${indexingNote}${syncNote}<button class="source-refresh-trigger ${syncRunning ? "is-spinning" : ""}" id="source-refresh-trigger" type="button" aria-label="Check for source changes" title="Check for source changes" ${syncRunning ? "disabled" : ""}>${icon("refresh")}</button></span>
             <strong>Showing ${escapeHtml(rangeSummary)}</strong>
           </div>
         </div>
@@ -1417,7 +1966,7 @@ function render(data) {
           </div>
         </div>
         <div class="group-metric-grid usage-profile-grid">
-          ${groupMetricItem({ label: "Favorite model", value: escapeHtml(data.favorite_model), iconName: "star", tone: "violet", compact: true })}
+          ${groupMetricItem({ label: "Favorite model", value: escapeHtml(truncateModelName(data.favorite_model)), iconName: "star", tone: "violet", compact: true })}
           ${groupMetricItem({ label: "Data source", value: escapeHtml(data.data_source || "SQLite + JSONL"), iconName: "database", tone: "violet", compact: true })}
         </div>
       </section>
@@ -1445,6 +1994,12 @@ function render(data) {
   });
 
   document.querySelector("#settings-trigger")?.addEventListener("click", openSettings);
+  document.querySelector("#source-refresh-trigger")?.addEventListener("click", () => {
+    refreshSourceChanges().catch((error) => {
+      console.error("[MeterMesh timing] manual source refresh failed", error);
+      window.alert(`Could not refresh sources: ${error.message}`);
+    });
+  });
 
   document.querySelectorAll("[data-range]").forEach((button) => {
     button.addEventListener("click", () => {
@@ -1546,45 +2101,68 @@ function render(data) {
     });
     const syncDirtyControls = () => {
       const dirty = settingsIsDirty();
-      settingsDialog.querySelector(".settings-apply")?.toggleAttribute("disabled", !dirty);
-      settingsDialog.querySelector("#full-reindex")?.toggleAttribute("disabled", dirty);
+      const applyButton = settingsDialog.querySelector(".settings-apply");
+      applyButton?.toggleAttribute("disabled", !dirty);
+      if (applyButton) applyButton.innerHTML = settingsApplied && !dirty ? "Applied" : "Apply";
+      settingsDialog.querySelector("#resync-unibase")?.toggleAttribute("disabled", dirty || settingsData.unibase.state === "reset_empty");
       settingsDialog.querySelector("#reset-unibase")?.toggleAttribute("disabled", dirty);
     };
-    settingsDialog.querySelector("#settings-auto-review")?.addEventListener("change", (event) => {
-      settingsDraft.ignore_codex_auto_review = event.target.checked;
+    settingsDialog.querySelectorAll("[data-settings-tab]").forEach((button) => {
+      button.addEventListener("click", () => {
+        settingsActiveTab = button.dataset.settingsTab;
+        renderSettingsUpdate();
+      });
+    });
+    settingsDialog.querySelector("#settings-merge-models")?.addEventListener("change", (event) => {
+      settingsApplied = false;
+      settingsDraft.merge_models_across_providers = event.target.checked;
       syncDirtyControls();
     });
     settingsDialog.querySelectorAll("[data-settings-source]").forEach((input) => {
       input.addEventListener("change", () => {
-        const source = settingsDraft.backups.find((item) => item.source_id === input.dataset.settingsSource);
+        settingsApplied = false;
+        const source = settingsDraft.sources.find((item) => item.source_id === input.dataset.settingsSource);
         if (source) source.enabled = input.checked;
+        syncDirtyControls();
+      });
+    });
+    settingsDialog.querySelectorAll("[data-settings-model]").forEach((input) => {
+      input.addEventListener("change", () => {
+        settingsApplied = false;
+        const model = settingsDraft.models.find((item) => item.model === input.dataset.settingsModel);
+        if (model) model.enabled = input.checked;
         syncDirtyControls();
       });
     });
     settingsDialog.querySelector("#settings-form")?.addEventListener("submit", async (event) => {
       event.preventDefault();
+      if (settingsApplyPending || !settingsIsDirty()) return;
+      const body = JSON.stringify({ revision: settingsData.revision, ...settingsDraft });
+      settingsApplyPending = true;
+      settingsApplied = false;
       settingsError = null;
+      renderSettingsUpdate();
       try {
         const response = await fetch("/api/settings", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ revision: settingsData.revision, ...settingsDraft })
+          body
         });
         if (!response.ok) throw new Error(response.status === 409 ? "Settings changed in another window. Reopen Settings." : `Settings API returned HTTP ${response.status}`);
         settingsData = await response.json();
-        settingsDraft = {
-          ignore_codex_auto_review: settingsData.ignore_codex_auto_review,
-          backups: Object.values(settingsData.backups).flat().map(({ source_id, enabled }) => ({ source_id, enabled }))
-        };
-        ignoreAutoReview = settingsData.ignore_codex_auto_review;
-        legacyIgnoreOverride = null;
-        writeCookie(ignoreAutoReviewCookie, ignoreAutoReview ? "1" : "0");
+        settingsDraft = settingsDraftFromData(settingsData);
+        settingsApplyPending = false;
+        settingsApplied = true;
         invalidateDashboardCaches();
         syncUrl();
         await refresh();
+        settingsApplyPending = false;
+        closeSettings();
       } catch (error) {
+        settingsApplyPending = false;
+        settingsApplied = false;
         settingsError = error.message;
-        render(data);
+        renderSettingsUpdate();
       }
     });
     settingsDialog.querySelector("#reset-unibase")?.addEventListener("click", () => {
@@ -1592,17 +2170,17 @@ function render(data) {
       resetConfirmation = "";
       render(data);
     });
-    settingsDialog.querySelector("#full-reindex")?.addEventListener("click", async () => {
+    settingsDialog.querySelector("#resync-unibase")?.addEventListener("click", async () => {
       settingsError = null;
       try {
-        const response = await fetch("/api/unibase/reindex", {
+        const response = await fetch("/api/unibase/resync", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: "{}"
         });
-        if (!response.ok) throw new Error(`Full reindex returned HTTP ${response.status}`);
+        if (!response.ok) throw new Error(`Resync returned HTTP ${response.status}`);
         const payload = await response.json();
-        settingsData.unibase.current_operation = { kind: "full_reindex", state: "queued", progress_current: 0, progress_total: 0 };
+        settingsData.unibase.current_operation = { kind: "resync", state: "queued", progress_current: 0, progress_total: 0 };
         render(data);
         await pollOperation(payload.operation_id);
       } catch (error) {
@@ -1640,15 +2218,12 @@ function render(data) {
           body: JSON.stringify({ confirmation: resetConfirmation })
         });
         if (!response.ok) throw new Error(`Reset returned HTTP ${response.status}`);
-        settingsData = await response.json();
-        settingsDraft = {
-          ignore_codex_auto_review: settingsData.ignore_codex_auto_review,
-          backups: Object.values(settingsData.backups).flat().map(({ source_id, enabled }) => ({ source_id, enabled }))
-        };
+        const payload = await response.json();
+        settingsData.unibase.current_operation = { kind: "reset", state: "queued", progress_current: 0, progress_total: 0 };
         resetConfirmOpen = false;
         resetConfirmation = "";
-        invalidateDashboardCaches();
-        await refresh();
+        render(data);
+        await pollOperation(payload.operation_id);
       } catch (error) {
         settingsError = error.message;
         resetConfirmOpen = false;
@@ -1657,6 +2232,7 @@ function render(data) {
     });
   }
 
+  scheduleSourceSyncPoll(data);
 }
 
 function icon(name, className = "") {
@@ -1785,6 +2361,8 @@ function hideHeatTooltip() {
 async function refresh() {
   cancelDiagnosticsRequest();
   try {
+    const cached = usageCache.get(buildQuery(activeRange));
+    if (cached) render(cached);
     const data = await load(activeRange);
     diagnosticsCache.delete(diagnosticsKey(data));
     diagnosticsErrors.delete(diagnosticsKey(data));
@@ -1793,7 +2371,8 @@ async function refresh() {
     activeChartRange = data.chart?.range || activeChartRange;
     customRangePending = false;
     customRangeOpen = false;
-    ignoreAutoReview = Boolean(data.ignore_auto_review);
+    chartCustomRangePending = false;
+    chartCustomRangeOpen = false;
     if (data.range === "custom") {
       customStartDate = data.range_start || customStartDate;
       customEndDate = data.range_end || customEndDate;
@@ -1807,6 +2386,7 @@ async function refresh() {
   } catch (error) {
     if (error.name === "AbortError") return;
     customRangeOpen = false;
+    chartCustomRangeOpen = false;
     document.documentElement.classList.remove("custom-range-modal-open");
     const providerLabel = providerOptions.find((option) => option.value === activeProvider)?.label || "ALL";
     app.innerHTML = `<section class="state error"><h1>MeterMesh · ${providerLabel}</h1><p>Could not load committed Unibase data.</p><code>${escapeHtml(error.message)}</code></section>`;

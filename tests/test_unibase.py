@@ -33,6 +33,41 @@ class UnibaseFoundationTests(unittest.TestCase):
         migrate.assert_not_called()
         self.assertEqual(database.settings()["state"], "ready")
 
+    def test_version_five_database_adds_failed_request_columns(self):
+        with self.db.connect() as conn:
+            conn.execute("alter table app_settings drop column ignore_failed_requests")
+            conn.execute("alter table event_variants drop column failed")
+            conn.execute("alter table active_events drop column failed")
+            conn.execute("pragma user_version = 5")
+
+        reopened = unibase.Unibase(self.db_path)
+
+        self.assertFalse(reopened.settings()["ignore_failed_requests"])
+        with reopened.connect(readonly=True) as conn:
+            self.assertIn("failed", {row[1] for row in conn.execute("pragma table_info(event_variants)")})
+            self.assertIn("failed", {row[1] for row in conn.execute("pragma table_info(active_events)")})
+
+    def test_version_seven_adds_model_inventory_and_removes_unknown_sentinel(self):
+        with self.db.connect() as conn:
+            conn.execute("insert into disabled_models(model, created_at) values ('remembered-model', 'now')")
+            conn.execute("insert into disabled_models(model, created_at) values ('(unknown)', 'now')")
+            conn.execute("drop table known_models")
+            conn.execute("alter table app_settings drop column merge_models_across_providers")
+            conn.execute("pragma user_version = 7")
+
+        reopened = unibase.Unibase(self.db_path)
+
+        self.assertFalse(reopened.settings()["merge_models_across_providers"])
+        with reopened.connect(readonly=True) as conn:
+            self.assertEqual(
+                [row[0] for row in conn.execute("select model from known_models order by model")],
+                ["remembered-model"],
+            )
+            self.assertEqual(
+                [row[0] for row in conn.execute("select model from disabled_models order by model")],
+                ["remembered-model"],
+            )
+
     def test_settings_revision_conflict_and_reset_preserves_registry(self):
         codex = self.root / ".codex"
         claude = self.root / ".claude"
@@ -73,6 +108,20 @@ class UnibaseFoundationTests(unittest.TestCase):
         self.assertEqual(sources[0].status, "ready")
         self.assertEqual(sources[1].status, "ready")
         self.assertFalse(any(source.enabled for source in sources))
+
+    def test_rediscovery_preserves_existing_live_source_status(self):
+        source = unibase.DiscoveredSource(
+            "live", "codex", "live", self.root, "live", "Live", True, 1000, None, None, "not_indexed"
+        )
+        self.db.register_source(source)
+        with self.db.connect() as conn:
+            conn.execute(
+                "update sources set discovery_status = 'ready', last_successful_scan = '2026-07-16T12:00:00Z' where source_id = 'live'"
+            )
+
+        self.db.register_source(source)
+
+        self.assertEqual(self.db.sources("codex")[0]["discovery_status"], "ready")
 
     def test_manifest_path_traversal_is_incomplete(self):
         child = self.root / "add_stat" / "bad"
@@ -117,6 +166,99 @@ class UnibaseFoundationTests(unittest.TestCase):
         self.assertEqual(len(self.db.active_event_rows()), 1)
         self.db.set_source_enabled("live", True)
         self.assertEqual(len(self.db.active_event_rows()), 1)
+
+    def test_incremental_projection_updates_only_dirty_event_keys(self):
+        self.db.register_source(unibase.DiscoveredSource(
+            "live", "codex", "live", self.root, "live", "live",
+            True, 1000, None, None, "ready",
+        ))
+        for index in (1, 2):
+            self.db.add_event("live", None, {
+                "provider": "codex", "event_key": f"event-{index}", "stream_key": f"stream-{index}",
+                "timestamp_utc": "2026-07-16T12:00:00Z", "occurred_at": 1784203200 + index,
+                "model": "gpt-test", "native_provider_id": "openai", "semantics": "exact",
+                "classification": "usage_update", "input_tokens": index, "cache_read_tokens": 0,
+                "cache_write_tokens": 0, "output_tokens": 1, "reasoning_tokens": 0,
+                "cost_usd": None, "cost_kind": "unavailable",
+            }, 1)
+        first_generation = self.db.rebuild_active_events()
+
+        second_generation = self.db.rebuild_active_events({("codex", "event-1")})
+        rows = {row["event_key"]: row for row in self.db.active_event_rows("codex")}
+
+        self.assertGreater(second_generation, first_generation)
+        self.assertEqual(rows["event-1"]["generation"], second_generation)
+        self.assertEqual(rows["event-2"]["generation"], first_generation)
+
+    def test_non_destructive_resync_retains_variants_but_selects_latest_scan(self):
+        self.db.register_source(unibase.DiscoveredSource(
+            "live", "claude", "live", self.root, "live", "live",
+            True, 1000, None, None, "ready",
+        ))
+        source_file_id = self.db.upsert_source_file("live", "file:safe", "transcript", size=1, mtime_ns=1)
+        original = {
+            "provider": "claude", "event_key": "event-1", "stream_key": "stream-1",
+            "timestamp_utc": "2026-07-16T12:00:00Z", "occurred_at": 1784203200,
+            "model": "claude-test", "native_provider_id": "anthropic", "semantics": "claude_metadata",
+            "classification": "usage_update", "input_tokens": 1, "cache_read_tokens": 0,
+            "cache_write_tokens": 0, "output_tokens": 1, "reasoning_tokens": 0,
+            "cost_usd": None, "cost_kind": "unavailable",
+        }
+        self.db.add_event("live", source_file_id, original, 1)
+        self.db.rebuild_active_events()
+
+        self.db.add_events("live", source_file_id, [{**original, "input_tokens": 9}], 2)
+        self.db.rebuild_active_events({("claude", "event-1")})
+
+        self.assertEqual(self.db.active_event_rows("claude")[0]["input_tokens"], 9)
+        with self.db.connect(readonly=True) as conn:
+            self.assertEqual(conn.execute("select count(*) from event_variants").fetchone()[0], 2)
+
+        self.db.add_events("live", source_file_id, [original], 3)
+        self.db.rebuild_active_events({("claude", "event-1")})
+        self.assertEqual(self.db.active_event_rows("claude")[0]["input_tokens"], 1)
+
+    def test_latest_occurrence_generation_wins_for_duplicate_variant(self):
+        self.db.register_source(unibase.DiscoveredSource(
+            "live", "claude", "live", self.root, "live", "live",
+            True, 1000, None, None, "ready",
+        ))
+        files = [
+            self.db.upsert_source_file("live", f"file:{index}", "transcript", size=1, mtime_ns=index)
+            for index in range(3)
+        ]
+        event = {
+            "provider": "claude", "event_key": "event-1", "stream_key": "stream-1",
+            "timestamp_utc": "2026-07-16T12:00:00Z", "occurred_at": 1784203200,
+            "model": "claude-test", "native_provider_id": "anthropic", "semantics": "claude_metadata",
+            "classification": "usage_update", "input_tokens": 1, "cache_read_tokens": 0,
+            "cache_write_tokens": 0, "output_tokens": 1, "reasoning_tokens": 0,
+            "cost_usd": None, "cost_kind": "unavailable",
+        }
+        self.db.add_events("live", files[0], [event], 1)
+        self.db.add_events("live", files[1], [{**event, "input_tokens": 9}], 2)
+        self.db.add_events("live", files[2], [event], 3)
+
+        self.db.rebuild_active_events()
+
+        self.assertEqual(self.db.active_event_rows("claude")[0]["input_tokens"], 1)
+
+    def test_incomplete_reconciliation_marks_source_stale_without_advancing_freshness(self):
+        self.db.register_source(unibase.DiscoveredSource(
+            "live", "codex", "live", self.root, "live", "live",
+            True, 1000, None, None, "ready",
+        ))
+        with self.db.connect() as conn:
+            conn.execute(
+                "update sources set last_successful_generation = 1, last_successful_scan = '2026-07-16T12:00:00Z' where source_id = 'live'"
+            )
+
+        self.db.reconcile_source_files("live", 2, [], complete=False)
+
+        source = self.db.sources("codex")[0]
+        self.assertTrue(source["stale"])
+        self.assertEqual(source["last_successful_generation"], 1)
+        self.assertEqual(source["last_successful_scan"], "2026-07-16T12:00:00Z")
 
     def test_failed_atomic_file_replacement_keeps_previous_occurrence(self):
         self.db.register_source(unibase.DiscoveredSource(
