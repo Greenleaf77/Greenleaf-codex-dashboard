@@ -1,3 +1,4 @@
+import errno
 import json
 import sqlite3
 import tempfile
@@ -167,6 +168,61 @@ class UnibaseFoundationTests(unittest.TestCase):
         self.assertEqual(self.db.settings()["state"], "reset_empty")
         self.assertTrue(self.db.settings()["ignore_codex_auto_review"])
         self.assertEqual([row["source_id"] for row in self.db.sources()], source_ids)
+
+    def test_read_only_root_without_add_stat_registers_live_source(self):
+        # A `:ro` container mount of a never-indexed source has no add_stat/, and
+        # mkdir answers EROFS rather than EEXIST, so exist_ok cannot absorb it.
+        # Discovery must degrade to "no backups" instead of taking the live
+        # source down with it.
+        codex = self.root / "ro" / ".codex"
+        (codex / "sessions").mkdir(parents=True)
+        original_mkdir = Path.mkdir
+
+        def mkdir_unless_add_stat(path, *args, **kwargs):
+            if path.name == "add_stat":
+                raise OSError(errno.EROFS, "read-only file system")
+            return original_mkdir(path, *args, **kwargs)
+
+        with patch.object(Path, "mkdir", autospec=True, side_effect=mkdir_unless_add_stat):
+            self.assertEqual(unibase.discover_backup_sources("codex", codex / "add_stat"), [])
+            unibase.register_default_sources(
+                self.db,
+                codex_root=codex,
+                claude_root=self.root / ".claude",
+                opencode_root=self.root / "opencode",
+            )
+        codex_live = [
+            row for row in self.db.sources()
+            if row["provider"] == "codex" and row["kind"] == "live"
+        ]
+        self.assertEqual(len(codex_live), 1)
+
+    def test_backup_discovery_does_not_hide_unexpected_filesystem_errors(self):
+        with patch.object(Path, "mkdir", side_effect=OSError(errno.EIO, "input/output error")):
+            with self.assertRaises(OSError) as raised:
+                unibase.discover_backup_sources("codex", self.root / "add_stat")
+        self.assertEqual(raised.exception.errno, errno.EIO)
+
+    def test_default_source_registration_does_not_hide_root_errors(self):
+        codex = self.root / "broken" / ".codex"
+        original_mkdir = Path.mkdir
+
+        def fail_codex_root(path, *args, **kwargs):
+            if path == codex:
+                raise OSError(errno.EIO, "input/output error")
+            return original_mkdir(path, *args, **kwargs)
+
+        with patch.object(Path, "mkdir", autospec=True, side_effect=fail_codex_root), patch.object(
+            unibase, "discover_backup_sources", return_value=[]
+        ):
+            with self.assertRaises(OSError) as raised:
+                unibase.register_default_sources(
+                    self.db,
+                    codex_root=codex,
+                    claude_root=self.root / ".claude",
+                    opencode_root=self.root / "opencode",
+                )
+        self.assertEqual(raised.exception.errno, errno.EIO)
 
     def test_normalized_and_legacy_discovery(self):
         add_stat = self.root / "add_stat"

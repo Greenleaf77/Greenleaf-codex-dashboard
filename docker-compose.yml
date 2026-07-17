@@ -1,0 +1,48 @@
+services:
+  metermesh:
+    build: .
+    image: metermesh:local
+    container_name: metermesh
+    init: true
+    user: "${METERMESH_UID:-10001}:${METERMESH_GID:-10001}"
+    # Keeps write access to the unibase volume when METERMESH_UID is overridden;
+    # the volume is owned by gid 10001 and is group-writable, not world-writable.
+    group_add:
+      - "10001"
+    ports:
+      - "127.0.0.1:8765:8765"
+    environment:
+      HOME: ${HOME:?HOME must be set}
+      METERMESH_UNIBASE_DB: /data/unibase/unibase.sqlite3
+      METERMESH_ALLOW_REMOTE: "1"
+      CODEX_USAGE_DB: ${HOME}/.codex/state_5.sqlite
+      CLAUDE_PROJECTS_DIR: ${HOME}/.claude/projects
+      OPENCODE_USAGE_DB: ${HOME}/.local/share/opencode/opencode.db
+    volumes:
+      - metermesh-unibase:/data/unibase
+      - type: bind
+        source: ${HOME:?HOME must be set}/.codex
+        target: ${HOME:?HOME must be set}/.codex
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${HOME:?HOME must be set}/.claude
+        target: ${HOME:?HOME must be set}/.claude
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${HOME:?HOME must be set}/.local/share/opencode
+        target: ${HOME:?HOME must be set}/.local/share/opencode
+        read_only: true
+        bind:
+          create_host_path: false
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+volumes:
+  metermesh-unibase:

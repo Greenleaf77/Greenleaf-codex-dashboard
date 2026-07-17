@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import datetime as dt
+import errno
 import hashlib
 import json
 import os
@@ -1485,7 +1486,17 @@ def _legacy_roots(provider: str, child: Path) -> list[Path]:
 
 
 def discover_backup_sources(provider: str, add_stat_dir: Path) -> list[DiscoveredSource]:
-    add_stat_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        add_stat_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        if exc.errno != errno.EROFS:
+            raise
+        # A read-only source root cannot gain an add_stat/ directory: mkdir
+        # reports EROFS rather than EEXIST, so exist_ok never engages. Nothing
+        # can have been snapshotted there either, so there is simply nothing to
+        # discover. Read-only roots are normal (a `:ro` container mount, backups
+        # on read-only media) and must not stop the live source registering.
+        return []
     discovered: list[DiscoveredSource] = []
     for child in sorted(path for path in add_stat_dir.iterdir() if path.is_dir()):
         manifest_path = child / "snapshot.json"
@@ -1547,9 +1558,16 @@ def register_default_sources(
         "opencode": (opencode_root or default_opencode_data_dir()).expanduser(),
     }
     for provider, root in roots.items():
-        root.mkdir(parents=True, exist_ok=True)
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            if exc.errno != errno.EROFS:
+                raise
+            # Already-present read-only roots answer mkdir with EEXIST, which
+            # exist_ok absorbs; only a genuinely missing root on read-only media
+            # reaches here, and registration below still reports it accurately.
+            pass
         add_stat = root / "add_stat"
-        add_stat.mkdir(parents=True, exist_ok=True)
         live_root = root
         source = DiscoveredSource(
             stable_id(provider, "live"), provider, "live", live_root, "live", f"Live {provider.title()}",
