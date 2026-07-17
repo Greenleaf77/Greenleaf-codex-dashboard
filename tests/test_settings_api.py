@@ -71,7 +71,8 @@ class SettingsApiTests(unittest.TestCase):
         status, payload = self.request("/api/settings")
         self.assertEqual(status, 200)
         self.assertEqual(payload["revision"], 1)
-        self.assertFalse(payload["merge_models_across_providers"])
+        self.assertTrue(payload["merge_models_across_providers"])
+        self.assertEqual(payload["non_working_weekdays"], [5, 6])
         self.assertEqual(len(payload["sources"]["codex"]), 2)
         self.assertTrue(payload["sources"]["codex"][0]["original"])
         self.assertEqual(payload["sources"]["codex"][0]["size_bytes"], 2 * 1024 * 1024)
@@ -91,6 +92,7 @@ class SettingsApiTests(unittest.TestCase):
         body = {
             "revision": payload["revision"],
             "merge_models_across_providers": True,
+            "non_working_weekdays": [5, 6],
             "sources": sources,
             "models": [],
         }
@@ -158,6 +160,7 @@ class SettingsApiTests(unittest.TestCase):
             status, applied = self.request("/api/settings", "POST", {
                 "revision": payload["revision"],
                 "merge_models_across_providers": False,
+                "non_working_weekdays": [5, 6],
                 "sources": sources,
                 "models": models,
             })
@@ -184,10 +187,61 @@ class SettingsApiTests(unittest.TestCase):
         status, _ = self.request("/api/settings", "POST", {
             "revision": 1,
             "merge_models_across_providers": False,
+            "non_working_weekdays": [5, 6],
             "sources": [None],
             "models": [],
         })
         self.assertEqual(status, 400)
+
+    def test_calendar_only_settings_change_skips_index_maintenance(self):
+        status, payload = self.request("/api/settings")
+        self.assertEqual(status, 200)
+        sources = [
+            {"source_id": source["source_id"], "enabled": source["enabled"]}
+            for provider_sources in payload["sources"].values()
+            for source in provider_sources
+        ]
+        models = [
+            {"model": model["model"], "enabled": model["enabled"]}
+            for group in payload["models"].values()
+            for model in group
+        ]
+        body = {
+            "revision": payload["revision"],
+            "merge_models_across_providers": payload["merge_models_across_providers"],
+            "non_working_weekdays": [2, 6],
+            "sources": sources,
+            "models": models,
+        }
+
+        with patch.object(dashboard_api, "schedule_enabled_sources_refresh") as schedule, patch.object(
+            unibase.Unibase, "rebuild_active_events"
+        ) as rebuild:
+            status, applied = self.request("/api/settings", "POST", body)
+
+        self.assertEqual(status, 200)
+        self.assertEqual(applied["non_working_weekdays"], [2, 6])
+        schedule.assert_not_called()
+        rebuild.assert_not_called()
+
+    def test_settings_reject_invalid_non_working_weekdays(self):
+        status, payload = self.request("/api/settings")
+        self.assertEqual(status, 200)
+        sources = [
+            {"source_id": source["source_id"], "enabled": source["enabled"]}
+            for provider_sources in payload["sources"].values()
+            for source in provider_sources
+        ]
+        for weekdays in ([1, 1], [-1], [7], list(range(7))):
+            with self.subTest(weekdays=weekdays):
+                status, _ = self.request("/api/settings", "POST", {
+                    "revision": payload["revision"],
+                    "merge_models_across_providers": False,
+                    "non_working_weekdays": weekdays,
+                    "sources": sources,
+                    "models": [],
+                })
+                self.assertEqual(status, 400)
 
     def test_model_inventory_excludes_unknown_and_survives_event_reset(self):
         for event_key, model in (("known", "remembered-model"), ("unknown", "(unknown)")):
@@ -472,6 +526,7 @@ class SettingsApiTests(unittest.TestCase):
         body = {
             "revision": settings["revision"],
             "merge_models_across_providers": False,
+            "non_working_weekdays": [5, 6],
             "sources": [
                 {"source_id": "codex-live", "enabled": True},
                 {"source_id": "codex-backup", "enabled": False},
