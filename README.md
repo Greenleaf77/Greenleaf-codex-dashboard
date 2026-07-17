@@ -109,6 +109,80 @@ Direct API server:
 python3 dashboard_api.py --host 127.0.0.1 --port 8766
 ```
 
+### Run in Docker
+
+MeterMesh ships a `Dockerfile` and `docker-compose.yml` for a sandboxed single-process runtime: the built SPA is served from `dist/` by a small `DashboardHandler` subclass, and every `/api/*` and `/data.json` request falls through to the upstream handlers. No Vite, no proxy at runtime.
+
+Requirements: Docker 24+ (or Docker Desktop) with Compose v2.
+
+```bash
+docker compose up -d
+```
+
+Open <http://127.0.0.1:8765>. The container binds to loopback only — not exposed to the LAN.
+
+#### Path mapping
+
+Provider sources are bind-mounted **read-only** from your host into fixed in-container paths. The compose file wires the defaults; override the host side of each mount (left of `:`) if your data lives elsewhere.
+
+| Host path | Container path | Env var | What it is |
+|-----------|----------------|---------|------------|
+| `~/.codex` | `/data/sources/codex` | `CODEX_USAGE_DB=/data/sources/codex/state_5.sqlite` | Codex live source + `add_stat/` backups |
+| `~/.claude` | `/data/sources/claude` | `CLAUDE_PROJECTS_DIR=/data/sources/claude/projects` | Claude `projects/**/*.jsonl` + `add_stat/` backups |
+| `~/.local/share/opencode` | `/data/sources/opencode` | `OPENCODE_USAGE_DB=/data/sources/opencode/opencode.db` | OpenCode live source + `add_stat/` backups |
+| — (named volume) | `/data/unibase` | `METERMESH_UNIBASE_DB=/data/unibase/unibase.sqlite3` | Rebuildable index, only writable path |
+
+The container paths and env vars are fixed by the image; only the host side of the bind mounts needs adjusting.
+
+#### Custom source paths
+
+If your provider data is not under the defaults, edit the `volumes` block in `docker-compose.yml`:
+
+```yaml
+volumes:
+  - metermesh-unibase:/data/unibase
+  - /opt/codex:/data/sources/codex:ro          # ← your Codex dir
+  - /srv/claude:/data/sources/claude:ro        # ← your Claude dir
+  - /var/lib/opencode:/data/sources/opencode:ro # ← your OpenCode data dir
+```
+
+To point Unibase at a host directory instead of a named volume (so you can inspect or back it up):
+
+```yaml
+volumes:
+  - ./unibase:/data/unibase
+  # …source mounts unchanged…
+```
+
+#### Pre-create `add_stat/` directories
+
+MeterMesh defensively calls `mkdir(exist_ok=True)` on each provider's `add_stat/` directory at startup. Against a read-only bind mount, `os.mkdir` raises `EROFS` *before* Python can check existence — so the directories must already exist on the host:
+
+```bash
+mkdir -p ~/.codex/add_stat ~/.claude/add_stat ~/.local/share/opencode/add_stat
+```
+
+These directories are documented under [Backup Snapshots](#backup-snapshots) and are safe to leave empty.
+
+#### Sandbox guarantees
+
+| Concern | Mitigation |
+|---------|------------|
+| Writes to provider sources | Blocked — bind-mounted `:ro` |
+| Network exposure | Host port bound to `127.0.0.1:8765` only |
+| Privilege escalation | `no-new-privileges`, `cap_drop: ALL`, non-root uid 10001 |
+| Path traversal via `/assets/..` | Resolved and rejected in `docker/server.py` |
+| Unibase corruption | Isolated named volume, only writable path in the container |
+
+#### Commands
+
+```bash
+docker compose up -d        # start
+docker compose logs -f      # tail logs
+docker compose down         # stop (Unibase volume preserved)
+docker compose down -v      # stop + wipe Unibase
+```
+
 ## Settings And Maintenance
 
 - **Apply** persists source, model, and All-scope aggregation preferences with optimistic revision checking.
