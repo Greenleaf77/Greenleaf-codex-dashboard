@@ -1,6 +1,5 @@
 import datetime as dt
 import json
-import statistics
 import tempfile
 import time
 import unittest
@@ -21,7 +20,6 @@ class CodexDeduplicationBenchmarkTests(unittest.TestCase):
     def _write_copied_rollouts(self, *, files, records):
         base = dt.datetime(2026, 7, 16, 12, tzinfo=dt.timezone.utc)
         rows = []
-        cumulative = {key: 0 for key in codex_usage.USAGE_COMPONENTS}
         for index in range(records):
             usage = {
                 "input_tokens": 100 + index,
@@ -29,8 +27,6 @@ class CodexDeduplicationBenchmarkTests(unittest.TestCase):
                 "output_tokens": 10 + index,
                 "reasoning_output_tokens": 5 + index,
             }
-            for key in cumulative:
-                cumulative[key] += usage[key]
             timestamp = (base + dt.timedelta(seconds=index)).isoformat().replace("+00:00", "Z")
             rows.extend((
                 {
@@ -45,7 +41,7 @@ class CodexDeduplicationBenchmarkTests(unittest.TestCase):
                         "type": "token_count",
                         "info": {
                             "last_token_usage": {**usage, "total_tokens": usage["input_tokens"] + usage["output_tokens"]},
-                            "total_token_usage": dict(cumulative),
+                            "total_token_usage": usage,
                         },
                         "rate_limits": {"window": index % 5, "remaining": records - index},
                     },
@@ -64,8 +60,8 @@ class CodexDeduplicationBenchmarkTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-    def _index_once(self, *, experimental, run):
-        database = unibase.Unibase(self.root / f"unibase-{experimental}-{run}.sqlite3")
+    def _index_once(self, *, run):
+        database = unibase.Unibase(self.root / f"unibase-{run}.sqlite3")
         database.register_source(unibase.DiscoveredSource(
             "codex-live", "codex", "live", self.codex_root, "live", "Live Codex",
             True, 1000, None, None, "ready",
@@ -74,33 +70,25 @@ class CodexDeduplicationBenchmarkTests(unittest.TestCase):
         result = codex_usage.import_codex_source(
             database,
             database.sources("codex")[0],
-            experimental_deduplication=experimental,
             force_full_scan=True,
         )
         return time.perf_counter() - started_at, result
 
-    def test_full_indexing_cost_is_reported_with_and_without_experimental_deduplication(self):
-        legacy_samples = []
-        experimental_samples = []
-        experimental_result = None
+    def test_full_deduplicated_indexing_cost_is_reported(self):
+        samples = []
+        result = None
         for run in range(3):
-            elapsed, _ = self._index_once(experimental=False, run=run)
-            legacy_samples.append(elapsed)
-            elapsed, experimental_result = self._index_once(experimental=True, run=run)
-            experimental_samples.append(elapsed)
+            elapsed, result = self._index_once(run=run)
+            samples.append(elapsed)
 
-        legacy = statistics.median(legacy_samples)
-        experimental = statistics.median(experimental_samples)
-        delta_percent = ((experimental / legacy) - 1) * 100 if legacy else 0
+        median = sorted(samples)[len(samples) // 2]
         print(
             "[MeterMesh benchmark] CODEX full index: "
-            f"legacy={legacy * 1000:.1f} ms; experimental={experimental * 1000:.1f} ms; "
-            f"delta={delta_percent:+.1f}%"
+            f"deduplicated={median * 1000:.1f} ms"
         )
-        self.assertGreater(legacy, 0)
-        self.assertGreater(experimental, 0)
-        self.assertEqual(experimental_result["token_count_events"], 2400)
-        self.assertEqual(experimental_result["unique_usage_records"], 200)
+        self.assertGreater(median, 0)
+        self.assertEqual(result["token_count_events"], 2400)
+        self.assertEqual(result["unique_usage_records"], 200)
 
 
 if __name__ == "__main__":

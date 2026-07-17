@@ -124,7 +124,7 @@ class SqlUsageTests(unittest.TestCase):
             "models": models,
             "chart": dashboard_api.chart_days_from_events(chart_events, chart_filters),
             "pricing_missing": sorted(missing_models),
-            "favorite_model": models[0]["model"] if models else "-",
+            "favorite_model": models[0]["model"].split(" · ", 1)[-1] if models else "-",
             "current_streak": dashboard_api.current_streak(days),
             "longest_streak": dashboard_api.longest_streak(days),
             "peak_day": peak["day"] if peak else "-",

@@ -11,17 +11,16 @@ from pathlib import Path
 from unibase import Unibase, open_source_sqlite_readonly, sanitize_error, stable_id
 
 
-PARSER_VERSION = 2
-DEDUP_PARSER_VERSION = 3
-AUTO_REVIEW_MODEL = "codex-auto-review"
-USAGE_COMPONENTS = ("input_tokens", "cached_input_tokens", "output_tokens", "reasoning_output_tokens")
-DEDUP_USAGE_FIELDS = (*USAGE_COMPONENTS, "total_tokens")
+PARSER_VERSION = 3
+DEDUP_USAGE_FIELDS = (
+    "input_tokens",
+    "cached_input_tokens",
+    "output_tokens",
+    "reasoning_output_tokens",
+    "total_tokens",
+)
 ROLLOUT_UUID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 ROLLOUT_FILENAME = re.compile(r"^rollout-.*\.jsonl$")
-
-
-def active_parser_version(experimental_deduplication: bool) -> int:
-    return DEDUP_PARSER_VERSION if experimental_deduplication else PARSER_VERSION
 
 
 def canonical_json(value: object) -> str:
@@ -36,37 +35,6 @@ def normalize_dedup_usage(value: object) -> tuple[int, int, int, int, int]:
 def make_dedup_key(usage: object, rate_limits: object) -> str:
     canonical = canonical_json({"usage": normalize_dedup_usage(usage), "rate_limits": rate_limits})
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-
-
-def parse_usage_components(value: object, *, cumulative: bool = False) -> dict[str, int] | None:
-    if not isinstance(value, dict):
-        return None
-    if cumulative and any(key not in value for key in USAGE_COMPONENTS[:3]):
-        return None
-    try:
-        usage = {key: int(value.get(key) or 0) for key in USAGE_COMPONENTS}
-    except (TypeError, ValueError):
-        return None
-    if any(component < 0 for component in usage.values()):
-        return None
-    return usage
-
-
-def usage_has_tokens(usage: dict[str, int] | None) -> bool:
-    return bool(usage and any(usage[key] > 0 for key in USAGE_COMPONENTS))
-
-
-def is_model_output_item(item_type: str | None, payload: dict) -> bool:
-    if item_type == "event_msg" and payload.get("type") in {"agent_message", "agent_reasoning"}:
-        return True
-    if item_type != "response_item":
-        return False
-    payload_type = payload.get("type")
-    if payload_type == "reasoning":
-        return True
-    if payload_type == "message":
-        return payload.get("role") == "assistant"
-    return isinstance(payload_type, str) and payload_type.endswith("_call") and not payload_type.endswith("_call_output")
 
 
 def usage_event(
@@ -95,108 +63,6 @@ def usage_event(
         "output_tokens": usage["output_tokens"],
         "reasoning_tokens": usage["reasoning_output_tokens"],
     }
-
-
-def scan_rollout_telemetry(rollout_path: Path, stream_key: str, model: str) -> dict[str, list[dict]]:
-    token_records: list[dict] = []
-    exact_records: list[dict] = []
-    model_output_since_token = False
-    with rollout_path.open(encoding="utf-8", errors="ignore") as handle:
-        for line_number, line in enumerate(handle, 1):
-            if not any(marker in line for marker in ('"token_count"', '"raw_response_completed"', '"response_item"', '"agent_message"', '"agent_reasoning"')):
-                continue
-            try:
-                item = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            payload = item.get("payload") or {}
-            if not isinstance(payload, dict):
-                continue
-            item_type = item.get("type")
-            payload_type = payload.get("type")
-            if is_model_output_item(item_type, payload):
-                model_output_since_token = True
-                continue
-            if payload_type == "raw_response_completed":
-                timestamp = item.get("timestamp")
-                parsed = parse_usage_components(payload.get("token_usage"))
-                if timestamp and parsed and usage_has_tokens(parsed):
-                    exact_records.append({"line_number": line_number, "timestamp": timestamp, "response_id": str(payload.get("response_id") or ""), "usage": parsed})
-                model_output_since_token = True
-                continue
-            if payload_type != "token_count":
-                continue
-            timestamp = item.get("timestamp")
-            if not timestamp:
-                model_output_since_token = False
-                continue
-            info = payload.get("info") or {}
-            token_records.append({
-                "line_number": line_number,
-                "timestamp": timestamp,
-                "last": parse_usage_components(info.get("last_token_usage")),
-                "cumulative": parse_usage_components(info.get("total_token_usage"), cumulative=True),
-                "model_output": model_output_since_token,
-            })
-            model_output_since_token = False
-
-    unique_exact = []
-    seen_response_ids = set()
-    for record in exact_records:
-        response_id = record["response_id"]
-        if response_id and response_id in seen_response_ids:
-            continue
-        if response_id:
-            seen_response_ids.add(response_id)
-        unique_exact.append(record)
-    covered_lines = set()
-    token_index = 0
-    for record in unique_exact:
-        while token_index < len(token_records) and token_records[token_index]["line_number"] < record["line_number"]:
-            token_index += 1
-        if token_index < len(token_records):
-            covered_lines.add(token_records[token_index]["line_number"])
-            token_index += 1
-
-    previous = None
-    token_events = []
-    fallback_events = []
-    for record in token_records:
-        current = record["cumulative"]
-        last = record["last"]
-        contribution = None
-        if current is None:
-            classification = "unverifiable_event"
-            if record["model_output"] and usage_has_tokens(last):
-                contribution = last
-        elif previous is None:
-            if record["model_output"] and usage_has_tokens(last):
-                classification = "usage_update"
-                contribution = last
-            else:
-                classification = "baseline_event"
-            previous = current
-        elif all(current[key] == previous[key] for key in USAGE_COMPONENTS):
-            classification = "replayed_event"
-        elif all(current[key] >= previous[key] for key in USAGE_COMPONENTS):
-            classification = "usage_update"
-            contribution = {key: current[key] - previous[key] for key in USAGE_COMPONENTS}
-            previous = current
-        else:
-            classification = "counter_reset"
-            if record["model_output"] and usage_has_tokens(last):
-                contribution = last
-            previous = current
-        raw = last or {key: 0 for key in USAGE_COMPONENTS}
-        token_events.append(usage_event(stream_key, model, record["timestamp"], raw, "reported", classification))
-        if contribution and usage_has_tokens(contribution) and record["line_number"] not in covered_lines:
-            fallback_events.append(usage_event(stream_key, model, record["timestamp"], contribution, "fallback", classification))
-
-    exact_events = [
-        usage_event(stream_key, model, record["timestamp"], record["usage"], "exact", "usage_update", record["response_id"] or None)
-        for record in unique_exact
-    ]
-    return {"usage_events": sorted(fallback_events + exact_events, key=lambda item: item["timestamp_utc"]), "token_events": token_events}
 
 
 def scan_rollout_deduplicated_usage(rollout_path: Path, stream_key: str, model: str) -> dict:
@@ -236,7 +102,7 @@ def scan_rollout_deduplicated_usage(rollout_path: Path, stream_key: str, model: 
                 event = usage_event(stream_key, model, timestamp, usage, "deduplicated", "usage_update")
             except ValueError:
                 continue
-            event["input_tokens"] = normalized[0] - normalized[1]
+            event["input_tokens"] = max(normalized[0] - normalized[1], 0)
             event["dedup_key"] = make_dedup_key(usage_value, payload.get("rate_limits"))
             event["source_line"] = line_number
             usage_events.append(event)
@@ -337,8 +203,6 @@ def import_codex_source(
     unibase: Unibase,
     source: dict,
     *,
-    ignore_auto_review: bool = False,
-    experimental_deduplication: bool = False,
     state_path: Path | None = None,
     require_state_inventory: bool = False,
     force_full_scan: bool = False,
@@ -384,7 +248,7 @@ def import_codex_source(
         raise RuntimeError("Codex state inventory is unavailable or incomplete")
 
     scan_generation = unibase.begin_source_scan(source_id)
-    parser_version = active_parser_version(experimental_deduplication)
+    parser_version = PARSER_VERSION
     seen_paths = []
     parsed_files = 0
     imported = 0
@@ -429,35 +293,20 @@ def import_codex_source(
             )
             stream_key, metadata_model = rollout_metadata(path, content_hash)
             model = state_rollouts.get(path.resolve(), backup_models.get(path.name, metadata_model))
-            if ignore_auto_review and model == AUTO_REVIEW_MODEL:
-                telemetry = {"usage_events": []}
-            elif experimental_deduplication:
-                telemetry = scan_rollout_deduplicated_usage(path, stream_key, model)
-                diagnostics = telemetry["diagnostics"]
-                processed_lines += int(diagnostics["processed_lines"])
-                malformed_lines += int(diagnostics["malformed_lines"])
-                token_count_events += int(diagnostics["token_count_events"])
-                file_minimum = diagnostics["minimum_timestamp"]
-                file_maximum = diagnostics["maximum_timestamp"]
-                if file_minimum and (minimum_timestamp is None or file_minimum < minimum_timestamp):
-                    minimum_timestamp = file_minimum
-                if file_maximum and (maximum_timestamp is None or file_maximum > maximum_timestamp):
-                    maximum_timestamp = file_maximum
-            else:
-                telemetry = scan_rollout_telemetry(path, stream_key, model)
-            ordinals: dict[tuple[str, str, str], int] = {}
+            telemetry = scan_rollout_deduplicated_usage(path, stream_key, model)
+            diagnostics = telemetry["diagnostics"]
+            processed_lines += int(diagnostics["processed_lines"])
+            malformed_lines += int(diagnostics["malformed_lines"])
+            token_count_events += int(diagnostics["token_count_events"])
+            file_minimum = diagnostics["minimum_timestamp"]
+            file_maximum = diagnostics["maximum_timestamp"]
+            if file_minimum and (minimum_timestamp is None or file_minimum < minimum_timestamp):
+                minimum_timestamp = file_minimum
+            if file_maximum and (maximum_timestamp is None or file_maximum > maximum_timestamp):
+                maximum_timestamp = file_maximum
             parsed_events = []
             for item in telemetry["usage_events"]:
-                ordinal_key = (item["timestamp_utc"], item["source"], item["classification"])
-                ordinal = ordinals.get(ordinal_key, 0)
-                ordinals[ordinal_key] = ordinal + 1
-                response_id = item.get("response_id")
-                if experimental_deduplication:
-                    event_key = item["dedup_key"]
-                elif response_id:
-                    event_key = stable_id("codex", "response", response_id)
-                else:
-                    event_key = stable_id("codex", "record", stream_key, *ordinal_key, ordinal)
+                event_key = item["dedup_key"]
                 parsed_events.append({
                     "provider": "codex",
                     "event_key": event_key,
@@ -466,7 +315,7 @@ def import_codex_source(
                     "occurred_at": item["occurred_at"],
                     "model": model,
                     "native_provider_id": "openai",
-                    "semantics": "codex_global_dedup" if experimental_deduplication else "exact" if item["source"] == "exact" else "cumulative_fallback",
+                    "semantics": "codex_global_dedup",
                     "classification": item["classification"],
                     "input_tokens": item["input_tokens"],
                     "cache_read_tokens": item["cache_read_tokens"],
@@ -509,7 +358,7 @@ def import_codex_source(
         if is_live and not state_inventory_complete:
             unibase.mark_source_error(source_id, "Codex state inventory is incomplete; retained committed data")
         active_events = unibase.active_event_rows("codex")
-        unique_usage_records = len(active_events) if experimental_deduplication else imported
+        unique_usage_records = len(active_events)
         return {
             "files": len(set(seen_paths)),
             "scanned_files": parsed_files,

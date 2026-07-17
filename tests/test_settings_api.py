@@ -76,6 +76,8 @@ class SettingsApiTests(unittest.TestCase):
         self.assertEqual(payload["sources"]["codex"][0]["size_bytes"], 2 * 1024 * 1024)
         self.assertIsNone(payload["unibase"]["fresh_at"])
         self.assertNotIn("ignore_failed_requests", payload)
+        self.assertNotIn("ignore_codex_auto_review", payload)
+        self.assertNotIn("experimental_codex_deduplication", payload)
         encoded = json.dumps(payload)
         self.assertNotIn(str(self.root), encoded)
 
@@ -87,16 +89,12 @@ class SettingsApiTests(unittest.TestCase):
         next(source for source in sources if source["source_id"] == "codex-backup")["enabled"] = True
         body = {
             "revision": payload["revision"],
-            "ignore_codex_auto_review": True,
-            "experimental_codex_deduplication": True,
             "sources": sources,
             "models": [],
         }
         with patch.object(dashboard_api, "schedule_enabled_sources_refresh", return_value=True):
             status, applied = self.request("/api/settings", "POST", body)
             self.assertEqual(status, 200)
-            self.assertTrue(applied["ignore_codex_auto_review"])
-            self.assertTrue(applied["experimental_codex_deduplication"])
             self.assertTrue(applied["sources"]["codex"][1]["enabled"])
 
             status, conflict = self.request("/api/settings", "POST", body)
@@ -156,8 +154,6 @@ class SettingsApiTests(unittest.TestCase):
         with patch.object(dashboard_api, "schedule_enabled_sources_refresh", return_value=True):
             status, applied = self.request("/api/settings", "POST", {
                 "revision": payload["revision"],
-                "ignore_codex_auto_review": False,
-                "experimental_codex_deduplication": False,
                 "sources": sources,
                 "models": models,
             })
@@ -174,6 +170,7 @@ class SettingsApiTests(unittest.TestCase):
         self.assertNotIn("GPT-TEST", {row["model"].split(" · ")[-1] for row in stats["models"]})
         self.assertNotIn("GPT-TEST", {item["model"].split(" · ")[-1] for item in requests["items"]})
         self.assertEqual(stats["totals"]["total_tokens"], 22)
+        self.assertEqual(stats["favorite_model"], "claude-test")
 
     def test_post_requires_json_and_strict_fields(self):
         status, _ = self.request("/api/settings", "POST", {"revision": 1}, content_type="text/plain")
@@ -182,8 +179,6 @@ class SettingsApiTests(unittest.TestCase):
         self.assertEqual(status, 400)
         status, _ = self.request("/api/settings", "POST", {
             "revision": 1,
-            "ignore_codex_auto_review": False,
-            "experimental_codex_deduplication": False,
             "sources": [None],
             "models": [],
         })
@@ -342,14 +337,17 @@ class SettingsApiTests(unittest.TestCase):
                 "timestamp": "2026-07-16T12:00:00Z",
                 "type": "event_msg",
                 "payload": {
-                    "type": "raw_response_completed",
-                    "response_id": "response-test",
-                    "token_usage": {
-                        "input_tokens": 5,
-                        "cached_input_tokens": 1,
-                        "output_tokens": 2,
-                        "reasoning_output_tokens": 0,
+                    "type": "token_count",
+                    "info": {
+                        "last_token_usage": {
+                            "input_tokens": 5,
+                            "cached_input_tokens": 1,
+                            "output_tokens": 2,
+                            "reasoning_output_tokens": 0,
+                            "total_tokens": 7,
+                        },
                     },
+                    "rate_limits": {"used": 1},
                 },
             },
         )) + "\n", encoding="utf-8")
@@ -368,7 +366,6 @@ class SettingsApiTests(unittest.TestCase):
         self.assertEqual(operation["state"], "succeeded")
         settings = dashboard_api.settings_payload(self.path)
         self.assertEqual(settings["unibase"]["state"], "ready")
-        self.assertTrue(settings["ignore_codex_auto_review"])
         self.assertEqual(len(settings["sources"]["codex"]), 2)
         self.assertEqual(settings["unibase"]["counts"]["active_events"], 1)
 
@@ -422,8 +419,6 @@ class SettingsApiTests(unittest.TestCase):
         settings = dashboard_api.settings_payload(self.path)
         body = {
             "revision": settings["revision"],
-            "ignore_codex_auto_review": False,
-            "experimental_codex_deduplication": False,
             "sources": [
                 {"source_id": "codex-live", "enabled": True},
                 {"source_id": "codex-backup", "enabled": False},
@@ -485,15 +480,14 @@ class SettingsApiTests(unittest.TestCase):
         self.assertEqual(status, 409)
         self.assertIn("empty", payload["error"])
 
-    def test_first_api_request_migrates_legacy_preference_cookie(self):
+    def test_legacy_preference_cookie_is_ignored(self):
         status, _ = self.request("/data.json?provider=codex", cookie="ignore_codex_auto_review_v2=1")
 
         self.assertEqual(status, 200)
         settings = self.db.settings()
-        self.assertTrue(settings["ignore_codex_auto_review"])
-        self.assertTrue(settings["legacy_preference_migrated"])
+        self.assertFalse(settings["ignore_codex_auto_review"])
 
-    def test_committed_preference_cannot_be_overridden_by_query(self):
+    def test_unibase_queries_do_not_apply_legacy_auto_review_filter(self):
         self.db.update_settings(1, True)
         handler = object.__new__(dashboard_api.DashboardHandler)
         handler.unibase_path = self.path
@@ -501,7 +495,7 @@ class SettingsApiTests(unittest.TestCase):
 
         filters = handler.filters_from_query("provider=all&ignore_auto_review=0")
 
-        self.assertTrue(filters["ignore_auto_review"])
+        self.assertFalse(filters["ignore_auto_review"])
 
     def test_settings_discovers_new_backup_without_restart(self):
         snapshot = self.codex_root / "add_stat" / "new-snapshot"

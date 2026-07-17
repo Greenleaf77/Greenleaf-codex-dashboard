@@ -145,7 +145,7 @@ class RequestsApiTests(unittest.TestCase):
         for forbidden in ("private-event", "private-session", "/private/source", "response_id", "event_key", "stream_key"):
             self.assertNotIn(forbidden, encoded)
 
-    def test_committed_auto_review_preference_filters_requests(self):
+    def test_committed_auto_review_preference_is_ignored(self):
         self.add_event(1, "2026-07-16T12:00:00Z")
         self.add_event(2, "2026-07-16T12:01:00Z", model=dashboard_api.AUTO_REVIEW_MODEL)
         self.db.update_settings(1, True)
@@ -153,7 +153,10 @@ class RequestsApiTests(unittest.TestCase):
 
         payload = self.load()
 
-        self.assertEqual([item["model"] for item in payload["items"]], ["Codex · gpt-5.5"])
+        self.assertEqual(
+            [item["model"] for item in payload["items"]],
+            ["Codex · codex-auto-review", "Codex · gpt-5.5"],
+        )
 
     def test_invalid_parameters_and_empty_page(self):
         self.db.rebuild_active_events()

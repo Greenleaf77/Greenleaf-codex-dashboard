@@ -557,8 +557,6 @@ class Unibase:
     def apply_settings(
         self,
         revision: int,
-        ignore_codex_auto_review: bool,
-        experimental_codex_deduplication: bool,
         sources: list[dict],
         models: list[dict],
     ) -> dict:
@@ -600,8 +598,8 @@ class Unibase:
                     [(name, utc_now()) for name, item in zip(model_names, models) if not item["enabled"]],
                 )
                 conn.execute(
-                    "update app_settings set revision = revision + 1, ignore_codex_auto_review = ?, experimental_codex_deduplication = ?, ignore_failed_requests = 0, legacy_preference_migrated = 1, updated_at = ? where id = 1",
-                    (int(ignore_codex_auto_review), int(experimental_codex_deduplication), utc_now()),
+                    "update app_settings set revision = revision + 1, ignore_codex_auto_review = 0, experimental_codex_deduplication = 1, ignore_failed_requests = 0, legacy_preference_migrated = 1, updated_at = ? where id = 1",
+                    (utc_now(),),
                 )
             self.rebuild_active_events()
             return self.settings()

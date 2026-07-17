@@ -74,7 +74,6 @@ const providerLogoPaths = {
   claude: 'm4.7144 15.9555 4.7174-2.6471.079-.2307-.079-.1275h-.2307l-.7893-.0486-2.6956-.0729-2.3375-.0971-2.2646-.1214-.5707-.1215-.5343-.7042.0546-.3522.4797-.3218.686.0608 1.5179.1032 2.2767.1578 1.6514.0972 2.4468.255h.3886l.0546-.1579-.1336-.0971-.1032-.0972L6.973 9.8356l-2.55-1.6879-1.3356-.9714-.7225-.4918-.3643-.4614-.1578-1.0078.6557-.7225.8803.0607.2246.0607.8925.686 1.9064 1.4754 2.4893 1.8336.3643.3035.1457-.1032.0182-.0728-.164-.2733-1.3539-2.4467-1.445-2.4893-.6435-1.032-.17-.6194c-.0607-.255-.1032-.4674-.1032-.7285L6.287.1335 6.6997 0l.9957.1336.419.3642.6192 1.4147 1.0018 2.2282 1.5543 3.0296.4553.8985.2429.8318.091.255h.1579v-.1457l.1275-1.706.2368-2.0947.2307-2.6957.0789-.7589.3764-.9107.7468-.4918.5828.2793.4797.686-.0668.4433-.2853 1.8517-.5586 2.9021-.3643 1.9429h.2125l.2429-.2429.9835-1.3053 1.6514-2.0643.7286-.8196.85-.9046.5464-.4311h1.0321l.759 1.1293-.34 1.1657-1.0625 1.3478-.8804 1.1414-1.2628 1.7-.7893 1.36.0729.1093.1882-.0183 2.8535-.607 1.5421-.2794 1.8396-.3157.8318.3886.091.3946-.3278.8075-1.967.4857-2.3072.4614-3.4364.8136-.0425.0304.0486.0607 1.5482.1457.6618.0364h1.621l3.0175.2247.7892.522.4736.6376-.079.4857-1.2142.6193-1.6393-.3886-3.825-.9107-1.3113-.3279h-.1822v.1093l1.0929 1.0686 2.0035 1.8092 2.5075 2.3314.1275.5768-.3218.4554-.34-.0486-2.2039-1.6575-.85-.7468-1.9246-1.621h-.1275v.17l.4432.6496 2.3436 3.5214.1214 1.0807-.17.3521-.6071.2125-.6679-.1214-1.3721-1.9246L14.38 17.959l-1.1414-1.9428-.1397.079-.674 7.2552-.3156.3703-.7286.2793-.6071-.4614-.3218-.7468.3218-1.4753.3886-1.9246.3157-1.53.2853-1.9004.17-.6314-.0121-.0425-.1397.0182-1.4328 1.9672-2.1796 2.9446-1.7243 1.8456-.4128.164-.7164-.3704.0667-.6618.4008-.5889 2.386-3.0357 1.4389-1.882.929-1.0868-.0062-.1579h-.0546l-6.3385 4.1164-1.1293.1457-.4857-.4554.0608-.7467.2307-.2429 1.9064-1.3114Z',
   opencode: 'M7 4.5h10l3 7.5-3 7.5H7L4 12l3-7.5Zm2.5 4L8 12l1.5 3.5h5L16 12l-1.5-3.5h-5Z'
 };
-const autoReviewModel = "codex-auto-review";
 
 const initialState = readUrlState();
 let activeProvider = initialState.provider;
@@ -1295,8 +1294,6 @@ async function loadRequestChildren(data, bucket, childPage) {
 function settingsIsDirty() {
   if (!settingsData || !settingsDraft) return false;
   const original = {
-    ignore_codex_auto_review: settingsData.ignore_codex_auto_review,
-    experimental_codex_deduplication: settingsData.experimental_codex_deduplication,
     sources: Object.values(settingsData.sources).flat().map(({ source_id, enabled }) => ({ source_id, enabled })),
     models: Object.values(settingsData.models).flat().map(({ model, enabled }) => ({ model, enabled }))
   };
@@ -1305,8 +1302,6 @@ function settingsIsDirty() {
 
 function settingsDraftFromData(payload) {
   return {
-    ignore_codex_auto_review: payload.ignore_codex_auto_review,
-    experimental_codex_deduplication: payload.experimental_codex_deduplication,
     sources: Object.values(payload.sources).flat().map(({ source_id, enabled }) => ({ source_id, enabled })),
     models: Object.values(payload.models).flat().map(({ model, enabled }) => ({ model, enabled }))
   };
@@ -1337,9 +1332,21 @@ function renderSourceGroup(provider, sources) {
 
 function renderModelGroup(group, models) {
   const settingsLocked = settingsApplyPending || ["queued", "running"].includes(settingsData?.unibase?.current_operation?.state);
+  const metadata = {
+    gpt: { label: "GPT", description: "OpenAI and Codex", provider: "codex" },
+    claude: { label: "Claude", description: "Anthropic models", provider: "claude" },
+    others: { label: "Others", description: "OpenCode and custom", provider: "opencode" }
+  }[group];
+  const enabledCount = models.filter((item) => settingsDraft?.models.find((model) => model.model === item.model)?.enabled).length;
   return `
-    <section class="settings-model-group">
-      <div class="settings-model-heading"><h3>${escapeHtml(group.toUpperCase())}</h3><span>${full(models.length)}</span></div>
+    <section class="settings-model-group settings-model-group-${escapeHtml(group)}">
+      <div class="settings-model-heading">
+        <div class="settings-model-identity">
+          <span class="settings-model-logo">${providerLogo(metadata.provider)}</span>
+          <div><h3>${escapeHtml(metadata.label)}</h3><p>${escapeHtml(metadata.description)}</p></div>
+        </div>
+        <span class="settings-model-count">${full(enabledCount)}/${full(models.length)} on</span>
+      </div>
       <div class="settings-model-list">
         ${models.length ? models.map((item) => {
           const draft = settingsDraft?.models.find((model) => model.model === item.model);
@@ -1377,11 +1384,6 @@ function renderSettingsDialog() {
         <div class="settings-tab-panel" role="tabpanel">
           ${settingsActiveTab === "general" ? `
             <section class="settings-section">
-              <h3>Preferences</h3>
-              <label class="settings-preference"><input id="settings-auto-review" type="checkbox" ${settingsDraft.ignore_codex_auto_review ? "checked" : ""} ${settingsLocked ? "disabled" : ""}><span><strong>Ignore "${escapeHtml(autoReviewModel)}"</strong><small>Applies only to Codex events in Codex and All views.</small></span></label>
-              <label class="settings-preference"><input id="settings-codex-deduplication" type="checkbox" ${settingsDraft.experimental_codex_deduplication ? "checked" : ""} ${settingsLocked ? "disabled" : ""}><span><strong>Experimental CODEX token deduplication</strong><small>Globally deduplicates last_token_usage + rate_limits and keeps the earliest timestamp. Changing this option reparses CODEX rollouts.</small></span></label>
-            </section>
-            <section class="settings-section">
               <div class="settings-section-heading"><div><h3>Sources</h3><p>Original live sources are always enabled. Optional sources remain registered when unchecked.</p></div></div>
               <div class="settings-source-groups">${["codex", "claude", "opencode"].map((provider) => renderSourceGroup(provider, settingsData.sources[provider] || [])).join("")}</div>
             </section>
@@ -1399,14 +1401,14 @@ function renderSettingsDialog() {
             </section>
           ` : `
             <section class="settings-section settings-models-section">
-              <div class="settings-section-heading"><div><h3>Models</h3><p>Disabled models are hidden from every provider, chart, statistic, and Token Usage list.</p></div></div>
+              <div class="settings-section-heading"><div><span class="eyebrow">Global visibility</span><h3>Models</h3><p>Disabled models are hidden from every provider, chart, statistic, and Token Usage list. Disable codex-auto-review here when it should be excluded.</p></div></div>
               <div class="settings-model-groups">${["gpt", "claude", "others"].map((group) => renderModelGroup(group, settingsData.models[group] || [])).join("")}</div>
             </section>
           `}
         </div>
         <div class="settings-actions">
           <button class="settings-cancel" id="settings-cancel" type="button" ${settingsApplyPending ? "disabled" : ""}>Cancel</button>
-          <button class="settings-apply" id="settings-apply" type="submit" ${dirty && !settingsLocked ? "" : "disabled"}>${settingsApplyPending ? "Applying…" : settingsApplied && !dirty ? "Applied" : "Apply"}</button>
+          <button class="settings-apply" id="settings-apply" type="submit" ${dirty && !settingsLocked ? "" : "disabled"}>${settingsApplyPending ? '<span class="settings-apply-spinner" aria-hidden="true"></span><span>Applying…</span>' : settingsApplied && !dirty ? "Applied" : "Apply"}</button>
         </div>
       </form>
     </dialog>
@@ -1799,7 +1801,7 @@ function render(data) {
           </div>
         </div>
         <div class="group-metric-grid usage-profile-grid">
-          ${groupMetricItem({ label: "Favorite model", value: escapeHtml(data.favorite_model), iconName: "star", tone: "violet", compact: true })}
+          ${groupMetricItem({ label: "Favorite model", value: escapeHtml(truncateModelName(data.favorite_model)), iconName: "star", tone: "violet", compact: true })}
           ${groupMetricItem({ label: "Data source", value: escapeHtml(data.data_source || "SQLite + JSONL"), iconName: "database", tone: "violet", compact: true })}
         </div>
       </section>
@@ -1936,7 +1938,7 @@ function render(data) {
       const dirty = settingsIsDirty();
       const applyButton = settingsDialog.querySelector(".settings-apply");
       applyButton?.toggleAttribute("disabled", !dirty);
-      if (applyButton) applyButton.textContent = settingsApplied && !dirty ? "Applied" : "Apply";
+      if (applyButton) applyButton.innerHTML = settingsApplied && !dirty ? "Applied" : "Apply";
       settingsDialog.querySelector("#resync-unibase")?.toggleAttribute("disabled", dirty || settingsData.unibase.state === "reset_empty");
       settingsDialog.querySelector("#reset-unibase")?.toggleAttribute("disabled", dirty);
     };
@@ -1945,16 +1947,6 @@ function render(data) {
         settingsActiveTab = button.dataset.settingsTab;
         renderSettingsUpdate();
       });
-    });
-    settingsDialog.querySelector("#settings-auto-review")?.addEventListener("change", (event) => {
-      settingsApplied = false;
-      settingsDraft.ignore_codex_auto_review = event.target.checked;
-      syncDirtyControls();
-    });
-    settingsDialog.querySelector("#settings-codex-deduplication")?.addEventListener("change", (event) => {
-      settingsApplied = false;
-      settingsDraft.experimental_codex_deduplication = event.target.checked;
-      syncDirtyControls();
     });
     settingsDialog.querySelectorAll("[data-settings-source]").forEach((input) => {
       input.addEventListener("change", () => {
@@ -1994,6 +1986,8 @@ function render(data) {
         invalidateDashboardCaches();
         syncUrl();
         await refresh();
+        settingsApplyPending = false;
+        closeSettings();
       } catch (error) {
         settingsApplyPending = false;
         settingsApplied = false;

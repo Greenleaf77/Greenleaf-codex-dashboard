@@ -22,8 +22,10 @@ test("operation polling preserves stable Settings controls and respects closure"
 test("Settings Apply is single-flight and visibly pending", () => {
   assert.match(source, /if \(settingsApplyPending \|\| !settingsIsDirty\(\)\) return;/);
   assert.match(source, /settingsApplyPending = true;[\s\S]*renderSettingsUpdate\(\);[\s\S]*fetch\("\/api\/settings"/);
-  assert.match(source, /settingsApplyPending \? "Applying…"/);
+  assert.match(source, /settingsApplyPending \? '<span class="settings-apply-spinner"/);
   assert.match(source, /settingsApplied && !dirty \? "Applied" : "Apply"/);
+  assert.match(source, /await refresh\(\);[\s\S]*settingsApplyPending = false;[\s\S]*closeSettings\(\);/);
+  assert.match(styles, /\.settings-apply-spinner\s*\{[^}]*animation:\s*settings-apply-spin/s);
 });
 
 test("header refresh is described as an incremental change check", () => {
@@ -47,7 +49,19 @@ test("source choices are compact wrapping rows without horizontal scrolling", ()
   assert.match(styles, /\.settings-source-list\s*\{[^}]*flex-wrap:\s*wrap/s);
 });
 
-test("experimental CODEX deduplication is an explicit setting", () => {
-  assert.match(source, /id="settings-codex-deduplication"/);
-  assert.match(source, /last_token_usage \+ rate_limits/);
+test("legacy CODEX preferences are removed from Settings", () => {
+  assert.doesNotMatch(source, /settings-codex-deduplication/);
+  assert.doesNotMatch(source, /settings-auto-review/);
+  assert.match(source, /Disable codex-auto-review here/);
+});
+
+test("model groups have branded headers and switches", () => {
+  assert.match(source, /settings-model-logo/);
+  assert.match(source, /providerLogo\(metadata\.provider\)/);
+  assert.match(styles, /\.settings-model input:checked::after/);
+});
+
+test("Settings modal uses the wider viewport-aware layout", () => {
+  assert.match(styles, /\.settings-dialog\s*\{[^}]*width:\s*min\(1180px, calc\(100vw - 28px\)\)/s);
+  assert.match(styles, /max-height:\s*calc\(100dvh - 28px\)/);
 });

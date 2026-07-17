@@ -1174,8 +1174,7 @@ h2.section-title {
 
 .settings-dialog,
 .confirm-dialog {
-  width: min(940px, calc(100vw - 28px));
-  max-height: min(880px, calc(100vh - 28px));
+  max-height: calc(100dvh - 28px);
   margin: auto;
   padding: 0;
   overflow: auto;
@@ -1185,6 +1184,10 @@ h2.section-title {
   background: var(--graphite);
   color: var(--text-primary);
   box-shadow: 0 30px 100px rgba(0, 0, 0, .7);
+}
+
+.settings-dialog {
+  width: min(1180px, calc(100vw - 28px));
 }
 
 .confirm-dialog {
@@ -1407,11 +1410,25 @@ h2.section-title {
 }
 
 .settings-model-group {
+  position: relative;
+  overflow: hidden;
   min-width: 0;
-  padding: 11px;
+  padding: 14px;
   border: 1px solid var(--border-soft);
-  border-radius: 12px;
-  background: var(--surface-1);
+  border-radius: 14px;
+  background: linear-gradient(145deg, color-mix(in srgb, var(--surface-1) 92%, var(--lime) 8%), var(--surface-1));
+}
+
+.settings-model-group-gpt {
+  border-top-color: color-mix(in srgb, var(--lime) 52%, var(--border-soft));
+}
+
+.settings-model-group-claude {
+  border-top-color: color-mix(in srgb, var(--coral) 52%, var(--border-soft));
+}
+
+.settings-model-group-others {
+  border-top-color: color-mix(in srgb, var(--cyan) 52%, var(--border-soft));
 }
 
 .settings-model-heading {
@@ -1422,11 +1439,46 @@ h2.section-title {
   margin-bottom: 8px;
 }
 
-.settings-model-heading h3 {
-  margin: 0;
+.settings-model-identity {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 10px;
 }
 
-.settings-model-heading span {
+.settings-model-logo {
+  display: grid;
+  width: 34px;
+  height: 34px;
+  flex: none;
+  place-items: center;
+  border: 1px solid var(--border-soft);
+  border-radius: 10px;
+  background: var(--surface-inset);
+  color: var(--text-primary);
+}
+
+.settings-model-logo .provider-logo {
+  width: 19px;
+  height: 19px;
+}
+
+.settings-model-heading h3 {
+  margin: 0;
+  font-size: 14px;
+}
+
+.settings-model-heading p {
+  margin: 2px 0 0;
+  color: var(--text-tertiary);
+  font-size: 10px;
+}
+
+.settings-model-count {
+  flex: none;
+  padding: 4px 7px;
+  border: 1px solid var(--border-soft);
+  border-radius: 999px;
   color: var(--text-tertiary);
   font-size: 10px;
 }
@@ -1441,10 +1493,51 @@ h2.section-title {
   min-width: 0;
   align-items: center;
   gap: 8px;
-  padding: 7px 8px;
+  padding: 9px 10px;
   border: 1px solid var(--border-soft);
   border-radius: 8px;
   background: var(--surface-inset);
+  transition: border-color .16s ease, background .16s ease;
+}
+
+.settings-model:has(input:checked) {
+  border-color: color-mix(in srgb, var(--lime) 30%, var(--border-soft));
+  background: color-mix(in srgb, var(--lime) 5%, var(--surface-inset));
+}
+
+.settings-model input {
+  position: relative;
+  width: 30px;
+  height: 18px;
+  flex: none;
+  appearance: none;
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  background: var(--surface-2);
+  cursor: pointer;
+  transition: border-color .16s ease, background .16s ease;
+}
+
+.settings-model input::after {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--text-tertiary);
+  content: "";
+  transition: transform .16s ease, background .16s ease;
+}
+
+.settings-model input:checked {
+  border-color: color-mix(in srgb, var(--lime) 58%, var(--border));
+  background: color-mix(in srgb, var(--lime) 25%, var(--surface-2));
+}
+
+.settings-model input:checked::after {
+  background: var(--lime);
+  transform: translateX(12px);
 }
 
 .settings-model span {
@@ -1504,8 +1597,25 @@ button:disabled {
 }
 
 .settings-apply {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
   background: color-mix(in srgb, var(--lime) 18%, var(--surface-2)) !important;
   color: var(--lime) !important;
+}
+
+.settings-apply-spinner {
+  width: 14px;
+  height: 14px;
+  border: 2px solid color-mix(in srgb, var(--lime) 28%, transparent);
+  border-top-color: var(--lime);
+  border-radius: 50%;
+  animation: settings-apply-spin .7s linear infinite;
+}
+
+@keyframes settings-apply-spin {
+  to { transform: rotate(360deg); }
 }
 
 .settings-actions {

@@ -24,8 +24,9 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from claude_usage import DEFAULT_CLAUDE_DB, DEFAULT_CLAUDE_PROJECTS, PARSER_VERSION as CLAUDE_PARSER_VERSION
 from claude_usage import index_claude_usage, load_claude_events
 from claude_usage import import_claude_source
-from codex_usage import active_parser_version as codex_parser_version
+from codex_usage import PARSER_VERSION as CODEX_PARSER_VERSION
 from codex_usage import import_codex_source
+from codex_usage import scan_rollout_deduplicated_usage as scan_codex_rollout
 from opencode_usage import PARSER_VERSION as OPENCODE_PARSER_VERSION
 from opencode_usage import import_opencode_source, resolve_opencode_db
 from unibase import (
@@ -392,27 +393,6 @@ def current_streak(days: set[str]) -> int:
     return current
 
 
-USAGE_COMPONENTS = ("input_tokens", "cached_input_tokens", "output_tokens", "reasoning_output_tokens")
-
-
-def parse_usage_components(value: object, *, cumulative: bool = False) -> dict[str, int] | None:
-    if not isinstance(value, dict):
-        return None
-    if cumulative and any(key not in value for key in USAGE_COMPONENTS[:3]):
-        return None
-    try:
-        usage = {key: int(value.get(key) or 0) for key in USAGE_COMPONENTS}
-    except (TypeError, ValueError):
-        return None
-    if any(component < 0 for component in usage.values()):
-        return None
-    return usage
-
-
-def usage_has_tokens(usage: dict[str, int] | None) -> bool:
-    return bool(usage and any(usage[key] > 0 for key in USAGE_COMPONENTS))
-
-
 def local_hour_from_iso_timestamp(value: str) -> str:
     parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone()
     return parsed.strftime("%Y-%m-%d %H:00")
@@ -452,157 +432,26 @@ def usage_event(
     }
 
 
-def is_model_output_item(item_type: str | None, payload: dict) -> bool:
-    if item_type == "event_msg" and payload.get("type") in {"agent_message", "agent_reasoning"}:
-        return True
-    if item_type != "response_item":
-        return False
-    payload_type = payload.get("type")
-    if payload_type == "reasoning":
-        return True
-    if payload_type == "message":
-        return payload.get("role") == "assistant"
-    return isinstance(payload_type, str) and payload_type.endswith("_call") and not payload_type.endswith("_call_output")
-
-
 def scan_rollout_telemetry(rollout_path: Path, thread_id: str, model: str) -> dict[str, list[dict]]:
-    token_records: list[dict] = []
-    exact_records: list[dict] = []
-    model_output_since_token = False
-
-    with rollout_path.open(encoding="utf-8", errors="ignore") as handle:
-        for line_number, line in enumerate(handle, 1):
-            if not any(
-                marker in line
-                for marker in ('"token_count"', '"raw_response_completed"', '"response_item"', '"agent_message"', '"agent_reasoning"')
-            ):
-                continue
-            try:
-                item = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            payload = item.get("payload") or {}
-            if not isinstance(payload, dict):
-                continue
-            item_type = item.get("type")
-            payload_type = payload.get("type")
-            if is_model_output_item(item_type, payload):
-                model_output_since_token = True
-                continue
-            if payload_type == "raw_response_completed":
-                timestamp = item.get("timestamp")
-                parsed_usage = parse_usage_components(payload.get("token_usage"))
-                if timestamp and parsed_usage and usage_has_tokens(parsed_usage):
-                    exact_records.append(
-                        {
-                            "line_number": line_number,
-                            "timestamp": timestamp,
-                            "response_id": str(payload.get("response_id") or ""),
-                            "usage": parsed_usage,
-                        }
-                    )
-                model_output_since_token = True
-                continue
-            if payload_type != "token_count":
-                continue
-            timestamp = item.get("timestamp")
-            if not timestamp:
-                model_output_since_token = False
-                continue
-            info = payload.get("info") or {}
-            token_records.append(
-                {
-                    "line_number": line_number,
-                    "timestamp": timestamp,
-                    "last": parse_usage_components(info.get("last_token_usage")),
-                    "cumulative": parse_usage_components(info.get("total_token_usage"), cumulative=True),
-                    "model_output": model_output_since_token,
-                }
-            )
-            model_output_since_token = False
-
-    unique_exact_records: list[dict] = []
-    seen_response_ids: set[str] = set()
-    for record in exact_records:
-        response_id = record["response_id"]
-        if response_id and response_id in seen_response_ids:
-            continue
-        if response_id:
-            seen_response_ids.add(response_id)
-        unique_exact_records.append(record)
-
-    covered_token_lines: set[int] = set()
-    token_index = 0
-    for record in unique_exact_records:
-        while token_index < len(token_records) and token_records[token_index]["line_number"] < record["line_number"]:
-            token_index += 1
-        if token_index < len(token_records):
-            covered_token_lines.add(token_records[token_index]["line_number"])
-            token_index += 1
-
-    previous_cumulative: dict[str, int] | None = None
-    token_events: list[dict] = []
-    fallback_usage_events: list[dict] = []
-
-    for record in token_records:
-        current = record["cumulative"]
-        last = record["last"]
-        contribution: dict[str, int] | None = None
-        if current is None:
-            classification = "unverifiable_event"
-            if record["model_output"] and usage_has_tokens(last):
-                contribution = last
-        elif previous_cumulative is None:
-            if record["model_output"] and usage_has_tokens(last):
-                classification = "usage_update"
-                contribution = last
-            else:
-                classification = "baseline_event"
-            previous_cumulative = current
-        elif all(current[key] == previous_cumulative[key] for key in USAGE_COMPONENTS):
-            classification = "replayed_event"
-        elif all(current[key] >= previous_cumulative[key] for key in USAGE_COMPONENTS):
-            classification = "usage_update"
-            contribution = {key: current[key] - previous_cumulative[key] for key in USAGE_COMPONENTS}
-            previous_cumulative = current
-        else:
-            classification = "counter_reset"
-            if record["model_output"] and usage_has_tokens(last):
-                contribution = last
-            previous_cumulative = current
-
-        raw_usage = last or {key: 0 for key in USAGE_COMPONENTS}
-        token_events.append(
-            usage_event(thread_id, model, record["timestamp"], raw_usage, "reported", classification)
+    scanned = scan_codex_rollout(rollout_path, thread_id, model)
+    usage_events = []
+    for item in scanned["usage_events"]:
+        event = usage_event(
+            thread_id,
+            model,
+            item["timestamp_utc"],
+            {
+                "input_tokens": item["input_tokens"] + item["cache_read_tokens"],
+                "cached_input_tokens": item["cache_read_tokens"],
+                "output_tokens": item["output_tokens"],
+                "reasoning_output_tokens": item["reasoning_tokens"],
+            },
+            "deduplicated",
+            "usage_update",
         )
-        if (
-            contribution
-            and usage_has_tokens(contribution)
-            and record["line_number"] not in covered_token_lines
-        ):
-            fallback_usage_events.append(
-                usage_event(thread_id, model, record["timestamp"], contribution, "fallback", classification)
-            )
-
-    exact_usage_events: list[dict] = []
-    for record in unique_exact_records:
-        response_id = record["response_id"]
-        exact_usage_events.append(
-            usage_event(
-                thread_id,
-                model,
-                record["timestamp"],
-                record["usage"],
-                "exact",
-                "usage_update",
-                response_id or None,
-            )
-        )
-
-    return {
-        "usage_events": sorted(fallback_usage_events + exact_usage_events, key=lambda event: event["timestamp"]),
-        "token_events": token_events,
-    }
+        event["dedup_key"] = item["dedup_key"]
+        usage_events.append(event)
+    return {"usage_events": usage_events, "token_events": list(usage_events)}
 
 
 def filter_telemetry_events(events: list[dict], filters: dict[str, str | int | bool | None]) -> list[dict]:
@@ -631,9 +480,8 @@ def scan_token_telemetry(db_path: Path, start_ts: int | None, ignore_auto_review
             params,
         ).fetchall()
 
-    usage_events: list[dict] = []
+    usage_events_by_key: dict[str, dict] = {}
     token_records: list[dict] = []
-    seen_response_ids: set[str] = set()
     for thread in threads:
         if ignore_auto_review and thread["model"] == AUTO_REVIEW_MODEL:
             continue
@@ -643,12 +491,10 @@ def scan_token_telemetry(db_path: Path, start_ts: int | None, ignore_auto_review
         result = scan_rollout_telemetry(rollout_path, thread["id"], thread["model"])
         token_records.extend(result["token_events"])
         for event in result["usage_events"]:
-            response_id = event.get("response_id")
-            if response_id and response_id in seen_response_ids:
-                continue
-            if response_id:
-                seen_response_ids.add(response_id)
-            usage_events.append(event)
+            previous = usage_events_by_key.get(event["dedup_key"])
+            if previous is None or event["timestamp"] < previous["timestamp"]:
+                usage_events_by_key[event["dedup_key"]] = event
+    usage_events = sorted(usage_events_by_key.values(), key=lambda event: event["timestamp"])
     return {"usage_events": usage_events, "token_events": token_records}
 
 
@@ -887,6 +733,7 @@ def diagnostics_from_events(usage_events: list[dict], token_records: list[dict])
                 "unverifiable_events": 0,
                 "exact_usage_events": 0,
                 "fallback_usage_events": 0,
+                "deduplicated_usage_events": 0,
                 "reported_tokens": 0,
                 "deduplicated_tokens": 0,
             },
@@ -926,6 +773,7 @@ def diagnostics_from_events(usage_events: list[dict], token_records: list[dict])
         "unverifiable_events",
         "exact_usage_events",
         "fallback_usage_events",
+        "deduplicated_usage_events",
         "reported_tokens",
         "deduplicated_tokens",
     )
@@ -1626,7 +1474,7 @@ def load_unibase_usage(
     range_name: str = "all",
     start_day: str | None = None,
     end_day: str | None = None,
-    ignore_auto_review: bool | None = None,
+    ignore_auto_review: bool = False,
     chart_range: str | None = "30d",
     chart_start_day: str | None = None,
     chart_end_day: str | None = None,
@@ -1638,8 +1486,6 @@ def load_unibase_usage(
     provider = normalize_provider(provider)
     unibase = Unibase(unibase_path, migrate=False)
     settings = unibase.settings()
-    if ignore_auto_review is None:
-        ignore_auto_review = bool(settings["ignore_codex_auto_review"])
     timezone = resolve_timezone(timezone_name)
     today = dt.datetime.now(timezone).date()
     filters = resolve_range(range_name, start_day, end_day, bool(ignore_auto_review), today=today)
@@ -1805,6 +1651,9 @@ def load_unibase_usage(
             for row in raw_chart_rows
         ]
     chart = _chart_days_from_aggregate_rows(chart_rows, chart_filters)
+    favorite_model = model_rows[0]["model"] if model_rows else "-"
+    if provider == "all" and favorite_model != "-":
+        favorite_model = favorite_model.split(" · ", 1)[-1]
     result = {
         "provider": provider,
         "provider_label": PROVIDER_LABELS[provider],
@@ -1828,7 +1677,7 @@ def load_unibase_usage(
             "source": pricing["source"], "url": pricing["url"], "loaded_at": pricing["loaded_at"],
             "error": pricing["error"], "missing_models": sorted(missing_models),
         },
-        "favorite_model": model_rows[0]["model"] if model_rows else "-",
+        "favorite_model": favorite_model,
         "current_streak": current_streak(days),
         "longest_streak": longest_streak(days),
         "peak_day": peak["day"] if peak else "-",
@@ -1918,7 +1767,7 @@ def load_requests(
     start_day: str | None = None,
     end_day: str | None = None,
     timezone_name: str = "UTC",
-    ignore_auto_review: bool | None = None,
+    ignore_auto_review: bool = False,
     group: str = "none",
     page: int = 1,
     page_size: int = 25,
@@ -1942,11 +1791,7 @@ def load_requests(
     unibase = Unibase(unibase_path, migrate=False)
     with unibase.connect(readonly=True) as conn:
         conn.execute("begin")
-        settings = conn.execute(
-            "select generation, ignore_codex_auto_review from app_settings where id = 1"
-        ).fetchone()
-        if ignore_auto_review is None:
-            ignore_auto_review = bool(settings["ignore_codex_auto_review"])
+        settings = conn.execute("select generation from app_settings where id = 1").fetchone()
         filters = resolve_range(
             range_name,
             start_day,
@@ -2165,9 +2010,8 @@ def unibase_freshness(database: Unibase, provider: str = "all") -> str | None:
 
 
 def source_parser_outdated(database: Unibase, source: dict) -> bool:
-    settings = database.settings()
     expected = {
-        "codex": codex_parser_version(bool(settings["experimental_codex_deduplication"])),
+        "codex": CODEX_PARSER_VERSION,
         "claude": CLAUDE_PARSER_VERSION,
         "opencode": OPENCODE_PARSER_VERSION,
     }[source["provider"]]
@@ -2237,8 +2081,6 @@ def settings_payload(unibase_path: Path) -> dict:
         }
     return {
         "revision": settings["revision"],
-        "ignore_codex_auto_review": bool(settings["ignore_codex_auto_review"]),
-        "experimental_codex_deduplication": bool(settings["experimental_codex_deduplication"]),
         "sources": groups,
         "models": model_groups,
         "unibase": {
@@ -2271,10 +2113,6 @@ def import_registered_source(
                     import_codex_source(
                         database,
                         source,
-                        ignore_auto_review=False,
-                        experimental_deduplication=bool(
-                            database.settings()["experimental_codex_deduplication"]
-                        ),
                         state_path=state_path,
                         require_state_inventory=require_codex_state_inventory and source["kind"] == "live",
                         force_full_scan=force_full_scan,
@@ -2668,6 +2506,8 @@ def render_dashboard(data: dict) -> str:
     daily_desc = list(reversed(data["daily"]))
     heat_cells = heatmap_days(data["daily"], data["range"], data.get("range_start"), data.get("range_end"))
     heat_columns = max(1, (len(heat_cells) + 6) // 7)
+    favorite_model = str(data["favorite_model"])
+    favorite_model = f"{favorite_model[:20]}..." if len(favorite_model) > 20 else favorite_model
 
     if data["range"] == "custom" and data.get("range_start") and data.get("range_end"):
         range_summary = f'{data["range_start"]} to {data["range_end"]}'
@@ -2957,7 +2797,7 @@ def render_dashboard(data: dict) -> str:
       <div class="card"><div class="label">Total tokens</div><div class="value">{fmt_short(totals["total_with_cached_tokens"])}</div></div>
       <div class="card"><div class="label">Active days</div><div class="value">{fmt_int(totals["active_days"])}</div></div>
       <div class="card"><div class="label">API estimate</div><div class="value">{fmt_usd(totals["cost_usd"])}<span class="metric-note">{html.escape(data["pricing"]["source"])}</span></div></div>
-      <div class="card"><div class="label">Favorite model</div><div class="value">{html.escape(data["favorite_model"])}</div></div>
+      <div class="card"><div class="label">Favorite model</div><div class="value">{html.escape(favorite_model)}</div></div>
       <div class="card"><div class="label">Current streak</div><div class="value">{fmt_int(data["current_streak"])}d</div></div>
       <div class="card"><div class="label">Longest streak</div><div class="value">{fmt_int(data["longest_streak"])}d</div></div>
       <div class="card"><div class="label">Peak day</div><div class="value">{peak_value}</div></div>
@@ -3115,18 +2955,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
         query = parse_qs(query_string)
         default_provider = "all" if self.unibase_path else "codex"
         provider = normalize_provider(query.get("provider", [default_provider])[0])
-        default_ignore = False
-        if self.unibase_path:
-            try:
-                database = Unibase(self.unibase_path, migrate=False)
-                self.seed_legacy_preference(database)
-                persisted = database.settings()
-                default_ignore = bool(persisted["ignore_codex_auto_review"])
-            except Exception:
-                default_ignore = False
         timezone_name = query.get("timezone", ["UTC"])[0]
         today = dt.datetime.now(resolve_timezone(timezone_name)).date()
-        ignore_auto_review = default_ignore if self.unibase_path else parse_bool_flag(
+        ignore_auto_review = False if self.unibase_path else parse_bool_flag(
             query.get("ignore_auto_review", [None])[0], default=False
         )
         filters = resolve_range(
@@ -3276,7 +3107,6 @@ class DashboardHandler(BaseHTTPRequestHandler):
         query = parse_qs(query_string)
         try:
             database = Unibase(self.unibase_path, migrate=False)
-            self.seed_legacy_preference(database)
             payload = load_requests(
                 self.unibase_path,
                 provider=query.get("provider", ["all"])[0],
@@ -3311,7 +3141,6 @@ class DashboardHandler(BaseHTTPRequestHandler):
         try:
             refresh_running = source_refresh_running()
             database = Unibase(self.unibase_path, migrate=not refresh_running)
-            self.seed_legacy_preference(database)
             if not refresh_running:
                 discovery_started_at = time.perf_counter()
                 register_default_sources(
@@ -3333,14 +3162,6 @@ class DashboardHandler(BaseHTTPRequestHandler):
             print(f"[MeterMesh timing] settings failed: {exc.__class__.__name__}: {exc}", flush=True)
             self.send_json(503, {"error": "Could not load MeterMesh settings."})
 
-    def seed_legacy_preference(self, database: Unibase) -> None:
-        marker = "ignore_codex_auto_review_v2="
-        headers = getattr(self, "headers", {})
-        for part in headers.get("Cookie", "").split(";"):
-            if part.strip().startswith(marker):
-                database.seed_legacy_preference(parse_bool_flag(part.strip().split("=", 1)[1]))
-                return
-
     def apply_settings_request(self) -> None:
         if not self.unibase_path:
             self.send_json(503, {"error": "Unibase is not configured."})
@@ -3349,16 +3170,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
             payload = self.read_json_body()
             if set(payload) != {
                 "revision",
-                "ignore_codex_auto_review",
-                "experimental_codex_deduplication",
                 "sources",
                 "models",
             }:
                 raise ValueError("Unexpected settings fields")
             if (
                 not isinstance(payload["revision"], int)
-                or not isinstance(payload["ignore_codex_auto_review"], bool)
-                or not isinstance(payload["experimental_codex_deduplication"], bool)
                 or not isinstance(payload["sources"], list)
                 or not isinstance(payload["models"], list)
                 or not all(
@@ -3374,8 +3191,6 @@ class DashboardHandler(BaseHTTPRequestHandler):
             database = Unibase(self.unibase_path)
             database.apply_settings(
                 payload["revision"],
-                payload["ignore_codex_auto_review"],
-                payload["experimental_codex_deduplication"],
                 payload["sources"],
                 payload["models"],
             )
