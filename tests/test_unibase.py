@@ -1,4 +1,5 @@
 import json
+import os
 import sqlite3
 import tempfile
 import threading
@@ -82,6 +83,33 @@ class UnibaseFoundationTests(unittest.TestCase):
         self.assertEqual(self.db.settings()["state"], "reset_empty")
         self.assertTrue(self.db.settings()["ignore_codex_auto_review"])
         self.assertEqual([row["source_id"] for row in self.db.sources()], source_ids)
+
+    def test_read_only_root_without_add_stat_registers_live_source(self):
+        # A `:ro` container mount of a never-indexed source has no add_stat/, and
+        # mkdir answers EROFS rather than EEXIST, so exist_ok cannot absorb it.
+        # Discovery must degrade to "no backups" instead of taking the live
+        # source down with it.
+        codex = self.root / "ro" / ".codex"
+        (codex / "sessions").mkdir(parents=True)
+        self.addCleanup(os.chmod, codex, 0o755)
+        os.chmod(codex, 0o555)
+        if os.access(codex, os.W_OK) or os.geteuid() == 0:
+            self.skipTest("cannot make a directory unwritable as this user")
+
+        self.assertEqual(unibase.discover_backup_sources("codex", codex / "add_stat"), [])
+        self.assertFalse((codex / "add_stat").exists())
+
+        unibase.register_default_sources(
+            self.db,
+            codex_root=codex,
+            claude_root=self.root / ".claude",
+            opencode_root=self.root / "opencode",
+        )
+        codex_live = [
+            row for row in self.db.sources()
+            if row["provider"] == "codex" and row["kind"] == "live"
+        ]
+        self.assertEqual(len(codex_live), 1)
 
     def test_normalized_and_legacy_discovery(self):
         add_stat = self.root / "add_stat"
