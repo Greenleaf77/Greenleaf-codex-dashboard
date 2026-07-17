@@ -111,15 +111,15 @@ python3 dashboard_api.py --host 127.0.0.1 --port 8766
 
 ### Run in Docker
 
-MeterMesh ships a `Dockerfile` and `docker-compose.yml` for a sandboxed single-process runtime: the built SPA is served from `dist/` by a small `DashboardHandler` subclass, and every `/api/*` and `/data.json` request falls through to the upstream handlers. No Vite, no proxy at runtime.
+`Dockerfile` + `docker-compose.yml` give you a sandboxed one-command runtime: provider sources bind-mounted read-only, Unibase in an isolated volume, host port bound to `127.0.0.1`.
 
-Requirements: Docker 24+ (or Docker Desktop) with Compose v2.
+Requires Docker 24+ (or Docker Desktop) with Compose v2.
 
 ```bash
 docker compose up -d
 ```
 
-Open <http://127.0.0.1:8765>. The container binds to loopback only — not exposed to the LAN.
+Open <http://127.0.0.1:8765>.
 
 #### Path mapping
 
@@ -171,17 +171,22 @@ These directories are documented under [Backup Snapshots](#backup-snapshots) and
 | Writes to provider sources | Blocked — bind-mounted `:ro` |
 | Network exposure | Host port bound to `127.0.0.1:8765` only |
 | Privilege escalation | `no-new-privileges`, `cap_drop: ALL`, non-root uid 10001 |
-| Path traversal via `/assets/..` | Resolved and rejected in `docker/server.py` |
-| Unibase corruption | Isolated named volume, only writable path in the container |
 
-#### Commands
+#### Updating to a new MeterMesh version
+
+The version (`package.json`) and SPA (`dist/`) are baked in at build time; the container does no runtime git fetch.
 
 ```bash
-docker compose up -d        # start
-docker compose logs -f      # tail logs
-docker compose down         # stop (Unibase volume preserved)
-docker compose down -v      # stop + wipe Unibase
+git checkout main && git pull origin main          # latest, or:
+git fetch && git checkout v2.3.0                  # pin a tag
+
+docker compose build                               # rebuild image
+docker compose up -d                               # recreate container
 ```
+
+Unibase and the source bind mounts survive the rebuild. If a new version changes the schema, trigger **Full reindex** in Settings, or `docker compose down -v` to start fresh.
+
+- Run `docker compose build --pull` periodically to refresh the pinned base images against security patches, independent of MeterMesh releases.
 
 ## Settings And Maintenance
 
