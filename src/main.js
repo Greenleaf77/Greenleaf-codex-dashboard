@@ -854,7 +854,7 @@ function renderUsageTables(data) {
     </div>
   `;
   if (activeTableView === "diagnostics") {
-    if (diagnosticsCache.has(diagnosticsCacheKey)) rightPanelContent = renderDiagnostics(diagnosticsCache.get(diagnosticsCacheKey));
+    if (diagnosticsCache.has(diagnosticsCacheKey)) rightPanelContent = renderDataHealth(diagnosticsCache.get(diagnosticsCacheKey));
     else if (diagnosticsErrors.has(diagnosticsCacheKey)) rightPanelContent = renderDiagnosticsError(diagnosticsErrors.get(diagnosticsCacheKey));
     else rightPanelContent = renderDiagnosticsLoading();
   }
@@ -889,8 +889,8 @@ function renderUsageTables(data) {
           <h2 class="section-title"><span class="section-icon tone-violet">${icon("models")}</span><span>Usage Details</span></h2>
           <nav class="segments workspace-panel-tabs" aria-label="Details view">
             <button class="seg ${activeTableView === "usage" ? "active" : ""}" type="button" data-table-view="usage" aria-pressed="${activeTableView === "usage"}">Models</button>
-            ${supportsDiagnostics ? `<button class="seg ${activeTableView === "diagnostics" ? "active" : ""}" type="button" data-table-view="diagnostics" aria-pressed="${activeTableView === "diagnostics"}">Diagnostics</button>` : ""}
             <button class="seg ${activeTableView === "requests" ? "active" : ""}" type="button" data-table-view="requests" aria-pressed="${activeTableView === "requests"}">Requests</button>
+            ${supportsDiagnostics ? `<button class="seg ${activeTableView === "diagnostics" ? "active" : ""}" type="button" data-table-view="diagnostics" aria-pressed="${activeTableView === "diagnostics"}">Data Health</button>` : ""}
           </nav>
         </header>
         <div class="workspace-panel-content" id="right-panel-content">${rightPanelContent}</div>
@@ -899,33 +899,113 @@ function renderUsageTables(data) {
   `;
 }
 
-function renderDiagnostics(diagnostics) {
+function renderDataHealth(diagnostics) {
   const summary = diagnostics.summary;
-  return `
-    <div class="diagnostics-panel">
-      <div class="diagnostics-heading">
-        <div>
-          <h2 class="section-title"><span class="section-icon tone-cyan">${icon("usage")}</span><span>Telemetry Diagnostics</span></h2>
-          <p>Local replay analysis, not server billing. Deduplicated usage can be closer to upstream usage but is not proof that a request was accepted.</p>
+  const sources = diagnostics.sources || [];
+  const enabledSources = sources.filter((source) => source.enabled);
+  const readySources = enabledSources.filter((source) => source.status === "ready" && !source.stale && !source.error);
+  const staleSources = enabledSources.filter((source) => source.stale);
+  const errorSources = enabledSources.filter((source) => source.status === "error" || source.error);
+  const conflicts = Number(summary.conflicts || 0);
+  const unverifiable = Number(summary.unverifiable_events || 0);
+  let healthTone = "good";
+  let healthLabel = "Healthy";
+  let healthMessage = `All ${full(enabledSources.length)} enabled sources are ready.`;
+  if (!enabledSources.length) {
+    healthTone = "warn";
+    healthLabel = "No active sources";
+    healthMessage = "Enable at least one source to keep the Unibase index current.";
+  } else if (errorSources.length || conflicts) {
+    healthTone = "bad";
+    healthLabel = "Needs attention";
+    healthMessage = `${full(errorSources.length)} source errors · ${full(conflicts)} index conflicts`;
+  } else if (staleSources.length || unverifiable) {
+    healthTone = "warn";
+    healthLabel = "Review recommended";
+    healthMessage = `${full(staleSources.length)} stale sources · ${full(unverifiable)} unverifiable updates`;
+  }
+  const successfulScans = enabledSources
+    .map((source) => new Date(source.last_successful_scan || "").getTime())
+    .filter(Number.isFinite);
+  const latestScan = successfulScans.length ? new Date(Math.max(...successfulScans)).toISOString() : null;
+  const providerOrder = ["codex", "claude", "opencode"];
+  const providerCards = providerOrder.map((provider) => {
+    const breakdown = diagnostics.provider_breakdown?.[provider] || {};
+    const providerSources = enabledSources.filter((source) => source.provider === provider);
+    const providerReady = providerSources.filter((source) => source.status === "ready" && !source.stale && !source.error).length;
+    const providerIssue = providerSources.some((source) => source.status === "error" || source.error)
+      ? "bad"
+      : providerSources.some((source) => source.stale) || !providerSources.length ? "warn" : "good";
+    const label = providerOptions.find((option) => option.value === provider)?.label || provider;
+    return `
+      <article class="health-provider-card" data-provider="${provider}">
+        <div class="health-provider-head">
+          <span class="health-provider-mark">${providerLogo(provider, "health-provider-logo")}</span>
+          <strong>${escapeHtml(label)}</strong>
+          <span class="health-state-dot health-${providerIssue}" aria-label="${providerIssue === "good" ? "Healthy" : providerIssue === "bad" ? "Error" : "Review"}"></span>
         </div>
-        <div class="diagnostics-source">${full(summary.exact_usage_events)} exact · ${full(summary.fallback_usage_events)} cumulative fallback</div>
+        <div class="health-provider-value">${full(breakdown.events)}</div>
+        <div class="health-provider-caption">indexed events</div>
+        <div class="health-provider-foot"><span>${full(providerReady)}/${full(providerSources.length)} sources ready</span></div>
+      </article>
+    `;
+  }).join("");
+  const sourceCards = [...sources]
+    .sort((left, right) => Number(right.enabled) - Number(left.enabled) || providerOrder.indexOf(left.provider) - providerOrder.indexOf(right.provider))
+    .map((source) => {
+      let state = "good";
+      let stateLabel = "Ready";
+      if (!source.enabled) {
+        state = "muted";
+        stateLabel = "Disabled";
+      } else if (source.status === "error" || source.error) {
+        state = "bad";
+        stateLabel = "Error";
+      } else if (source.stale) {
+        state = "warn";
+        stateLabel = "Stale";
+      } else if (source.status !== "ready") {
+        state = "warn";
+        stateLabel = String(source.status || "Pending");
+      }
+      const providerLabel = providerOptions.find((option) => option.value === source.provider)?.label || source.provider;
+      return `
+        <article class="health-source-row ${source.enabled ? "" : "is-disabled"}">
+          <div class="health-source-identity">
+            <span class="health-source-logo provider-${escapeHtml(source.provider)}">${providerLogo(source.provider, "health-source-provider-logo")}</span>
+            <span><strong>${escapeHtml(source.label)}</strong><small>${escapeHtml(providerLabel)} · ${escapeHtml(String(source.kind || "source").replaceAll("_", " "))}</small></span>
+          </div>
+          <div class="health-source-stat"><strong>${compactNumber(source.event_count)}</strong><small>source records</small></div>
+          <div class="health-source-sync"><strong>${escapeHtml(formatTimestamp(source.last_successful_scan, "Never synced"))}</strong><small>last successful scan</small></div>
+          <span class="health-status health-${state}"><i></i>${escapeHtml(stateLabel)}</span>
+        </article>
+      `;
+    }).join("");
+  return `
+    <div class="data-health-panel">
+      <div class="data-health-heading">
+        <div>
+          <h2 class="section-title"><span class="section-icon tone-cyan">${icon("database")}</span><span>Data Health</span></h2>
+          <p>Unibase index integrity, provider coverage, and source freshness for the selected usage range.</p>
+        </div>
+        <span class="health-status health-${healthTone}"><i></i>${healthLabel}</span>
       </div>
-      <div class="diagnostics-summary">
-        <div><span>Raw token events</span><strong>${full(summary.raw_token_events)}</strong></div>
-        <div><span>Deduplicated updates</span><strong>${full(summary.deduplicated_usage_updates)}</strong></div>
-        <div><span>Replayed events</span><strong>${full(summary.replayed_events)} <small>${(summary.replay_rate * 100).toFixed(1)}%</small></strong></div>
-        <div><span>Estimated local overcount</span><strong>${compactNumber(summary.estimated_local_overcount_tokens)}</strong></div>
+      <div class="health-overview health-overview-${healthTone}">
+        <span class="health-overview-icon">${icon("database")}</span>
+        <div><span>Unibase status</span><strong>${healthLabel}</strong><p>${escapeHtml(healthMessage)}</p></div>
+        <div class="health-last-sync"><span>Latest successful scan</span><strong>${escapeHtml(formatTimestamp(latestScan, "Not synced"))}</strong></div>
       </div>
-      <div class="diagnostics-integrity">
-        Baselines ${full(summary.baseline_events)} · Resets ${full(summary.counter_resets)} · Unverifiable ${full(summary.unverifiable_events)}
+      <div class="health-metrics">
+        <article><span>Indexed updates</span><strong>${full(summary.deduplicated_usage_updates)}</strong><small>active events in this range</small></article>
+        <article><span>Ready sources</span><strong>${full(readySources.length)}/${full(enabledSources.length)}</strong><small>${full(sources.length)} registered total</small></article>
+        <article><span>Index conflicts</span><strong>${full(conflicts)}</strong><small>canonical event conflicts</small></article>
+        <article><span>Integrity signals</span><strong>${full(Number(summary.counter_resets || 0) + unverifiable)}</strong><small>${full(summary.counter_resets)} resets · ${full(unverifiable)} unverifiable</small></article>
       </div>
-      <div class="table-scroll">
-        <table class="diagnostics-table">
-          <thead><tr><th>Hour</th><th>Model</th><th class="num">Raw events</th><th class="num">Updates</th><th class="num">Replayed</th><th class="num">Replay rate</th><th class="num">Reported total</th><th class="num">Deduplicated total</th><th class="num">Est. overcount</th></tr></thead>
-          <tbody>
-            ${diagnostics.rows.map((row) => `<tr><td>${escapeHtml(row.hour)}</td><td>${escapeHtml(row.model)}</td><td class="num">${full(row.raw_token_events)}</td><td class="num">${full(row.deduplicated_usage_updates)}</td><td class="num">${full(row.replayed_events)}</td><td class="num">${(row.replay_rate * 100).toFixed(1)}%</td><td class="num">${full(row.reported_tokens)}</td><td class="num">${full(row.deduplicated_tokens)}</td><td class="num diagnostic-overcount">${full(row.estimated_local_overcount_tokens)}</td></tr>`).join("") || '<tr><td colspan="9" class="empty">No token telemetry in this range.</td></tr>'}
-          </tbody>
-        </table>
+      <div class="health-section-heading"><div><span>Provider coverage</span><strong>Indexed activity by provider</strong></div></div>
+      <div class="health-provider-grid">${providerCards}</div>
+      <div class="health-section-heading health-sources-heading"><div><span>Source registry</span><strong>Freshness and ingestion status</strong></div><small>${full(enabledSources.length)} enabled · ${full(sources.length)} registered</small></div>
+      <div class="health-source-list">
+        ${sourceCards || '<div class="health-empty">No registered sources.</div>'}
       </div>
     </div>
   `;
@@ -933,11 +1013,11 @@ function renderDiagnostics(diagnostics) {
 
 function renderDiagnosticsLoading(elapsedSeconds = 0) {
   const elapsed = elapsedSeconds >= 2 ? `<span>${full(elapsedSeconds)}s elapsed</span>` : "";
-  return `<div class="diagnostics-state" aria-live="polite"><span class="diagnostics-spinner" aria-hidden="true"></span><strong>Analyzing rollout telemetry…</strong>${elapsed}</div>`;
+  return `<div class="diagnostics-state" aria-live="polite"><span class="diagnostics-spinner" aria-hidden="true"></span><strong>Checking Unibase health…</strong>${elapsed}</div>`;
 }
 
 function renderDiagnosticsError(message) {
-  return `<div class="diagnostics-state error"><strong>Could not analyze rollout telemetry.</strong><code>${escapeHtml(message)}</code><button class="diagnostics-retry" type="button">Retry</button></div>`;
+  return `<div class="diagnostics-state error"><strong>Could not load Data Health.</strong><code>${escapeHtml(message)}</code><button class="diagnostics-retry" type="button">Retry</button></div>`;
 }
 
 function renderRequestValues(item) {

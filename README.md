@@ -1,17 +1,17 @@
 # MeterMesh
 
-MeterMesh is a local, privacy-conscious usage dashboard for Codex, Claude Code, and OpenCode. It incrementally imports usage metadata into one app-owned SQLite index named **Unibase**, deduplicates overlapping live and backup sources, and serves Usage, Diagnostics, and Requests from committed SQL projections.
+MeterMesh is a local, privacy-conscious usage dashboard for Codex, Claude Code, and OpenCode. It incrementally imports usage metadata into one app-owned SQLite index named **Unibase**, deduplicates overlapping live and backup sources, and serves Usage, Requests, and Data Health from committed SQL projections.
 
-![MeterMesh 2.0.0 dashboard showing the All provider scope and privacy-safe Requests](docs/screenshot-v2.0.0.png)
+![MeterMesh 2.2.0 dashboard showing the All provider scope and Data Health](docs/screenshot-v2.2.0.png)
 
 ## Highlights
 
 - Provider selector: All, Codex, Claude, OpenCode.
 - Usage charts and provider-qualified model totals.
 - Independent visualization ranges with daily, weekly, and monthly token buckets.
-- Provider-aware Diagnostics and source health.
+- Provider-aware Data Health with index integrity, coverage, and source freshness.
 - Privacy-safe Requests with numbered pagination and grouping from 1 minute to 24 hours.
-- Settings for backup snapshots, Codex auto-review filtering, reset, and Full reindex.
+- Settings for source and model filtering, All-scope aggregation, reset, and Full reindex.
 - Retained provenance: disabling one duplicate backup does not remove an event still supported by another source.
 - Recorded OpenCode costs remain distinct from pricing estimates and unavailable costs.
 
@@ -111,10 +111,10 @@ python3 dashboard_api.py --host 127.0.0.1 --port 8766
 
 ## Settings And Maintenance
 
-- **Apply** persists the Codex auto-review preference and backup checkboxes with optimistic revision checking.
+- **Apply** persists source, model, and All-scope aggregation preferences with optimistic revision checking.
 - **Reset Unibase** requires `RESET UNIBASE`, preserves settings and source registry, and blocks automatic indexing until Full reindex.
 - **Full reindex** builds a staging Unibase from live sources and enabled backups, runs invariants and `PRAGMA integrity_check`, then atomically swaps the database.
-- Usage, Diagnostics, and Requests continue reading the previous committed database while staging is built.
+- Usage, Requests, and Data Health continue reading the previous committed database while staging is built.
 
 ## API
 
