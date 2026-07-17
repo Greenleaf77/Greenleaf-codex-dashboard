@@ -167,6 +167,65 @@ function formatTimestamp(value, fallback = "Not synced") {
   return timestamp.toLocaleString([], { dateStyle: "medium", timeStyle: "short" });
 }
 
+function requestDayKey(value, timezone) {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    timeZone: timezone
+  }).formatToParts(value);
+  const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  return `${values.year}-${values.month}-${values.day}`;
+}
+
+function formatRequestDateTime(value, timezone, includeSeconds = true) {
+  const timestamp = new Date(value);
+  if (Number.isNaN(timestamp.getTime())) return String(value || "");
+  return new Intl.DateTimeFormat("en-US", {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: includeSeconds ? "2-digit" : undefined,
+    hourCycle: "h23",
+    timeZone: timezone
+  }).format(timestamp);
+}
+
+function formatRequestWindow(startValue, endValue, timezone) {
+  const start = new Date(startValue);
+  const end = new Date(endValue);
+  if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) return String(startValue || "");
+  if (requestDayKey(start, timezone) !== requestDayKey(end, timezone)) {
+    return `${formatRequestDateTime(startValue, timezone, false)} – ${formatRequestDateTime(endValue, timezone, false)}`;
+  }
+  const date = new Intl.DateTimeFormat("en-US", {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+    timeZone: timezone
+  }).format(start);
+  const time = new Intl.DateTimeFormat("en-US", {
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+    timeZone: timezone
+  });
+  return `${date} · ${time.format(start)}–${time.format(end)}`;
+}
+
+function requestTimezoneLabel(payload) {
+  const values = payload.items.flatMap((item) => [item.bucket_start, item.bucket_end, item.local_timestamp]).filter(Boolean);
+  const offsets = new Set(values.map((value) => {
+    const match = String(value).match(/(Z|[+-]\d{2}:\d{2})$/);
+    if (!match) return null;
+    return match[1] === "Z" ? "+00:00" : match[1];
+  }).filter(Boolean));
+  const offset = offsets.size === 1 ? ` (UTC${[...offsets][0]})` : "";
+  return `${payload.timezone || "UTC"}${offset}`;
+}
+
 function formatMegabytes(bytes) {
   return `${(Number(bytes || 0) / (1024 * 1024)).toFixed(2)} MB`;
 }
@@ -885,11 +944,11 @@ function renderRequestValues(item) {
   return `<span>In ${full(item.input)}</span><span>Out ${full(item.output)}</span><span>Cache R ${full(item.cache_read)}</span><span>Cache W ${full(item.cache_write)}</span><strong>${full(item.total_with_cache)} total</strong>`;
 }
 
-function renderRequestEvent(item) {
+function renderRequestEvent(item, timezone) {
   return `
     <article class="request-event">
       <div class="request-event-main">
-        <time datetime="${escapeHtml(item.timestamp)}">${escapeHtml(item.local_timestamp || item.timestamp)}</time>
+        <time datetime="${escapeHtml(item.timestamp)}">${escapeHtml(formatRequestDateTime(item.local_timestamp || item.timestamp, timezone))}</time>
         <strong>${escapeHtml(item.model)}</strong>
         <span class="request-provider provider-${escapeHtml(item.provider)}">${escapeHtml(item.provider)}</span>
       </div>
@@ -899,11 +958,11 @@ function renderRequestEvent(item) {
   `;
 }
 
-function renderRequestChildren(item) {
+function renderRequestChildren(item, timezone) {
   const bucket = escapeHtml(item.bucket_start);
   const loading = requestChildrenLoading.has(item.bucket_start);
   const error = requestChildrenErrors.get(item.bucket_start);
-  const children = item.children.map(renderRequestEvent).join("");
+  const children = item.children.map((child) => renderRequestEvent(child, timezone)).join("");
   const status = loading
     ? '<div class="request-child-state"><span class="diagnostics-spinner" aria-hidden="true"></span><span>Loading requests…</span></div>'
     : error
@@ -924,12 +983,12 @@ function renderRequests(payload) {
   const rows = payload.items.map((item) => grouped ? `
     <details class="request-group" data-request-group="${escapeHtml(item.bucket_start)}" ${expandedRequestGroups.has(item.bucket_start) ? "open" : ""}>
       <summary>
-        <span><strong>${escapeHtml(item.bucket_start)}</strong><small>${full(item.count)} requests</small></span>
+        <span><time datetime="${escapeHtml(item.bucket_start)}">${escapeHtml(formatRequestWindow(item.bucket_start, item.bucket_end, payload.timezone))}</time><small>${full(item.count)} requests · summed in this window</small></span>
         <span class="request-values">${renderRequestValues(item)}</span>
       </summary>
-      ${renderRequestChildren(item)}
+      ${renderRequestChildren(item, payload.timezone)}
     </details>
-  ` : renderRequestEvent(item)).join("");
+  ` : renderRequestEvent(item, payload.timezone)).join("");
   return `
     <div class="requests-panel">
       <div class="requests-heading">
@@ -948,6 +1007,7 @@ function renderRequests(payload) {
         <span>Page ${full(payload.page)} of ${full(payload.total_pages)}</span>
         <button type="button" data-request-page="${payload.page + 1}" ${payload.has_next ? "" : "disabled"}>Next</button>
       </nav>
+      <footer class="requests-footer">Times, date boundaries, and grouped totals are calculated in <strong>${escapeHtml(requestTimezoneLabel(payload))}</strong>.</footer>
     </div>
   `;
 }

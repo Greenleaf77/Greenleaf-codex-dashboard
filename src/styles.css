@@ -1094,6 +1094,13 @@ h2.section-title {
   gap: 3px;
 }
 
+.request-group summary time {
+  color: var(--text-primary);
+  font-size: 13px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
 .request-children {
   display: grid;
   gap: 7px;
@@ -1156,6 +1163,20 @@ h2.section-title {
   padding: 36px 12px;
   color: var(--text-tertiary);
   text-align: center;
+}
+
+.requests-footer {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border-soft);
+  color: var(--text-tertiary);
+  font-size: 11px;
+  text-align: center;
+}
+
+.requests-footer strong {
+  color: var(--text-secondary);
+  font-weight: 600;
 }
 
 .settings-trigger {

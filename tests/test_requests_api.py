@@ -121,6 +121,23 @@ class RequestsApiTests(unittest.TestCase):
         self.assertFalse(third["items"][0]["child_has_next"])
         self.assertEqual(request_item.call_count, 10)
 
+    def test_grouped_windows_and_totals_use_requested_timezone(self):
+        self.add_event(1, "2026-07-16T21:01:00Z")
+        self.add_event(2, "2026-07-16T21:14:00Z")
+        self.add_event(3, "2026-07-16T21:15:00Z")
+        self.db.rebuild_active_events()
+
+        payload = self.load(group="15m", page_size=10, timezone_name="Europe/Moscow")
+
+        self.assertEqual(payload["timezone"], "Europe/Moscow")
+        self.assertEqual(
+            [(item["bucket_start"], item["bucket_end"], item["count"], item["input"]) for item in payload["items"]],
+            [
+                ("2026-07-17T00:15:00+03:00", "2026-07-17T00:30:00+03:00", 1, 4),
+                ("2026-07-17T00:00:00+03:00", "2026-07-17T00:15:00+03:00", 2, 5),
+            ],
+        )
+
     def test_dst_fall_back_hours_are_distinct(self):
         self.add_event(1, "2026-11-01T05:30:00Z")
         self.add_event(2, "2026-11-01T06:30:00Z")
@@ -130,6 +147,10 @@ class RequestsApiTests(unittest.TestCase):
 
         self.assertEqual(len(payload["items"]), 2)
         self.assertNotEqual(payload["items"][0]["bucket_start"], payload["items"][1]["bucket_start"])
+        self.assertEqual(
+            {item["bucket_end"] for item in payload["items"]},
+            {"2026-11-01T01:00:00-05:00", "2026-11-01T02:00:00-05:00"},
+        )
 
     def test_all_provider_fields_and_privacy(self):
         self.add_event(1, "2026-07-16T12:00:00Z", provider="codex")

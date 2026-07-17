@@ -1756,6 +1756,17 @@ def _bucket_start(timestamp: str, group: str, timezone: ZoneInfo) -> dt.datetime
     return local.replace(hour=floored // 60, minute=floored % 60, second=0, microsecond=0)
 
 
+def _bucket_end(bucket_start: str, group: str, timezone: ZoneInfo) -> dt.datetime:
+    start = dt.datetime.fromisoformat(bucket_start).astimezone(timezone)
+    start_key = start.isoformat()
+    start_utc = start.astimezone(dt.timezone.utc)
+    for minute in range(1, 26 * 60 + 1):
+        candidate_utc = start_utc + dt.timedelta(minutes=minute)
+        if _bucket_start(candidate_utc.isoformat(), group, timezone).isoformat() != start_key:
+            return candidate_utc.astimezone(timezone)
+    raise RuntimeError("Could not resolve request bucket end")
+
+
 def _public_request_item(item: dict) -> dict:
     return {key: value for key, value in item.items() if not key.startswith("_")}
 
@@ -1955,6 +1966,7 @@ def load_requests(
             child_total_pages = max((branch["count"] + page_size - 1) // page_size, 1)
             page_items.append({
                 "bucket_start": key,
+                "bucket_end": _bucket_end(key, group, timezone).isoformat(),
                 "count": branch["count"],
                 "input": branch["input"],
                 "output": branch["output"],
