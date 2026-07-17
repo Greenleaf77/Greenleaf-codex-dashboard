@@ -1,10 +1,16 @@
 #!/usr/bin/env bash
+# Single-process MeterMesh runtime.
+# The Python subclass serves the built SPA from ./dist for / and /assets/*
+# and falls through to the upstream handlers for everything else (including
+# /api/* and /data.json).
+#
+# Compose's `user:` directive pins the running UID/GID, so we don't drop
+# privileges here. The container needs to read $HOME-absolute source paths
+# (Codex state_5.sqlite stores host-absolute rollout paths), so HOME is set
+# in the compose `environment` block to match the host.
+
 set -euo pipefail
 
-mkdir -p "$(dirname "${METERMESH_UNIBASE_DB}")"
-
-# Single-process runtime: the Python subclass serves the built SPA from ./dist
-# and forwards /api/* and /data.json to the upstream handlers.
 exec python3 /app/docker/server.py \
   --host 0.0.0.0 \
   --port 8765 \

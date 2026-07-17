@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
-"""Single-process MeterMesh server.
+"""Single-process MeterMesh server for the Docker runtime.
 
 Subclasses the upstream DashboardHandler so the built SPA's static assets
 (/, /index.html, /assets/*) are served from ./dist, while every /api/* and
 /data.json request falls through to the original handlers unchanged.
 
+The Dockerfile bakes in METERMESH_ALLOW_REMOTE=1 so --host 0.0.0.0 is always
+allowed inside the container; the host port is still bound to 127.0.0.1 by
+docker-compose.yml.
+
 Run instead of dashboard_api.py for the Docker runtime:
     python3 docker/server.py --host 0.0.0.0 --port 8765 [more flags...]
-
-Requires METERMESH_ALLOW_REMOTE=1 when --host is non-loopback, same as upstream.
 """
 from __future__ import annotations
 
@@ -16,7 +18,7 @@ import mimetypes
 import sys
 from http import HTTPStatus
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -28,7 +30,7 @@ STATIC_INDEX_ROUTES = {"/", "/index.html"}
 
 def _safe_join(root: Path, relative: str) -> Path | None:
     """Resolve `relative` under `root`, rejecting traversal escapes."""
-    candidate = (root / relative.lstrip("/")).resolve(strict=False)
+    candidate = (root / unquote(relative).lstrip("/")).resolve(strict=False)
     try:
         candidate.relative_to(root)
     except ValueError:
@@ -74,14 +76,11 @@ class StaticDashboardHandler(dashboard_api.DashboardHandler):
 
 
 def main() -> None:
-    # Replace DashboardHandler in the upstream module so its main() wires up our
-    # subclass when it builds the ThreadingHTTPServer and sets class attributes.
-    original = dashboard_api.DashboardHandler
+    # Replace DashboardHandler in the upstream module so its main() wires up
+    # our subclass when it builds the ThreadingHTTPServer and sets class
+    # attributes. main() blocks for the lifetime of the process.
     dashboard_api.DashboardHandler = StaticDashboardHandler
-    try:
-        dashboard_api.main()
-    finally:
-        dashboard_api.DashboardHandler = original
+    dashboard_api.main()
 
 
 if __name__ == "__main__":
