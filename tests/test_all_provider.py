@@ -14,6 +14,8 @@ class AllProviderTests(unittest.TestCase):
         self.addCleanup(self.temp_dir.cleanup)
         self.path = Path(self.temp_dir.name) / "unibase.sqlite3"
         self.db = unibase.Unibase(self.path)
+        with self.db.connect() as conn:
+            conn.execute("update app_settings set merge_models_across_providers = 0")
         for provider in ("codex", "claude", "opencode"):
             self.db.register_source(unibase.DiscoveredSource(
                 f"{provider}-live", provider, "live", Path("/unused"), "live", f"Live {provider}",
@@ -96,6 +98,16 @@ class AllProviderTests(unittest.TestCase):
         self.assertEqual([row["model"] for row in data["chart"]["models"]], ["gpt-5.5"])
         self.assertEqual([row["model"] for row in data["chart"]["days"][0]["models"]], ["gpt-5.5"])
 
+    def test_chart_models_do_not_expose_persisted_color_slots(self):
+        data = self.load("all")
+
+        for row in data["chart"]["models"]:
+            self.assertNotIn("color_slot", row)
+            self.assertNotIn("raw_model", row)
+        for row in data["chart"]["days"][0]["models"]:
+            self.assertNotIn("color_slot", row)
+            self.assertNotIn("raw_model", row)
+
     def test_opencode_endpoints_share_one_model_row(self):
         self.db.add_event("opencode-live", None, {
             "provider": "opencode",
@@ -154,6 +166,46 @@ class AllProviderTests(unittest.TestCase):
         self.assertEqual(custom["chart_start_day"], "2020-01-01")
         self.assertEqual(custom["chart_end_day"], "2020-01-02")
 
+    def test_workdays_filter_is_parsed_and_uses_a_distinct_cache_entry(self):
+        handler = object.__new__(dashboard_api.DashboardHandler)
+        handler.unibase_path = self.path
+        source_root = Path(self.temp_dir.name) / "sources"
+        handler.db_path = source_root / ".codex" / "state_5.sqlite"
+        handler.claude_projects_path = source_root / ".claude" / "projects"
+        handler.opencode_db_path = source_root / "opencode" / "opencode.db"
+        regular = handler.filters_from_query("provider=all&range=all&chart_range=all")
+        workdays = handler.filters_from_query("provider=all&range=all&chart_range=all&workdays=1")
+        invalid = handler.filters_from_query("workdays=invalid")
+
+        self.assertFalse(regular["workdays_only"])
+        self.assertTrue(workdays["workdays_only"])
+        self.assertFalse(invalid["workdays_only"])
+        with patch.object(dashboard_api, "load_pricing", return_value=self.pricing), patch.object(
+            dashboard_api, "load_unibase_usage", wraps=dashboard_api.load_unibase_usage
+        ) as load_usage:
+            handler.usage_payload(regular)
+            handler.usage_payload(workdays)
+        self.assertEqual(load_usage.call_count, 2)
+
+    def test_usage_cache_key_includes_settings_revision(self):
+        handler = object.__new__(dashboard_api.DashboardHandler)
+        handler.unibase_path = self.path
+        source_root = Path(self.temp_dir.name) / "sources"
+        handler.db_path = source_root / ".codex" / "state_5.sqlite"
+        handler.claude_projects_path = source_root / ".claude" / "projects"
+        handler.opencode_db_path = source_root / "opencode" / "opencode.db"
+        filters = handler.filters_from_query("provider=all&range=all&chart_range=all&workdays=1")
+
+        with patch.object(dashboard_api, "load_pricing", return_value=self.pricing), patch.object(
+            dashboard_api, "load_unibase_usage", wraps=dashboard_api.load_unibase_usage
+        ) as load_usage:
+            handler.usage_payload(filters)
+            with self.db.connect() as conn:
+                conn.execute("update app_settings set revision = revision + 1 where id = 1")
+            handler.usage_payload(filters)
+
+        self.assertEqual(load_usage.call_count, 2)
+
     def test_chart_granularity_uses_requested_boundaries(self):
         self.assertEqual(dashboard_api.chart_granularity(
             dashboard_api.dt.date(2026, 1, 1), dashboard_api.dt.date(2026, 3, 31)
@@ -162,10 +214,10 @@ class AllProviderTests(unittest.TestCase):
             dashboard_api.dt.date(2026, 1, 1), dashboard_api.dt.date(2026, 4, 1)
         ), "week")
         self.assertEqual(dashboard_api.chart_granularity(
-            dashboard_api.dt.date(2026, 1, 16), dashboard_api.dt.date(2026, 7, 16)
+            dashboard_api.dt.date(2026, 1, 1), dashboard_api.dt.date(2026, 7, 9)
         ), "week")
         self.assertEqual(dashboard_api.chart_granularity(
-            dashboard_api.dt.date(2026, 1, 16), dashboard_api.dt.date(2026, 7, 17)
+            dashboard_api.dt.date(2026, 1, 1), dashboard_api.dt.date(2026, 7, 10)
         ), "month")
         timezone_day = dashboard_api.resolve_chart_range(
             "1d", today=dashboard_api.dt.date(2026, 7, 17)

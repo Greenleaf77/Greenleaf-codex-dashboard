@@ -332,9 +332,86 @@ h2.section-title {
 }
 
 .chart-filter {
-  display: grid;
-  justify-items: end;
-  gap: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  max-width: 100%;
+}
+
+.chart-filter-scroll {
+  max-width: 100%;
+  overflow-x: auto;
+  scrollbar-width: thin;
+}
+
+.chart-range-tabs {
+  flex: 0 0 auto;
+  flex-wrap: nowrap;
+  width: max-content;
+}
+
+.workdays-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  min-height: 44px;
+  padding: 8px 14px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface-inset);
+  color: var(--text-secondary);
+  cursor: pointer;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 620;
+  transition: color 120ms ease, border-color 120ms ease, background 120ms ease;
+}
+
+.workdays-toggle:hover {
+  color: var(--text-primary);
+}
+
+.workdays-toggle:focus-visible {
+  outline: 2px solid var(--cyan);
+  outline-offset: 2px;
+}
+
+.workdays-toggle[aria-pressed="true"] {
+  border-color: color-mix(in srgb, var(--cyan) 38%, var(--border));
+  background: color-mix(in srgb, var(--cyan) 13%, var(--surface-inset));
+  color: var(--text-primary);
+}
+
+.workdays-toggle-indicator {
+  position: relative;
+  width: 27px;
+  height: 16px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface-2);
+  transition: border-color 120ms ease, background 120ms ease;
+}
+
+.workdays-toggle-indicator::after {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--text-tertiary);
+  content: "";
+  transition: transform 120ms ease, background 120ms ease;
+}
+
+.workdays-toggle[aria-pressed="true"] .workdays-toggle-indicator {
+  border-color: color-mix(in srgb, var(--cyan) 55%, var(--border));
+  background: color-mix(in srgb, var(--cyan) 24%, var(--surface-2));
+}
+
+.workdays-toggle[aria-pressed="true"] .workdays-toggle-indicator::after {
+  background: var(--cyan);
+  transform: translateX(11px);
 }
 
 .viz-tabs {
@@ -591,8 +668,56 @@ h2.section-title {
 }
 
 .activity-time-bar {
-  background: linear-gradient(180deg, var(--cyan), color-mix(in srgb, var(--cyan) 58%, var(--blue)));
+  background: transparent;
   box-shadow: 0 0 18px color-mix(in srgb, var(--cyan) 18%, transparent);
+}
+
+.activity-time-segment {
+  flex: 0 0 auto;
+  width: 100%;
+}
+
+.activity-chart-shell .bar-slot:focus-visible,
+.activity-time-segment:focus-visible {
+  outline: 2px solid var(--cyan);
+  outline-offset: -2px;
+}
+
+.activity-time-segment.included {
+  background: linear-gradient(180deg, var(--cyan), color-mix(in srgb, var(--cyan) 58%, var(--blue)));
+}
+
+.bar-slot.excluded-day::before {
+  position: absolute;
+  bottom: 20px;
+  left: 50%;
+  width: min(var(--bar-fill), var(--bar-max));
+  height: 300px;
+  border-radius: 4px 4px 0 0;
+  background: repeating-linear-gradient(
+    -45deg,
+    color-mix(in srgb, var(--text-tertiary) 16%, transparent) 0 4px,
+    transparent 4px 8px
+  );
+  content: "";
+  opacity: 0.45;
+  transform: translateX(-50%);
+}
+
+.bar-slot.excluded-day .stacked-bar {
+  position: relative;
+  z-index: 1;
+}
+
+.activity-time-segment.excluded,
+.activity-time-bar.excluded {
+  background: repeating-linear-gradient(
+    -45deg,
+    color-mix(in srgb, var(--text-tertiary) 35%, transparent) 0 4px,
+    color-mix(in srgb, var(--surface-2) 65%, transparent) 4px 8px
+  );
+  box-shadow: none;
+  opacity: 0.58;
 }
 
 .activity-chart-shell .chart-grid span {
@@ -1636,6 +1761,50 @@ h2.section-title {
 .settings-preference small,
 .settings-source small {
   color: var(--text-tertiary);
+}
+
+.weekday-preference {
+  justify-content: space-between;
+  flex-wrap: wrap;
+}
+
+.weekday-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.weekday-chips label {
+  cursor: pointer;
+}
+
+.weekday-chips input {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.weekday-chips span {
+  display: block;
+  min-width: 38px;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-inset);
+  color: var(--text-secondary);
+  font-size: 11px;
+  text-align: center;
+}
+
+.weekday-chips input:checked + span {
+  border-color: color-mix(in srgb, var(--blue) 55%, var(--border));
+  background: color-mix(in srgb, var(--blue) 14%, var(--surface-inset));
+  color: var(--text-primary);
+}
+
+.weekday-chips input:focus-visible + span {
+  outline: 2px solid var(--blue);
+  outline-offset: 2px;
 }
 
 .settings-source-groups {
@@ -2857,7 +3026,11 @@ tbody tr:hover td {
   }
 
   .chart-filter {
-    justify-items: start;
+    justify-content: flex-start;
+  }
+
+  .chart-filter-scroll {
+    width: 100%;
   }
 
   .viz-tabs {
@@ -3032,12 +3205,8 @@ tbody tr:hover td {
   }
 
   .chart-filter,
-  .chart-range-tabs {
+  .chart-filter-scroll {
     width: 100%;
-  }
-
-  .chart-range-tabs .seg {
-    flex: 1;
   }
 
   .activity-summary {

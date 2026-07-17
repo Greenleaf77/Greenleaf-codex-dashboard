@@ -4,6 +4,15 @@ export function chartHeightPercent(tokens, maxTokens) {
   return (value / maximum) * 100;
 }
 
+export function activityMaxSeconds(days, dailyScale) {
+  const minimum = dailyScale ? 24 * 60 * 60 : 1;
+  return Math.max(minimum, ...days.map((day) => Number(day.raw_active_seconds || day.active_seconds || 0)));
+}
+
+export function activityTicks(maxSeconds) {
+  return [1, 0.75, 0.5, 0.25, 0].map((ratio) => Math.round(maxSeconds * ratio));
+}
+
 export function chartBarSizing(granularity, count) {
   if (granularity === "month") {
     return { barGap: count <= 16 ? 8 : count <= 32 ? 3 : 0, barFill: 72, barMax: 88 };

@@ -1,5 +1,13 @@
 # Changelog
 
+## 2.2.1 - 2026-07-17
+
+- Added configurable non-working weekdays and a URL-backed Workdays-only Active time view with excluded activity retained as dimmed chart segments.
+- Enabled matching-model merging by default in the All scope while preserving the user's post-migration setting.
+- Assigned chart colors dynamically from the current legend order using a scalable accessible palette instead of persisted model slots.
+- Updated chart granularity to daily through 90 days, weekly through 190 days, and monthly for longer ranges, with calendar-aligned weeks and months.
+- Improved Active time keyboard details and handled 25-hour daylight-saving fall-back days without clipping or incorrect axis labels.
+
 ## 2.2.0 - 2026-07-17
 
 - Replaced the misleading raw telemetry Diagnostics view with a compact Data Health workspace for Unibase integrity, provider coverage, and source freshness.

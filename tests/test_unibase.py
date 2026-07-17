@@ -27,6 +27,91 @@ class UnibaseFoundationTests(unittest.TestCase):
             self.assertEqual(conn.execute("pragma foreign_keys").fetchone()[0], 1)
             self.assertEqual(conn.execute("pragma busy_timeout").fetchone()[0], 30000)
 
+    def test_schema_eleven_defaults_to_merged_models(self):
+        self.assertEqual(unibase.SCHEMA_VERSION, 11)
+        self.assertEqual(json.loads(self.db.settings()["non_working_weekdays"]), [5, 6])
+        self.assertEqual(self.db.settings()["merge_models_across_providers"], 1)
+        with self.db.connect(readonly=True) as conn:
+            self.assertIn("color_slot", {row[1] for row in conn.execute("pragma table_info(known_models)")})
+
+    def test_fnv1a32_utf8_vectors(self):
+        self.assertEqual(unibase.fnv1a32_utf8(""), 2166136261)
+        self.assertEqual(unibase.fnv1a32_utf8("a"), 3826002220)
+        self.assertEqual(unibase.fnv1a32_utf8("gpt-5.6-sol"), 2826131955)
+
+    def test_non_working_weekdays_validation(self):
+        self.assertEqual(unibase.normalize_non_working_weekdays([]), [])
+        self.assertEqual(unibase.normalize_non_working_weekdays([6, 2]), [2, 6])
+        for invalid in (None, [True], [1, 1], [-1], [7], list(range(7))):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                unibase.normalize_non_working_weekdays(invalid)
+
+    def test_invalid_stored_weekdays_fall_back_and_are_repaired_on_apply(self):
+        with self.db.connect() as conn:
+            conn.execute("update app_settings set non_working_weekdays = 'broken' where id = 1")
+        settings = self.db.settings()
+        self.assertEqual(unibase.load_non_working_weekdays(settings["non_working_weekdays"]), [5, 6])
+
+        self.db.apply_settings(
+            settings["revision"],
+            bool(settings["merge_models_across_providers"]),
+            [],
+            [],
+            [5, 6],
+        )
+        self.assertEqual(self.db.settings()["non_working_weekdays"], "[5,6]")
+
+    def test_version_eight_assigns_existing_model_color_slots(self):
+        with self.db.connect() as conn:
+            conn.executemany(
+                "insert into known_models(model, first_seen_at, last_seen_at) values (?, 'now', 'now')",
+                [("gpt-a",), ("gpt-b",), ("gpt-c",)],
+            )
+            conn.execute("alter table app_settings drop column non_working_weekdays")
+            conn.execute("alter table known_models drop column color_slot")
+            conn.execute("pragma user_version = 8")
+
+        reopened = unibase.Unibase(self.db_path)
+
+        self.assertEqual(json.loads(reopened.settings()["non_working_weekdays"]), [5, 6])
+        with reopened.connect(readonly=True) as conn:
+            slots = [row[0] for row in conn.execute("select color_slot from known_models order by model")]
+        self.assertEqual(slots, [None, None, None])
+
+    def test_version_nine_reassigns_existing_slots_by_first_seen_then_model(self):
+        with self.db.connect() as conn:
+            conn.execute("delete from known_models")
+            conn.executemany(
+                "insert into known_models(model, first_seen_at, last_seen_at, color_slot) values (?, ?, ?, ?)",
+                [
+                    ("model-c", "2026-07-03", "2026-07-03", 2),
+                    ("model-b", "2026-07-01", "2026-07-01", 17),
+                    ("model-a", "2026-07-01", "2026-07-01", 9),
+                ],
+            )
+            conn.execute("pragma user_version = 9")
+
+        reopened = unibase.Unibase(self.db_path)
+        with reopened.connect(readonly=True) as conn:
+            slots = {str(row[0]): row[1] for row in conn.execute("select model, color_slot from known_models")}
+        self.assertEqual(slots, {"model-a": None, "model-b": None, "model-c": None})
+
+    def test_version_ten_forces_merge_once_and_clears_legacy_color_slots(self):
+        with self.db.connect() as conn:
+            conn.execute(
+                "insert into known_models(model, first_seen_at, last_seen_at, color_slot) values ('model-a', 'now', 'now', 7)"
+            )
+            conn.execute("update app_settings set merge_models_across_providers = 0")
+            before_revision = int(conn.execute("select revision from app_settings where id = 1").fetchone()[0])
+            conn.execute("pragma user_version = 10")
+
+        reopened = unibase.Unibase(self.db_path)
+        settings = reopened.settings()
+        self.assertEqual(settings["merge_models_across_providers"], 1)
+        self.assertEqual(settings["revision"], before_revision + 1)
+        with reopened.connect(readonly=True) as conn:
+            self.assertIsNone(conn.execute("select color_slot from known_models where model = 'model-a'").fetchone()[0])
+
     def test_existing_database_can_skip_migration_for_read_paths(self):
         with patch.object(unibase.Unibase, "migrate") as migrate:
             database = unibase.Unibase(self.db_path, migrate=False)
@@ -58,7 +143,7 @@ class UnibaseFoundationTests(unittest.TestCase):
 
         reopened = unibase.Unibase(self.db_path)
 
-        self.assertFalse(reopened.settings()["merge_models_across_providers"])
+        self.assertTrue(reopened.settings()["merge_models_across_providers"])
         with reopened.connect(readonly=True) as conn:
             self.assertEqual(
                 [row[0] for row in conn.execute("select model from known_models order by model")],

@@ -1,6 +1,7 @@
 import "./styles.css";
 import { compactNumber, formatDuration } from "./format.js";
-import { chartBarSizing, chartHeightPercent } from "./chart-scale.js";
+import { activityMaxSeconds, activityTicks, chartBarSizing, chartHeightPercent } from "./chart-scale.js";
+import { chartColorMap, modelColorForSlot } from "./chart-colors.js";
 import { normalizeProvider, providerOptions } from "./provider-state.js";
 import { paginateRows, truncateModelName, USAGE_TABLE_PAGE_SIZE } from "./usage-table.js";
 import {
@@ -54,7 +55,15 @@ const accountingOptions = [
 ];
 const requestGroupOptions = ["none", "1m", "15m", "30m", "1h", "6h", "12h", "24h"];
 const requestPageSizes = [10, 25, 50, 100];
-const chartColors = ["#3b82f6", "#22c55e", "#f59e0b", "#8b5cf6", "#14b8a6", "#f05d4f", "#60a5fa", "#a3e635"];
+const weekdayOptions = [
+  { short: "Mon", full: "Monday" },
+  { short: "Tue", full: "Tuesday" },
+  { short: "Wed", full: "Wednesday" },
+  { short: "Thu", full: "Thursday" },
+  { short: "Fri", full: "Friday" },
+  { short: "Sat", full: "Saturday" },
+  { short: "Sun", full: "Sunday" }
+];
 const iconPaths = {
   brand: '<path d="m12 3.5 7 4v9l-7 4-7-4v-9l7-4Z"/><polyline points="8.2 12 10.7 14.5 15.8 9.4"/>',
   sessions: '<circle cx="12" cy="8" r="3.2"/><path d="M5 20c.6-3.2 3.2-5 7-5s6.4 1.8 7 5"/>',
@@ -107,6 +116,7 @@ let chartStartDate = initialState.chartStart;
 let chartEndDate = initialState.chartEnd;
 let activeVisualization = initialState.visualization;
 let cacheMode = initialState.cacheMode;
+let workdaysOnly = initialState.workdaysOnly;
 let activeTableView = initialState.view;
 let currentData = null;
 let diagnosticsController = null;
@@ -346,6 +356,7 @@ function readUrlState() {
     chartEnd: params.get("chart_end") || "",
     visualization: normalizedVisualization,
     cacheMode: resolveCacheMode(params.get("cache")),
+    workdaysOnly: params.get("workdays") === "1",
     view: ["usage", "diagnostics", "requests"].includes(params.get("view")) ? params.get("view") : "usage",
     requestGroup: requestGroupOptions.includes(params.get("group")) ? params.get("group") : "none",
     requestPage: Math.max(Number.parseInt(params.get("page") || "1", 10) || 1, 1),
@@ -369,6 +380,7 @@ function buildQuery(rangeName, includeDiagnostics = false) {
   params.set("chart_range", activeChartRange);
   params.set("visualization", activeVisualization);
   params.set("cache", cacheMode);
+  if (workdaysOnly) params.set("workdays", "1");
   params.set("timezone", Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC");
   params.set("view", activeTableView);
   if (activeTableView === "requests") {
@@ -428,11 +440,6 @@ function dayLabel(day, fallbackDay) {
   return new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric" }).format(date);
 }
 
-function modelColor(model, models) {
-  const index = Math.max(0, models.findIndex((row) => row.model === model));
-  return chartColors[index % chartColors.length];
-}
-
 function heatmapCells(daily, rangeName, rangeStart, rangeEnd, accountingMode) {
   const byDay = new Map(daily.map((row) => [row.day, row]));
   const today = new Date();
@@ -474,7 +481,7 @@ function renderVisualizationPanel(data, heat, months, heatColumns) {
     activity: "Active time"
   }[activeVisualization];
   const note = activityMode
-    ? `Showing ${escapeHtml(describeChartRange(data.chart))} · ${full(data.activity?.idle_timeout_minutes || 10)}-minute inactivity timeout · all models combined`
+    ? `Showing ${escapeHtml(describeChartRange(data.chart))} · ${full(data.activity?.idle_timeout_minutes || 10)}-minute inactivity timeout · all models combined${workdaysOnly ? " · Workdays only · non-working days are dimmed and excluded from totals" : ""}`
     : `Showing ${escapeHtml(describeChartRange(data.chart))} · ${accountingLabel}`;
   return `
     <div class="daily-visualization">
@@ -489,15 +496,19 @@ function renderVisualizationPanel(data, heat, months, heatColumns) {
           </div>
         </div>
         <div class="viz-controls">
-          ${activityMode ? "" : `<div class="viz-primary-controls">
-            <nav class="segments accounting-tabs" aria-label="Token accounting">
-              ${accountingOptions.map((option) => `<button class="seg ${cacheMode === option.value ? "active" : ""}" type="button" data-cache-mode="${option.value}" aria-pressed="${cacheMode === option.value}">${option.label}</button>`).join("")}
-            </nav>
-          </div>`}
+          <div class="viz-primary-controls">
+            ${activityMode
+              ? `<button class="workdays-toggle" id="workdays-only" type="button" data-workdays-only aria-pressed="${workdaysOnly}"><span class="workdays-toggle-indicator" aria-hidden="true"></span><span>Workdays only</span></button>`
+              : `<nav class="segments accounting-tabs" aria-label="Token accounting">
+                ${accountingOptions.map((option) => `<button class="seg ${cacheMode === option.value ? "active" : ""}" type="button" data-cache-mode="${option.value}" aria-pressed="${cacheMode === option.value}">${option.label}</button>`).join("")}
+              </nav>`}
+          </div>
           <div class="chart-filter">
-            <nav class="segments chart-range-tabs" aria-label="Visualization range">
-              ${chartRangeOptionsFor(activeVisualization).map((option) => `<button class="seg ${activeChartRange === option.value ? "active" : ""}" type="button" data-chart-range="${option.value}" aria-pressed="${activeChartRange === option.value}" ${option.value === "custom" ? `id="chart-range-trigger" aria-haspopup="dialog" aria-expanded="${chartCustomRangeOpen}"` : ""}>${option.label}</button>`).join("")}
-            </nav>
+            <div class="chart-filter-scroll">
+              <nav class="segments chart-range-tabs" aria-label="Visualization range">
+                ${chartRangeOptionsFor(activeVisualization).map((option) => `<button class="seg ${activeChartRange === option.value ? "active" : ""}" type="button" data-chart-range="${option.value}" aria-pressed="${activeChartRange === option.value}" ${option.value === "custom" ? `id="chart-range-trigger" aria-haspopup="dialog" aria-expanded="${chartCustomRangeOpen}"` : ""}>${option.label}</button>`).join("")}
+              </nav>
+            </div>
           </div>
         </div>
       </div>
@@ -548,6 +559,7 @@ function renderHeatmap(heat, months, heatColumns, accountingMode) {
 function renderTokensOverTime(chart, accountingMode) {
   const days = chart.days || [];
   const models = chart.models || [];
+  const colors = chartColorMap(models);
   const maxTokens = Math.max(1, ...days.map((day) => metricValue(day, accountingMode)));
   const ticks = [1, 0.75, 0.5, 0.25, 0].map((ratio) => Math.round(maxTokens * ratio));
   const labelEvery = Math.max(1, Math.ceil(days.length / 10));
@@ -571,12 +583,12 @@ function renderTokensOverTime(chart, accountingMode) {
             ${days.map(() => "<span></span>").join("")}
           </div>
           <div class="chart-bars">
-            ${days.map((day, index) => renderChartBar(day, models, maxTokens, index, labelEvery, days.length, accountingMode)).join("")}
+            ${days.map((day, index) => renderChartBar(day, models, colors, maxTokens, index, labelEvery, days.length, accountingMode)).join("")}
           </div>
         </div>
       </div>
     </div>
-    ${renderChartLegend(models)}
+    ${renderChartLegend(models, colors)}
   `;
 }
 
@@ -586,10 +598,8 @@ function renderActiveTime(activity) {
   }
   const days = activity.days || [];
   const dailyScale = activity.granularity === "day";
-  const maxSeconds = dailyScale ? 24 * 60 * 60 : Math.max(1, ...days.map((day) => Number(day.active_seconds || 0)));
-  const ticks = dailyScale
-    ? [24, 18, 12, 6, 0].map((hours) => hours * 60 * 60)
-    : [1, 0.75, 0.5, 0.25, 0].map((ratio) => Math.round(maxSeconds * ratio));
+  const maxSeconds = activityMaxSeconds(days, dailyScale);
+  const ticks = activityTicks(maxSeconds);
   const labelEvery = Math.max(1, Math.ceil(days.length / 10));
   const { barGap, barFill, barMax } = chartBarSizing(activity.granularity, days.length);
   const activitySummary = `${full(activity.focus_blocks)} sessions`;
@@ -621,20 +631,34 @@ function renderActiveTime(activity) {
 
 function renderActivityBar(day, maxSeconds, index, labelEvery, dayCount) {
   const seconds = Number(day.active_seconds || 0);
-  const height = chartHeightPercent(seconds, maxSeconds);
+  const excludedSeconds = Number(day.excluded_active_seconds || 0);
+  const rawSeconds = Number(day.raw_active_seconds ?? seconds + excludedSeconds);
+  const height = chartHeightPercent(rawSeconds, maxSeconds);
+  const includedHeight = rawSeconds ? (seconds / rawSeconds) * 100 : 0;
+  const excludedHeight = rawSeconds ? (excludedSeconds / rawSeconds) * 100 : 0;
   const label = index % labelEvery === 0 || index === dayCount - 1 ? dayLabel(day.label, day.day) : "";
   const title = day.bucket_start && day.bucket_end && day.bucket_start !== day.bucket_end
     ? `${day.bucket_start} - ${day.bucket_end}`
     : day.day;
+  const requestCount = full(day.raw_request_count ?? day.request_count);
+  const barLabel = `${title}: ${formatDuration(rawSeconds)} active, ${requestCount} requests${day.fully_excluded ? ", excluded non-working day" : ""}`;
+  const includedLabel = `${title}: ${formatDuration(seconds)} counted, ${full(day.request_count)} requests counted`;
+  const excludedLabel = `${title}: ${formatDuration(excludedSeconds)} excluded, ${full(day.excluded_request_count)} requests, non-working days`;
+  const includedTooltip = workdaysOnly
+    ? ` tabindex="0" aria-label="${escapeHtml(includedLabel)}" data-tooltip-title="${escapeHtml(title)}" data-tooltip-body="${formatDuration(seconds)} counted · ${full(day.request_count)} requests counted"`
+    : "";
   return `
-    <div class="bar-slot" data-tooltip-title="${escapeHtml(title)}" data-tooltip-body="${formatDuration(seconds)} active · ${full(day.request_count)} requests">
-      <div class="stacked-bar activity-time-bar ${seconds ? "" : "empty"}" style="height: ${height}%"></div>
+    <div class="bar-slot ${day.fully_excluded ? "excluded-day" : ""}" tabindex="0" aria-label="${escapeHtml(barLabel)}" data-tooltip-title="${escapeHtml(title)}" data-tooltip-body="${formatDuration(rawSeconds)} active · ${requestCount} requests${day.fully_excluded ? "<br>Excluded non-working day" : ""}">
+      <div class="stacked-bar activity-time-bar ${day.fully_excluded ? "excluded" : ""} ${rawSeconds ? "" : "empty"}" style="height: ${height}%">
+        ${seconds ? `<div class="activity-time-segment included" style="height:${includedHeight}%"${includedTooltip}></div>` : ""}
+        ${excludedSeconds ? `<div class="activity-time-segment excluded" tabindex="0" aria-label="${escapeHtml(excludedLabel)}" style="height:${excludedHeight}%" data-tooltip-title="${escapeHtml(title)}" data-tooltip-body="${formatDuration(excludedSeconds)} excluded · ${full(day.excluded_request_count)} requests · non-working days"></div>` : ""}
+      </div>
       <div class="bar-label">${escapeHtml(label)}</div>
     </div>
   `;
 }
 
-function renderChartBar(day, models, maxTokens, index, labelEvery, dayCount, accountingMode) {
+function renderChartBar(day, models, colors, maxTokens, index, labelEvery, dayCount, accountingMode) {
   const tokens = metricValue(day, accountingMode);
   const height = chartHeightPercent(tokens, maxTokens);
   const label = index % labelEvery === 0 || index === dayCount - 1 ? dayLabel(day.label, day.day) : "";
@@ -646,7 +670,7 @@ function renderChartBar(day, models, maxTokens, index, labelEvery, dayCount, acc
         ${(day.models || []).map((item) => {
           const itemTokens = metricValue(item, accountingMode);
           const segmentHeight = tokens ? (itemTokens / tokens) * 100 : 0;
-          return `<div class="bar-segment" style="height: ${segmentHeight}%; background: ${modelColor(item.model, models)}" data-tooltip-title="${escapeHtml(item.model)}" data-tooltip-body="${escapeHtml(title)}<br>${full(itemTokens)} tokens ${accountingLabel}"></div>`;
+          return `<div class="bar-segment" style="height: ${segmentHeight}%; background: ${colors.get(item.model) || modelColorForSlot(0)}" data-tooltip-title="${escapeHtml(item.model)}" data-tooltip-body="${escapeHtml(title)}<br>${full(itemTokens)} tokens ${accountingLabel}"></div>`;
         }).join("")}
       </div>
       <div class="bar-label">${escapeHtml(label)}</div>
@@ -654,13 +678,13 @@ function renderChartBar(day, models, maxTokens, index, labelEvery, dayCount, acc
   `;
 }
 
-function renderChartLegend(models) {
+function renderChartLegend(models, colors) {
   if (!models.length) return "";
   return `
     <div class="chart-legend">
       ${models.map((row) => `
         <span class="legend-item">
-          <span class="legend-swatch" style="background: ${modelColor(row.model, models)}"></span>
+          <span class="legend-swatch" style="background: ${colors.get(row.model) || modelColorForSlot(0)}"></span>
           <span>${escapeHtml(row.model)}</span>
         </span>
       `).join("")}
@@ -1175,6 +1199,12 @@ function bindTableView(data) {
     });
   });
 
+  document.querySelector("[data-workdays-only]")?.addEventListener("click", () => {
+    workdaysOnly = !workdaysOnly;
+    syncUrl();
+    refresh();
+  });
+
   document.querySelectorAll("[data-chart-range]").forEach((button) => {
     button.addEventListener("click", () => {
       activeChartRange = button.dataset.chartRange;
@@ -1272,10 +1302,12 @@ function bindTableView(data) {
     cell.addEventListener("mouseleave", hideHeatTooltip);
   });
 
-  document.querySelectorAll(".bar-slot, .bar-segment").forEach((item) => {
+  document.querySelectorAll(".bar-slot, .bar-segment, .activity-time-segment[data-tooltip-title]").forEach((item) => {
     item.addEventListener("mouseenter", showChartTooltip);
     item.addEventListener("mousemove", positionHeatTooltip);
     item.addEventListener("mouseleave", handleChartTooltipLeave);
+    item.addEventListener("focus", showChartTooltip);
+    item.addEventListener("blur", hideHeatTooltip);
   });
 
   const retry = document.querySelector(".diagnostics-retry");
@@ -1454,6 +1486,7 @@ function settingsIsDirty() {
   if (!settingsData || !settingsDraft) return false;
   const original = {
     merge_models_across_providers: settingsData.merge_models_across_providers,
+    non_working_weekdays: settingsData.non_working_weekdays,
     sources: Object.values(settingsData.sources).flat().map(({ source_id, enabled }) => ({ source_id, enabled })),
     models: Object.values(settingsData.models).flat().map(({ model, enabled }) => ({ model, enabled }))
   };
@@ -1463,6 +1496,7 @@ function settingsIsDirty() {
 function settingsDraftFromData(payload) {
   return {
     merge_models_across_providers: payload.merge_models_across_providers,
+    non_working_weekdays: [...payload.non_working_weekdays],
     sources: Object.values(payload.sources).flat().map(({ source_id, enabled }) => ({ source_id, enabled })),
     models: Object.values(payload.models).flat().map(({ model, enabled }) => ({ model, enabled }))
   };
@@ -1547,6 +1581,7 @@ function renderSettingsDialog() {
             <section class="settings-section">
               <h3>Preferences</h3>
               <label class="settings-preference"><input id="settings-merge-models" type="checkbox" ${settingsDraft.merge_models_across_providers ? "checked" : ""} ${settingsLocked ? "disabled" : ""}><span><strong>Merge matching models in "All" mode</strong><small>Combines the same model name across Codex, Claude, and OpenCode in charts and model usage tables.</small></span></label>
+              <div class="settings-preference weekday-preference"><span><strong>Non-working days</strong><small>Used by the optional Workdays only filter in Active time.</small></span><div class="weekday-chips">${weekdayOptions.map((option, day) => `<label><input type="checkbox" data-non-working-weekday="${day}" aria-label="${option.full} is a non-working day" ${settingsDraft.non_working_weekdays.includes(day) ? "checked" : ""} ${settingsLocked ? "disabled" : ""}><span>${option.short}</span></label>`).join("")}</div></div>
             </section>
             <section class="settings-section">
               <div class="settings-section-heading"><div><h3>Sources</h3><p>Original live sources are always enabled. Optional sources remain registered when unchecked.</p></div></div>
@@ -2118,6 +2153,25 @@ function render(data) {
       settingsDraft.merge_models_across_providers = event.target.checked;
       syncDirtyControls();
     });
+    settingsDialog.querySelectorAll("[data-non-working-weekday]").forEach((input) => {
+      input.addEventListener("change", () => {
+        const day = Number(input.dataset.nonWorkingWeekday);
+        const selected = new Set(settingsDraft.non_working_weekdays);
+        if (input.checked) selected.add(day);
+        else selected.delete(day);
+        if (selected.size === 7) {
+          input.checked = false;
+          input.setCustomValidity("At least one working day is required.");
+          input.reportValidity();
+          input.setCustomValidity("");
+          return;
+        }
+        input.setCustomValidity("");
+        settingsApplied = false;
+        settingsDraft.non_working_weekdays = [...selected].sort((left, right) => left - right);
+        syncDirtyControls();
+      });
+    });
     settingsDialog.querySelectorAll("[data-settings-source]").forEach((input) => {
       input.addEventListener("change", () => {
         settingsApplied = false;
@@ -2324,12 +2378,28 @@ function showChartTooltip(event) {
 function showChartTooltipFor(target, event) {
   tooltip.innerHTML = `${escapeHtml(target.dataset.tooltipTitle)}<br><strong>${target.dataset.tooltipBody}</strong>`;
   tooltip.classList.add("visible");
-  positionHeatTooltip(event);
+  if (event.type === "focus") positionTooltipAtTarget(target);
+  else positionHeatTooltip(event);
+}
+
+function positionTooltipAtTarget(target) {
+  const gap = 12;
+  const margin = 8;
+  const targetRect = target.getBoundingClientRect();
+  const tooltipRect = tooltip.getBoundingClientRect();
+  let left = targetRect.left + targetRect.width / 2 - tooltipRect.width / 2;
+  let top = targetRect.top - tooltipRect.height - gap;
+  left = Math.max(margin, Math.min(left, window.innerWidth - tooltipRect.width - margin));
+  if (top < margin) top = targetRect.bottom + gap;
+  tooltip.style.left = `${left}px`;
+  tooltip.style.top = `${Math.max(margin, Math.min(top, window.innerHeight - tooltipRect.height - margin))}px`;
 }
 
 function handleChartTooltipLeave(event) {
   const slot = event.currentTarget.closest(".bar-slot");
-  if (event.currentTarget.classList.contains("bar-segment") && slot?.contains(event.relatedTarget)) {
+  const isSegment = event.currentTarget.classList.contains("bar-segment")
+    || event.currentTarget.classList.contains("activity-time-segment");
+  if (isSegment && slot?.contains(event.relatedTarget)) {
     showChartTooltipFor(slot, event);
     return;
   }

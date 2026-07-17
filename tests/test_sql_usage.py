@@ -24,6 +24,8 @@ class SqlUsageTests(unittest.TestCase):
         self.addCleanup(self.temp_dir.cleanup)
         self.path = Path(self.temp_dir.name) / "unibase.sqlite3"
         self.db = unibase.Unibase(self.path)
+        with self.db.connect() as conn:
+            conn.execute("update app_settings set merge_models_across_providers = 0")
         for provider in ("codex", "claude", "opencode"):
             self.db.register_source(unibase.DiscoveredSource(
                 f"{provider}-live", provider, "live", Path("/unused"), "live", f"Live {provider}",
