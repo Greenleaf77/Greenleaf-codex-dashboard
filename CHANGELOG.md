@@ -1,5 +1,13 @@
 # Changelog
 
+## 2.2.2 - 2026-07-17
+
+- Added a multi-stage Docker runtime that serves the built dashboard and API from one non-root container bound to `127.0.0.1`.
+- Mounted provider sources read-only at their host-absolute paths while keeping Unibase in an isolated writable volume with Linux UID/GID support.
+- Made source discovery tolerate absent `add_stat/` directories on read-only mounts without hiding unexpected filesystem errors.
+- Added Docker smoke coverage for startup, SPA/API routing, absolute Codex rollout paths, provider imports, volume permissions, and host-write isolation.
+- Documented Docker setup, additional Codex profile mounts, platform limits, updates, and troubleshooting alongside the MeterMesh 2.2.1 features.
+
 ## 2.2.1 - 2026-07-17
 
 - Added configurable non-working weekdays and a URL-backed Workdays-only Active time view with excluded activity retained as dimmed chart segments.
