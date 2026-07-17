@@ -14,11 +14,11 @@ import sys
 
 # Recorded in the state_5.sqlite fixture. Wins only when the host-absolute
 # rollout_path resolves inside the container.
-STATE_MODEL_KEY = "codex:smoke-codex-state-model"
+STATE_MODEL = "smoke-codex-state-model"
 # Recorded in the rollout JSONL session_meta. import_codex_source() falls back to
 # this when the state-db lookup misses, so seeing it means the same-path mount
 # is broken.
-META_MODEL_KEY = "codex:smoke-codex-meta-model"
+META_MODEL = "smoke-codex-meta-model"
 
 ARCHIVE_DAY = "2026-01-02"  # rollout reachable ONLY via the absolute state path
 SESSIONS_DAY = "2026-01-01"  # rollout found by the relative sessions/ glob
@@ -40,22 +40,31 @@ def main() -> None:
     usage = json.load(open(sys.argv[1]))
     settings = json.load(open(sys.argv[2]))
     models = {m["model_key"]: m for m in usage.get("models", [])}
+    merged = bool(usage.get("merge_models_across_providers"))
+
+    def model_key(provider: str, model: str) -> str:
+        return model if merged else f"{provider}:{model}"
+
+    state_model_key = model_key("codex", STATE_MODEL)
+    meta_model_key = model_key("codex", META_MODEL)
 
     out: list[tuple[str, object]] = [
-        ("CODEX_STATE_MODEL", int(STATE_MODEL_KEY in models)),
-        ("CODEX_META_MODEL", int(META_MODEL_KEY in models)),
-        ("ARCHIVE_INPUT", day_field(models, STATE_MODEL_KEY, ARCHIVE_DAY, "input_tokens")),
-        ("ARCHIVE_OUTPUT", day_field(models, STATE_MODEL_KEY, ARCHIVE_DAY, "output_tokens")),
-        ("ARCHIVE_REASONING", day_field(models, STATE_MODEL_KEY, ARCHIVE_DAY, "reasoning_output_tokens")),
-        ("SESSIONS_INPUT", day_field(models, STATE_MODEL_KEY, SESSIONS_DAY, "input_tokens")),
-        ("CLAUDE_INPUT", models.get("claude:smoke-claude-model", {}).get("input_tokens", "-")),
-        ("CLAUDE_OUTPUT", models.get("claude:smoke-claude-model", {}).get("output_tokens", "-")),
-        ("OPENCODE_INPUT", models.get("opencode:smoke-opencode-model", {}).get("input_tokens", "-")),
-        ("OPENCODE_OUTPUT", models.get("opencode:smoke-opencode-model", {}).get("output_tokens", "-")),
+        ("CODEX_STATE_MODEL", int(state_model_key in models)),
+        ("CODEX_META_MODEL", int(meta_model_key in models)),
+        ("ARCHIVE_INPUT", day_field(models, state_model_key, ARCHIVE_DAY, "input_tokens")),
+        ("ARCHIVE_OUTPUT", day_field(models, state_model_key, ARCHIVE_DAY, "output_tokens")),
+        ("ARCHIVE_REASONING", day_field(models, state_model_key, ARCHIVE_DAY, "reasoning_output_tokens")),
+        ("SESSIONS_INPUT", day_field(models, state_model_key, SESSIONS_DAY, "input_tokens")),
+        ("CLAUDE_INPUT", models.get(model_key("claude", "smoke-claude-model"), {}).get("input_tokens", "-")),
+        ("CLAUDE_OUTPUT", models.get(model_key("claude", "smoke-claude-model"), {}).get("output_tokens", "-")),
+        ("OPENCODE_INPUT", models.get(model_key("opencode", "smoke-opencode-model"), {}).get("input_tokens", "-")),
+        ("OPENCODE_OUTPUT", models.get(model_key("opencode", "smoke-opencode-model"), {}).get("output_tokens", "-")),
     ]
 
     codex_sources = settings.get("sources", {}).get("codex", [])
     codex = codex_sources[0] if codex_sources else {}
+    if codex.get("error"):
+        print(f"Codex source error: {codex['error']}", file=sys.stderr)
     out += [
         ("CODEX_STATUS", codex.get("status", "-")),
         ("CODEX_FILES", codex.get("file_count", "-")),

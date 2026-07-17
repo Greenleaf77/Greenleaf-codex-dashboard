@@ -40,7 +40,7 @@ OpenCode: $XDG_DATA_HOME/opencode/opencode.db
           or ~/.local/share/opencode/opencode.db
 ```
 
-For the live Codex source, MeterMesh also imports valid absolute rollout paths registered in `state_5.sqlite`. This automatically includes additional Codex profiles such as `~/.codex-work/sessions` without storing their raw paths in Unibase.
+For the live Codex source, MeterMesh also imports valid absolute rollout paths registered in `state_5.sqlite`. Direct runs automatically include additional Codex profiles such as `~/.codex-work/sessions` without storing their raw paths in Unibase. Docker runs must mount each additional profile at the same absolute path, as described below.
 
 Compatibility overrides:
 
@@ -113,12 +113,18 @@ python3 dashboard_api.py --host 127.0.0.1 --port 8766
 
 ### Run in Docker
 
-`Dockerfile` + `docker-compose.yml` give you a sandboxed one-command runtime: provider sources bind-mounted read-only, Unibase in an isolated volume, host port bound to `127.0.0.1`.
+`Dockerfile` + `docker-compose.yml` give you a sandboxed runtime: provider sources bind-mounted read-only, Unibase in an isolated volume, host port bound to `127.0.0.1`.
 
-Requires Docker 24+ (or Docker Desktop) with Compose v2.
+Requires Docker 24+ (or Docker Desktop) with Compose v2. The supplied Compose file supports Linux and macOS paths. On Windows, run it from WSL2 with provider data under the WSL home directory; native `C:\...` paths cannot be preserved inside the Linux container.
+
+The default Compose file expects all three source directories to exist. Create empty user-owned directories for providers that are not installed; fail-fast bind mounts prevent Docker from silently creating them as `root`:
 
 ```bash
-docker compose up -d                                                # macOS, Windows
+mkdir -p "$HOME/.codex" "$HOME/.claude" "$HOME/.local/share/opencode"
+```
+
+```bash
+docker compose up -d                                                # macOS or WSL2
 METERMESH_UID=$(id -u) METERMESH_GID=$(id -g) docker compose up -d  # Linux
 ```
 
@@ -135,15 +141,15 @@ Provider sources are bind-mounted **read-only** at the *same absolute path* they
 | `~/.codex` | identical | `CODEX_USAGE_DB=$HOME/.codex/state_5.sqlite` | Codex live source + `add_stat/` backups |
 | `~/.claude` | identical | `CLAUDE_PROJECTS_DIR=$HOME/.claude/projects` | Claude `projects/**/*.jsonl` + `add_stat/` backups |
 | `~/.local/share/opencode` | identical | `OPENCODE_USAGE_DB=$HOME/.local/share/opencode/opencode.db` | OpenCode live source + `add_stat/` backups |
-| — (named volume) | `/data/unibase` | `METERMESH_UNIBASE_DB=/data/unibase/unibase.sqlite3` | Rebuildable index, only writable path |
+| — (named volume) | `/data/unibase` | `METERMESH_UNIBASE_DB=/data/unibase/unibase.sqlite3` | Rebuildable index and only persistent app data |
 
-Mounting at identical paths is deliberate. Codex's `state_5.sqlite` records each session's rollout file as an **absolute** host path (`/home/you/.codex/sessions/…`). Mounted anywhere else, those paths would not resolve inside the container and every Codex session would index as empty — without erroring. Compose therefore reads `$HOME` from your shell and refuses to start if it is unset.
+Mounting at identical paths is deliberate. Codex's `state_5.sqlite` records each session's rollout file as an **absolute** host path (`/home/you/.codex/sessions/…`). Mounted anywhere else, those paths would not resolve inside the container. Compose therefore reads `$HOME` from your shell and refuses to start if it is unset.
 
-Each provider's `add_stat/` directory is covered by a `tmpfs` mount. MeterMesh calls `mkdir(exist_ok=True)` on it at startup, which would otherwise fail with `EROFS` against a read-only source that has no `add_stat/` yet. The tmpfs absorbs that write; nothing reaches your host.
+If a read-only source has no `add_stat/` directory, backup discovery receives `EROFS` and continues with the live source only. Existing snapshots remain visible through the read-only bind; MeterMesh never creates or writes `add_stat/` inside the container.
 
 #### Linux: run as yourself
 
-On macOS and Windows, Docker Desktop remaps ownership on bind mounts and the defaults work as-is. On Linux, bind mounts preserve host ownership and mode: `~/.codex` and `~/.claude` are commonly `0700` with `0600` files owned by you, so the container's default uid `10001` cannot even traverse them. Pass your own ids:
+On macOS, Docker Desktop remaps ownership on bind mounts and the defaults work as-is. On Linux, bind mounts preserve host ownership and mode: `~/.codex` and `~/.claude` are commonly `0700` with `0600` files owned by you, so the container's default uid `10001` cannot even traverse them. Pass your own ids:
 
 ```bash
 METERMESH_UID=$(id -u) METERMESH_GID=$(id -g) docker compose up -d
@@ -166,12 +172,27 @@ If your provider data is not under the defaults, edit the `volumes` and `environ
 environment:
   CODEX_USAGE_DB: /opt/codex/state_5.sqlite   # ← must match the mount below
 volumes:
-  - /opt/codex:/opt/codex:ro                  # ← your Codex dir, same path both sides
-tmpfs:
-  - /opt/codex/add_stat
+  - type: bind
+    source: /opt/codex
+    target: /opt/codex                        # ← same absolute path
+    read_only: true
+    bind:
+      create_host_path: false
 ```
 
 Keep the host and container sides equal. Mapping a source to a different container path breaks Codex's absolute `rollout_path` lookups, as described above.
+
+Additional Codex profiles referenced by `state_5.sqlite` need their own same-path read-only mounts. For example, add this alongside the default `~/.codex` mount:
+
+```yaml
+volumes:
+  - type: bind
+    source: ${HOME}/.codex-work
+    target: ${HOME}/.codex-work
+    read_only: true
+    bind:
+      create_host_path: false
+```
 
 #### Storing Unibase in a host directory
 
@@ -198,10 +219,10 @@ If Docker creates `./unibase` itself it makes it `root:root`, and the container 
 
 | Concern | Mitigation |
 |---------|------------|
-| Writes to provider sources | Blocked — bind-mounted `:ro`; `add_stat/` writes land on a throwaway `tmpfs` |
+| Writes to provider sources | Blocked — bind-mounted read-only; absent `add_stat/` directories are treated as having no backups |
 | Network exposure | Host port bound to `127.0.0.1:8765` only |
 | Privilege escalation | `no-new-privileges`, `cap_drop: ALL`, non-root uid 10001 |
-| Writable surface | Only `/data/unibase` (group-writable to gid 10001, not world-writable) |
+| Persistent app data | Only `/data/unibase` (group-writable to gid 10001, not world-writable) |
 
 #### Updating to a new MeterMesh version
 
@@ -209,7 +230,7 @@ The version (`package.json`) and SPA (`dist/`) are baked in at build time; the c
 
 ```bash
 git checkout main && git pull origin main          # latest, or:
-git fetch && git checkout v2.3.0                  # pin a tag
+git fetch && git checkout v2.2.1                  # pin a tag
 
 docker compose build                               # rebuild image
 docker compose up -d                               # recreate container

@@ -39,6 +39,8 @@ SOURCE_DIRS=(
   "$FIXTURES_HOME/.claude"
   "$FIXTURES_HOME/.local/share/opencode"
 )
+MISSING_SOURCE="$FIXTURES_HOME/.local/share/opencode"
+MISSING_SOURCE_BACKUP="$FIXTURES_HOME/.local/share/opencode.smoke-missing"
 
 FAILURES=0
 pass() { printf '  ok   %s\n' "$1"; }
@@ -70,6 +72,9 @@ teardown() {
   rm -rf "${ADD_STAT_DIRS[@]}"
   rm -f "$FIXTURES_HOME/.codex/state_5.sqlite" \
         "$FIXTURES_HOME/.local/share/opencode/opencode.db"
+  if [ -d "$MISSING_SOURCE_BACKUP" ] && [ ! -e "$MISSING_SOURCE" ]; then
+    mv "$MISSING_SOURCE_BACKUP" "$MISSING_SOURCE"
+  fi
   chmod 755 "${SOURCE_DIRS[@]}" 2>/dev/null || true
   echo "  torn down"
   exit "$status"
@@ -111,6 +116,27 @@ echo "  no conflicting 'metermesh' container"
 info "Build"
 compose build >/dev/null
 echo "  built metermesh:local"
+
+# --------------------------------------------------------------------------
+# catches: replacing long bind syntax with short syntax, which silently creates
+# a missing host source directory as root. The shipped config must fail before
+# startup and leave the host path absent.
+info "Fail-fast missing source bind"
+reset_fixtures
+rm -rf "$MISSING_SOURCE_BACKUP"
+mv "$MISSING_SOURCE" "$MISSING_SOURCE_BACKUP"
+if compose up -d >/tmp/metermesh-smoke-missing-source.log 2>&1; then
+  fail "compose started with a missing source directory"
+else
+  pass "compose rejected a missing source directory"
+fi
+if [ -e "$MISSING_SOURCE" ]; then
+  fail "Docker created the missing source directory on the host"
+else
+  pass "missing source directory was not created on the host"
+fi
+compose down -v >/dev/null 2>&1 || true
+mv "$MISSING_SOURCE_BACKUP" "$MISSING_SOURCE"
 
 # --------------------------------------------------------------------------
 # Scenario 2: fresh install. A never-indexed source has no add_stat/, and the
@@ -163,6 +189,28 @@ else
   echo "  --- container logs ---"; docker logs metermesh 2>&1 | tail -20 | sed 's/^/  /'
   exit 1
 fi
+
+# Pin the single-process static/API split: the container serves the built SPA,
+# keeps the compatibility JSON endpoint on the upstream handler, and does not
+# turn missing assets into HTML responses.
+INDEX_CODE="$(curl -s -o /tmp/metermesh-smoke-index.html -w '%{http_code}' "$BASE_URL/")"
+check_eq "200" "$INDEX_CODE" "GET / served the built SPA"
+if grep -q '<main id="app"></main>' /tmp/metermesh-smoke-index.html; then
+  pass "GET / returned the Vite index"
+else
+  fail "GET / did not return the Vite index"
+fi
+
+DATA_CODE="$(curl -s -o /tmp/metermesh-smoke-data.json -w '%{http_code}' "$BASE_URL/data.json?provider=all")"
+check_eq "200" "$DATA_CODE" "GET /data.json reached the API handler"
+if python3 -c 'import json; json.load(open("/tmp/metermesh-smoke-data.json"))'; then
+  pass "GET /data.json returned JSON"
+else
+  fail "GET /data.json did not return JSON"
+fi
+
+MISSING_ASSET_CODE="$(curl -s -o /dev/null -w '%{http_code}' "$BASE_URL/assets/missing-smoke-file.js")"
+check_eq "404" "$MISSING_ASSET_CODE" "missing static assets return 404"
 
 # POST /api/unibase/resync wants Content-Type: application/json and a literal
 # `{}`; read_json_body() rejects a zero-length body with 400.
@@ -221,6 +269,18 @@ check_eq "2" "$CODEX_FILES" "codex indexed both rollouts"
 # 'Codex state inventory is incomplete; retained committed data'.
 check_eq "ready" "$CODEX_STATUS" "codex source is not in an error state"
 check_eq "0" "$CODEX_SOURCE_ERROR" "codex source carries no error"
+if [ "$CODEX_SOURCE_ERROR" = "1" ]; then
+  docker exec metermesh python3 -c '
+import os, sqlite3
+from pathlib import Path
+db = Path(os.environ["CODEX_USAGE_DB"])
+print("  diagnostic: HOME=", os.environ.get("HOME"), " state_db=", db, " exists=", db.exists(), sep="")
+if db.exists():
+    with sqlite3.connect(db) as conn:
+        for (path,) in conn.execute("select rollout_path from threads order by rollout_path"):
+            print("  diagnostic: rollout_path=", path, " exists=", Path(path).is_file(), sep="")
+' || true
+fi
 
 # catches: the ${HOME}/.codex bind being dropped entirely, or CODEX_USAGE_DB
 # pointing somewhere the sessions tree isn't. (7001 raw - 1 cached = 7000.)
@@ -321,14 +381,16 @@ for dir in "${SOURCE_DIRS[@]}"; do
   check_eq "700" "$MODE" "$(basename "$dir") still 0700 after the run"
 done
 
-# catches: the tmpfs being replaced by a writable bind -> the container's
-# add_stat writes land on the host instead of in RAM.
+# catches: source mounts becoming writable and allowing add_stat content to
+# leak onto the host.
+LEAKED=0
 for dir in "${ADD_STAT_DIRS[@]}"; do
   if [ -d "$dir" ] && [ -n "$(ls -A "$dir" 2>/dev/null)" ]; then
     fail "host add_stat/ received container writes: $dir"
+    LEAKED=1
   fi
 done
-pass "no container writes reached the host add_stat/ dirs"
+if [ "$LEAKED" -eq 0 ]; then pass "no container writes reached the host add_stat/ dirs"; fi
 
 # --------------------------------------------------------------------------
 info "Result"

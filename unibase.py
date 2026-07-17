@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import datetime as dt
+import errno
 import hashlib
 import json
 import os
@@ -1487,7 +1488,9 @@ def _legacy_roots(provider: str, child: Path) -> list[Path]:
 def discover_backup_sources(provider: str, add_stat_dir: Path) -> list[DiscoveredSource]:
     try:
         add_stat_dir.mkdir(parents=True, exist_ok=True)
-    except OSError:
+    except OSError as exc:
+        if exc.errno != errno.EROFS:
+            raise
         # A read-only source root cannot gain an add_stat/ directory: mkdir
         # reports EROFS rather than EEXIST, so exist_ok never engages. Nothing
         # can have been snapshotted there either, so there is simply nothing to
@@ -1557,7 +1560,9 @@ def register_default_sources(
     for provider, root in roots.items():
         try:
             root.mkdir(parents=True, exist_ok=True)
-        except OSError:
+        except OSError as exc:
+            if exc.errno != errno.EROFS:
+                raise
             # Already-present read-only roots answer mkdir with EEXIST, which
             # exist_ok absorbs; only a genuinely missing root on read-only media
             # reaches here, and registration below still reports it accurately.

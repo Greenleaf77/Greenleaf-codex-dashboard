@@ -87,7 +87,10 @@ def write_opencode_db(home: Path) -> Path:
 def main() -> None:
     if len(sys.argv) != 2:
         raise SystemExit(f"usage: {sys.argv[0]} <fixtures-home>")
-    home = Path(sys.argv[1]).resolve()
+    # Preserve the exact host path used as the container mount target. Resolving
+    # macOS /var to /private/var would write state paths that do not exist in the
+    # container even though both names refer to the same host directory.
+    home = Path(sys.argv[1]).absolute()
     if not home.is_dir():
         raise SystemExit(f"fixtures home does not exist: {home}")
     print(f"generated {write_codex_state(home)}")
