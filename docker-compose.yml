@@ -1,0 +1,25 @@
+services:
+  metermesh:
+    build: .
+    image: metermesh:local
+    container_name: metermesh
+    ports:
+      - "127.0.0.1:8765:8765"
+    environment:
+      METERMESH_UNIBASE_DB: /data/unibase/unibase.sqlite3
+      CODEX_USAGE_DB:      /data/sources/codex/state_5.sqlite
+      CLAUDE_PROJECTS_DIR: /data/sources/claude/projects
+      OPENCODE_USAGE_DB:   /data/sources/opencode/opencode.db
+    volumes:
+      - metermesh-unibase:/data/unibase
+      - ${HOME}/.codex:/data/sources/codex:ro
+      - ${HOME}/.claude:/data/sources/claude:ro
+      - ${HOME}/.local/share/opencode:/data/sources/opencode:ro
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+volumes:
+  metermesh-unibase:
