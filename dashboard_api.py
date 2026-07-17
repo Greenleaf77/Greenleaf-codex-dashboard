@@ -44,7 +44,7 @@ from unibase import (
 DEFAULT_DB = Path.home() / ".codex" / "state_5.sqlite"
 PROVIDERS = {"all", "codex", "claude", "opencode"}
 RANGES = {"all", "30d", "7d", "1d", "custom"}
-CHART_RANGES = {"all", "1y", "6m", "90d", "30d", "7d", "1d", "custom"}
+CHART_RANGES = {"all", "1y", "6m", "90d", "30d", "21d", "14d", "7d", "3d", "1d", "custom"}
 REQUEST_GROUPS = {"none", "1m", "15m", "30m", "1h", "6h", "12h", "24h"}
 REQUEST_PAGE_SIZES = {10, 25, 50, 100}
 ACTIVITY_IDLE_TIMEOUT_SECONDS = 10 * 60
@@ -338,8 +338,17 @@ def resolve_chart_range(
     if range_name == "1d":
         start_date = today
         end_date = today
+    elif range_name == "3d":
+        start_date = today - dt.timedelta(days=2)
+        end_date = today
     elif range_name == "7d":
         start_date = today - dt.timedelta(days=6)
+        end_date = today
+    elif range_name == "14d":
+        start_date = today - dt.timedelta(days=13)
+        end_date = today
+    elif range_name == "21d":
+        start_date = today - dt.timedelta(days=20)
         end_date = today
     elif range_name == "30d":
         start_date = today - dt.timedelta(days=29)
@@ -1486,6 +1495,7 @@ def load_unibase_usage(
     provider = normalize_provider(provider)
     unibase = Unibase(unibase_path, migrate=False)
     settings = unibase.settings()
+    merge_models = provider == "all" and bool(settings["merge_models_across_providers"])
     timezone = resolve_timezone(timezone_name)
     today = dt.datetime.now(timezone).date()
     filters = resolve_range(range_name, start_day, end_day, bool(ignore_auto_review), today=today)
@@ -1524,7 +1534,7 @@ def load_unibase_usage(
             conn, provider, envelope_start_ts, envelope_end_ts, bool(ignore_auto_review)
         )
         conn.commit()
-    groups = [_price_usage_group(row, pricing, provider == "all") for row in raw_groups]
+    groups = [_price_usage_group(row, pricing, provider == "all" and not merge_models) for row in raw_groups]
     print(
         f"[MeterMesh timing] usage SQL aggregates: {(time.perf_counter() - sql_started_at) * 1000:.0f} ms; "
         f"groups={len(groups)}; sessions={len(session_rows)}; provider={provider}",
@@ -1539,7 +1549,7 @@ def load_unibase_usage(
     for row in session_rows:
         name = str(row["provider"])
         session = (name, str(row["stream_key"]))
-        model_key = f'{name}:{row["model"]}'
+        model_key = str(row["model"]) if merge_models else f'{name}:{row["model"]}'
         day = str(row["day"])
         total_sessions.add(session)
         daily_sessions.setdefault(day, set()).add(session)
@@ -1566,14 +1576,14 @@ def load_unibase_usage(
     cost_breakdown = {"recorded": 0.0, "estimated": 0.0, "unavailable": 0}
     for row in groups:
         day = str(row["day"])
-        model_key = str(row["model_key"])
+        model_key = str(row["raw_model"]) if merge_models else str(row["model_key"])
         daily = daily_map.setdefault(day, {"day": day, **{key: 0 for key in AGGREGATE_KEYS}})
         model_row = model_map.setdefault(
             model_key,
             {
-                "model": row["model"],
+                "model": row["raw_model"] if merge_models else row["model"],
                 "model_key": model_key,
-                "provider": row["provider"],
+                "provider": "all" if merge_models else row["provider"],
                 "daily_map": {},
                 "first_occurred_at": row["first_occurred_at"],
                 "first_event_id": row["first_event_id"],
@@ -1645,8 +1655,9 @@ def load_unibase_usage(
         chart_rows = [
             {
                 **row,
-                "model": f'{PROVIDER_LABELS[str(row["provider"])]} · {row["model"]}'
-                if provider == "all" else str(row["model"]),
+                "model": str(row["model"])
+                if merge_models or provider != "all"
+                else f'{PROVIDER_LABELS[str(row["provider"])]} · {row["model"]}',
             }
             for row in raw_chart_rows
         ]
@@ -1664,6 +1675,7 @@ def load_unibase_usage(
         "range_start": filters["start_day"],
         "range_end": filters["end_day"],
         "timezone": getattr(timezone, "key", "UTC"),
+        "merge_models_across_providers": bool(settings["merge_models_across_providers"]),
         "ignore_auto_review": bool(ignore_auto_review),
         "generated_at": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "totals": totals,
@@ -2000,7 +2012,10 @@ def unibase_freshness(database: Unibase, provider: str = "all") -> str | None:
             """
             select count(*) enabled_count,
                    sum(last_successful_scan is not null and stale = 0 and discovery_status = 'ready') ready_count,
-                   min(last_successful_scan) fresh_at
+                   coalesce(
+                       min(case when kind = 'live' then last_successful_scan end),
+                       min(last_successful_scan)
+                   ) fresh_at
             from sources where """ + " and ".join(clauses),
             params,
         ).fetchone()
@@ -2039,14 +2054,10 @@ def settings_payload(unibase_path: Path) -> dict:
         ).fetchall()
         model_rows = conn.execute(
             """
-            select inventory.model, disabled.model is null enabled
-            from (
-                select model from active_events
-                union
-                select model from disabled_models
-            ) inventory
-            left join disabled_models disabled on disabled.model = inventory.model
-            order by lower(inventory.model), inventory.model
+            select known.model, disabled.model is null enabled
+            from known_models known
+            left join disabled_models disabled on disabled.model = known.model
+            order by lower(known.model), known.model
             """
         ).fetchall()
     for row in rows:
@@ -2081,6 +2092,7 @@ def settings_payload(unibase_path: Path) -> dict:
         }
     return {
         "revision": settings["revision"],
+        "merge_models_across_providers": bool(settings["merge_models_across_providers"]),
         "sources": groups,
         "models": model_groups,
         "unibase": {
@@ -3170,12 +3182,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
             payload = self.read_json_body()
             if set(payload) != {
                 "revision",
+                "merge_models_across_providers",
                 "sources",
                 "models",
             }:
                 raise ValueError("Unexpected settings fields")
             if (
                 not isinstance(payload["revision"], int)
+                or not isinstance(payload["merge_models_across_providers"], bool)
                 or not isinstance(payload["sources"], list)
                 or not isinstance(payload["models"], list)
                 or not all(
@@ -3191,6 +3205,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             database = Unibase(self.unibase_path)
             database.apply_settings(
                 payload["revision"],
+                payload["merge_models_across_providers"],
                 payload["sources"],
                 payload["models"],
             )

@@ -79,6 +79,23 @@ class AllProviderTests(unittest.TestCase):
         self.assertEqual(all_data["cost"]["recorded"], 0.5)
         self.assertGreater(all_data["cost"]["estimated"], 0)
 
+    def test_all_can_merge_matching_models_across_providers(self):
+        with self.db.connect() as conn:
+            conn.execute("update app_settings set merge_models_across_providers = 1")
+
+        data = self.load("all")
+
+        self.assertTrue(data["merge_models_across_providers"])
+        self.assertEqual(len(data["models"]), 1)
+        model = data["models"][0]
+        self.assertEqual(model["model"], "gpt-5.5")
+        self.assertEqual(model["model_key"], "gpt-5.5")
+        self.assertEqual(model["provider"], "all")
+        self.assertEqual(model["sessions"], 3)
+        self.assertEqual(model["total_tokens"], data["totals"]["total_tokens"])
+        self.assertEqual([row["model"] for row in data["chart"]["models"]], ["gpt-5.5"])
+        self.assertEqual([row["model"] for row in data["chart"]["days"][0]["models"]], ["gpt-5.5"])
+
     def test_opencode_endpoints_share_one_model_row(self):
         self.db.add_event("opencode-live", None, {
             "provider": "opencode",
@@ -155,6 +172,10 @@ class AllProviderTests(unittest.TestCase):
         )
         self.assertEqual(timezone_day["start_day"], "2026-07-17")
         self.assertEqual(timezone_day["end_day"], "2026-07-17")
+        for range_name, expected_start in (("3d", "2026-07-15"), ("14d", "2026-07-04"), ("21d", "2026-06-27")):
+            resolved = dashboard_api.resolve_chart_range(range_name, today=dashboard_api.dt.date(2026, 7, 17))
+            self.assertEqual(resolved["start_day"], expected_start)
+            self.assertEqual(resolved["end_day"], "2026-07-17")
 
     def test_production_usage_payload_does_not_call_provider_scanners(self):
         handler = object.__new__(dashboard_api.DashboardHandler)

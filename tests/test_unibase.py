@@ -47,6 +47,27 @@ class UnibaseFoundationTests(unittest.TestCase):
             self.assertIn("failed", {row[1] for row in conn.execute("pragma table_info(event_variants)")})
             self.assertIn("failed", {row[1] for row in conn.execute("pragma table_info(active_events)")})
 
+    def test_version_seven_adds_model_inventory_and_removes_unknown_sentinel(self):
+        with self.db.connect() as conn:
+            conn.execute("insert into disabled_models(model, created_at) values ('remembered-model', 'now')")
+            conn.execute("insert into disabled_models(model, created_at) values ('(unknown)', 'now')")
+            conn.execute("drop table known_models")
+            conn.execute("alter table app_settings drop column merge_models_across_providers")
+            conn.execute("pragma user_version = 7")
+
+        reopened = unibase.Unibase(self.db_path)
+
+        self.assertFalse(reopened.settings()["merge_models_across_providers"])
+        with reopened.connect(readonly=True) as conn:
+            self.assertEqual(
+                [row[0] for row in conn.execute("select model from known_models order by model")],
+                ["remembered-model"],
+            )
+            self.assertEqual(
+                [row[0] for row in conn.execute("select model from disabled_models order by model")],
+                ["remembered-model"],
+            )
+
     def test_settings_revision_conflict_and_reset_preserves_registry(self):
         codex = self.root / ".codex"
         claude = self.root / ".claude"

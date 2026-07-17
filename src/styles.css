@@ -595,6 +595,10 @@ h2.section-title {
   box-shadow: 0 0 18px color-mix(in srgb, var(--cyan) 18%, transparent);
 }
 
+.activity-chart-shell .chart-grid span {
+  border-top-color: color-mix(in srgb, var(--cyan) 20%, var(--border));
+}
+
 .tables {
   display: grid;
   grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.1fr);

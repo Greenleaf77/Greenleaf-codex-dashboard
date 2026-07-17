@@ -304,7 +304,7 @@ class CodexUsageAdapterTests(unittest.TestCase):
             token("2026-07-16T12:00:00Z", {**usage(10, 2, 3), "total_tokens": 13}),
         ])
         sources = [{"source_id": "codex-live", "enabled": True}]
-        self.unibase.apply_settings(1, sources, [])
+        self.unibase.apply_settings(1, False, sources, [])
 
         dashboard_api.import_registered_source(self.unibase, self.unibase.sources("codex")[0])
 

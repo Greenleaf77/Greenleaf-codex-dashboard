@@ -88,6 +88,27 @@ class MultisourceDedupTests(unittest.TestCase):
 
         self.assertEqual(self.db.active_event_rows()[0]["input_tokens"], 20)
 
+    def test_codex_dedup_prefers_known_model_over_unknown_source_variant(self):
+        for source_id in ("backup-a", "backup-b"):
+            self.db.register_source(unibase.DiscoveredSource(
+                source_id, "codex", "legacy_backup", Path("/unused"), source_id, source_id,
+                True, 400, source_id, None, "ready",
+            ))
+        shared = {
+            "provider": "codex", "event_key": "dedup-key", "stream_key": "stream-1",
+            "timestamp_utc": "2026-07-16T12:00:00Z", "occurred_at": 1784203200,
+            "native_provider_id": "openai", "semantics": "codex_global_dedup",
+            "classification": "usage_update", "input_tokens": 10, "cache_read_tokens": 20,
+            "cache_write_tokens": 0, "output_tokens": 1, "reasoning_tokens": 0,
+            "cost_usd": None, "cost_kind": "unavailable",
+        }
+        self.db.add_event("backup-a", None, {**shared, "model": "(unknown)"}, 2)
+        self.db.add_event("backup-b", None, {**shared, "model": "gpt-5.4"}, 1)
+
+        self.db.rebuild_active_events()
+
+        self.assertEqual(self.db.active_event_rows("codex")[0]["model"], "gpt-5.4")
+
     def test_stale_source_retains_last_committed_projection(self):
         self.db.register_source(source("backup", "normalized_backup", 500))
         self.db.add_event("backup", None, event(10), 1)

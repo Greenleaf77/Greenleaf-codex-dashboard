@@ -15,7 +15,7 @@ from pathlib import Path, PurePosixPath
 from typing import Iterable, Iterator
 
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 DEFAULT_UNIBASE_DB = Path.home() / ".metermesh" / "unibase.sqlite3"
 PROVIDERS = ("codex", "claude", "opencode")
 SOURCE_PRIORITIES = {"live": 1000, "normalized_backup": 500, "legacy_backup": 400}
@@ -126,6 +126,7 @@ MIGRATION_1 = """
 create table app_settings (
     id integer primary key check (id = 1),
     revision integer not null default 1,
+    merge_models_across_providers integer not null default 0,
     ignore_codex_auto_review integer not null default 0,
     experimental_codex_deduplication integer not null default 0,
     ignore_failed_requests integer not null default 0,
@@ -139,6 +140,12 @@ create table app_settings (
 create table disabled_models (
     model text primary key,
     created_at text not null
+);
+
+create table known_models (
+    model text primary key,
+    first_seen_at text not null,
+    last_seen_at text not null
 );
 
 create table sources (
@@ -513,6 +520,38 @@ class Unibase:
                     )
                     conn.execute("pragma user_version = 7")
                     conn.commit()
+                    version = 7
+                if version == 7:
+                    conn.execute("begin immediate")
+                    columns = {row[1] for row in conn.execute("pragma table_info(app_settings)")}
+                    if "merge_models_across_providers" not in columns:
+                        conn.execute(
+                            "alter table app_settings add column merge_models_across_providers integer not null default 0"
+                        )
+                    conn.execute(
+                        """
+                        create table if not exists known_models (
+                            model text primary key,
+                            first_seen_at text not null,
+                            last_seen_at text not null
+                        )
+                        """
+                    )
+                    now = utc_now()
+                    conn.execute(
+                        """
+                        insert or ignore into known_models(model, first_seen_at, last_seen_at)
+                        select model, ?, ? from active_events
+                        where trim(model) != '' and lower(trim(model)) != '(unknown)'
+                        union
+                        select model, ?, ? from disabled_models
+                        where trim(model) != '' and lower(trim(model)) != '(unknown)'
+                        """,
+                        (now, now, now, now),
+                    )
+                    conn.execute("delete from disabled_models where lower(trim(model)) = '(unknown)'")
+                    conn.execute("pragma user_version = 8")
+                    conn.commit()
 
     def settings(self) -> dict:
         with self.connect(readonly=True) as conn:
@@ -557,6 +596,7 @@ class Unibase:
     def apply_settings(
         self,
         revision: int,
+        merge_models_across_providers: bool,
         sources: list[dict],
         models: list[dict],
     ) -> dict:
@@ -598,8 +638,8 @@ class Unibase:
                     [(name, utc_now()) for name, item in zip(model_names, models) if not item["enabled"]],
                 )
                 conn.execute(
-                    "update app_settings set revision = revision + 1, ignore_codex_auto_review = 0, experimental_codex_deduplication = 1, ignore_failed_requests = 0, legacy_preference_migrated = 1, updated_at = ? where id = 1",
-                    (utc_now(),),
+                    "update app_settings set revision = revision + 1, merge_models_across_providers = ?, ignore_codex_auto_review = 0, experimental_codex_deduplication = 1, ignore_failed_requests = 0, legacy_preference_migrated = 1, updated_at = ? where id = 1",
+                    (int(merge_models_across_providers), utc_now()),
                 )
             self.rebuild_active_events()
             return self.settings()
@@ -844,6 +884,16 @@ class Unibase:
             )
         }
         payload_hash = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        model = str(payload["model"] or "").strip()
+        if model and model.lower() != "(unknown)":
+            now = utc_now()
+            conn.execute(
+                """
+                insert into known_models(model, first_seen_at, last_seen_at) values (?, ?, ?)
+                on conflict(model) do update set last_seen_at = excluded.last_seen_at
+                """,
+                (model, now, now),
+            )
         conn.execute(
                 """
                 insert into event_variants(
@@ -1080,6 +1130,7 @@ class Unibase:
                                 row_number() over (
                                     partition by provider, event_key
                                     order by case when semantics = 'codex_global_dedup' then occurred_at end asc,
+                                             case when semantics = 'codex_global_dedup' and lower(trim(model)) = '(unknown)' then 1 else 0 end asc,
                                              priority desc, snapshot_date desc, stable_source_id asc,
                                              scan_generation desc, payload_hash asc
                                 ) variant_rank,

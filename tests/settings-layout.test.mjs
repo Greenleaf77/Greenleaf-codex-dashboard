@@ -42,6 +42,12 @@ test("Settings uses General and Models tabs", () => {
   assert.match(source, /\["gpt", "claude", "others"\]/);
 });
 
+test("General exposes All-provider model merging", () => {
+  assert.match(source, /id="settings-merge-models"/);
+  assert.match(source, /Merge matching models in "All" mode/);
+  assert.match(source, /merge_models_across_providers/);
+});
+
 test("source choices are compact wrapping rows without horizontal scrolling", () => {
   assert.match(styles, /\.settings-dialog,[\s\S]*overflow-x:\s*hidden/);
   assert.match(styles, /\.settings-source-groups\s*\{[^}]*grid-template-columns:\s*1fr/s);

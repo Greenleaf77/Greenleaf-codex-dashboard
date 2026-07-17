@@ -23,3 +23,8 @@ test("visualizations keep separate default ranges", () => {
   assert.match(source, /start: chartStartDate/);
   assert.match(source, /end: chartEndDate/);
 });
+
+test("Active time uses short day presets", () => {
+  assert.match(source, /activityChartRangeOptions = \[[\s\S]*"3d"[\s\S]*"7d"[\s\S]*"14d"[\s\S]*"21d"[\s\S]*"30d"[\s\S]*"custom"/);
+  assert.match(source, /visualization === "activity" \? activityChartRangeOptions : chartRangeOptions/);
+});

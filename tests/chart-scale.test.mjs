@@ -29,3 +29,9 @@ test("chart grid fits every bucket into the available panel width", () => {
   assert.equal(chartBarSizing("month", 48).barGap, 0);
   assert.ok(chartBarSizing("month", 13).barGap > 0);
 });
+
+test("daily Active time uses a fixed 24-hour vertical scale", () => {
+  const source = readFileSync(new URL("../src/main.js", import.meta.url), "utf8");
+  assert.match(source, /dailyScale \? 24 \* 60 \* 60/);
+  assert.match(source, /\[24, 18, 12, 6, 0\]\.map\(\(hours\) => hours \* 60 \* 60\)/);
+});

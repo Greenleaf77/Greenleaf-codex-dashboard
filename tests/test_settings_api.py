@@ -71,6 +71,7 @@ class SettingsApiTests(unittest.TestCase):
         status, payload = self.request("/api/settings")
         self.assertEqual(status, 200)
         self.assertEqual(payload["revision"], 1)
+        self.assertFalse(payload["merge_models_across_providers"])
         self.assertEqual(len(payload["sources"]["codex"]), 2)
         self.assertTrue(payload["sources"]["codex"][0]["original"])
         self.assertEqual(payload["sources"]["codex"][0]["size_bytes"], 2 * 1024 * 1024)
@@ -89,12 +90,14 @@ class SettingsApiTests(unittest.TestCase):
         next(source for source in sources if source["source_id"] == "codex-backup")["enabled"] = True
         body = {
             "revision": payload["revision"],
+            "merge_models_across_providers": True,
             "sources": sources,
             "models": [],
         }
         with patch.object(dashboard_api, "schedule_enabled_sources_refresh", return_value=True):
             status, applied = self.request("/api/settings", "POST", body)
             self.assertEqual(status, 200)
+            self.assertTrue(applied["merge_models_across_providers"])
             self.assertTrue(applied["sources"]["codex"][1]["enabled"])
 
             status, conflict = self.request("/api/settings", "POST", body)
@@ -154,6 +157,7 @@ class SettingsApiTests(unittest.TestCase):
         with patch.object(dashboard_api, "schedule_enabled_sources_refresh", return_value=True):
             status, applied = self.request("/api/settings", "POST", {
                 "revision": payload["revision"],
+                "merge_models_across_providers": False,
                 "sources": sources,
                 "models": models,
             })
@@ -179,10 +183,44 @@ class SettingsApiTests(unittest.TestCase):
         self.assertEqual(status, 400)
         status, _ = self.request("/api/settings", "POST", {
             "revision": 1,
+            "merge_models_across_providers": False,
             "sources": [None],
             "models": [],
         })
         self.assertEqual(status, 400)
+
+    def test_model_inventory_excludes_unknown_and_survives_event_reset(self):
+        for event_key, model in (("known", "remembered-model"), ("unknown", "(unknown)")):
+            self.db.add_event("codex-live", None, {
+                "provider": "codex", "event_key": event_key, "stream_key": event_key,
+                "timestamp_utc": "2026-07-16T12:00:00Z", "occurred_at": 1784203200,
+                "model": model, "native_provider_id": "openai", "semantics": "exact",
+                "classification": "usage_update", "input_tokens": 1, "cache_read_tokens": 0,
+                "cache_write_tokens": 0, "output_tokens": 1, "reasoning_tokens": 0,
+                "cost_usd": None, "cost_kind": "unavailable",
+            }, 1)
+        self.db.rebuild_active_events()
+
+        before = dashboard_api.settings_payload(self.path)
+        visible = [item["model"] for group in before["models"].values() for item in group]
+        self.assertEqual(visible, ["remembered-model"])
+
+        sources = [
+            {"source_id": source["source_id"], "enabled": source["enabled"]}
+            for provider_sources in before["sources"].values()
+            for source in provider_sources
+        ]
+        self.db.apply_settings(
+            before["revision"],
+            False,
+            sources,
+            [{"model": "remembered-model", "enabled": False}],
+        )
+        self.db.reset()
+
+        after = dashboard_api.settings_payload(self.path)
+        remembered = next(item for group in after["models"].values() for item in group)
+        self.assertEqual(remembered, {"model": "remembered-model", "enabled": False})
 
     def test_manual_refresh_runs_incremental_source_scan(self):
         with patch.object(dashboard_api, "schedule_enabled_sources_refresh", return_value=True) as schedule:
@@ -280,6 +318,20 @@ class SettingsApiTests(unittest.TestCase):
 
         self.assertEqual(status, 200)
         self.assertEqual(payload["fresh_at"], "2026-07-16T12:00:00Z")
+
+    def test_status_freshness_is_not_pinned_by_skipped_immutable_backup(self):
+        with self.db.connect() as conn:
+            conn.execute(
+                "update sources set last_successful_scan = '2026-07-16T12:00:00Z', stale = 0 where source_id = 'codex-live'"
+            )
+            conn.execute(
+                "update sources set enabled = 1, last_successful_scan = '2026-07-01T12:00:00Z', stale = 0 where source_id = 'codex-backup'"
+            )
+
+        for provider in ("codex", "all"):
+            status, payload = self.request(f"/api/unibase/status?provider={provider}")
+            self.assertEqual(status, 200)
+            self.assertEqual(payload["fresh_at"], "2026-07-16T12:00:00Z")
 
     def test_source_refresh_reports_individual_source_failures(self):
         with patch.object(dashboard_api, "register_default_sources"), patch.object(
@@ -419,6 +471,7 @@ class SettingsApiTests(unittest.TestCase):
         settings = dashboard_api.settings_payload(self.path)
         body = {
             "revision": settings["revision"],
+            "merge_models_across_providers": False,
             "sources": [
                 {"source_id": "codex-live", "enabled": True},
                 {"source_id": "codex-backup", "enabled": False},

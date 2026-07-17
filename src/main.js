@@ -34,6 +34,14 @@ const chartRangeOptions = [
   { value: "all", label: "All" },
   { value: "custom", label: "Custom" }
 ];
+const activityChartRangeOptions = [
+  { value: "3d", label: "3d" },
+  { value: "7d", label: "7d" },
+  { value: "14d", label: "14d" },
+  { value: "21d", label: "21d" },
+  { value: "30d", label: "30d" },
+  { value: "custom", label: "Custom" }
+];
 const visualizationOptions = [
   { value: "heatmap", label: "Daily heatmap" },
   { value: "tokens", label: "Tokens over time" },
@@ -169,12 +177,12 @@ function resetUsageTablePages() {
 }
 
 function usageTableScopeKey(data) {
-  return [data.provider, data.range, data.range_start || "", data.range_end || ""].join(":");
+  return [data.provider, data.range, data.range_start || "", data.range_end || "", data.merge_models_across_providers ? "merged" : "split"].join(":");
 }
 
 function modelDisplayName(data, row) {
   const model = String(row.model || "");
-  if (data.provider !== "all") return model;
+  if (data.provider !== "all" || data.merge_models_across_providers) return model;
   const providerLabel = providerOptions.find((option) => option.value === row.provider)?.label || row.provider;
   if (model.toLowerCase().startsWith(`${providerLabel.toLowerCase()} ·`)) return model;
   return `${providerLabel} · ${model}`;
@@ -232,6 +240,10 @@ function restoreChartState(visualization) {
   chartEndDate = state.end;
 }
 
+function chartRangeOptionsFor(visualization) {
+  return visualization === "activity" ? activityChartRangeOptions : chartRangeOptions;
+}
+
 function positionCustomRangeDialog(dialog, anchor) {
   const margin = 8;
   const gap = 8;
@@ -268,7 +280,7 @@ function readUrlState() {
     range: rangeOptions.some((option) => option.value === range) ? range : "all",
     start: params.get("start") || "",
     end: params.get("end") || "",
-    chartRange: chartRangeOptions.some((option) => option.value === chartRange)
+    chartRange: chartRangeOptionsFor(normalizedVisualization).some((option) => option.value === chartRange)
       ? chartRange
       : chartRangeDefaults[normalizedVisualization],
     chartStart: params.get("chart_start") || "",
@@ -339,7 +351,11 @@ function describeChartRange(chart) {
   if (chart.range === "custom" && chart.range_start && chart.range_end) {
     return `${chart.range_start} - ${chart.range_end}`;
   }
+  if (chart.range === "3d") return "Last 3 days";
   if (chart.range === "30d") return "Last 30 days";
+  if (chart.range === "21d") return "Last 21 days";
+  if (chart.range === "14d") return "Last 14 days";
+  if (chart.range === "7d") return "Last 7 days";
   if (chart.range === "90d") return "Last 90 days";
   if (chart.range === "6m") return "Last 6 months";
   if (chart.range === "1y") return "Last year";
@@ -421,7 +437,7 @@ function renderVisualizationPanel(data, heat, months, heatColumns) {
           </div>`}
           <div class="chart-filter">
             <nav class="segments chart-range-tabs" aria-label="Visualization range">
-              ${chartRangeOptions.map((option) => `<button class="seg ${activeChartRange === option.value ? "active" : ""}" type="button" data-chart-range="${option.value}" aria-pressed="${activeChartRange === option.value}" ${option.value === "custom" ? `id="chart-range-trigger" aria-haspopup="dialog" aria-expanded="${chartCustomRangeOpen}"` : ""}>${option.label}</button>`).join("")}
+              ${chartRangeOptionsFor(activeVisualization).map((option) => `<button class="seg ${activeChartRange === option.value ? "active" : ""}" type="button" data-chart-range="${option.value}" aria-pressed="${activeChartRange === option.value}" ${option.value === "custom" ? `id="chart-range-trigger" aria-haspopup="dialog" aria-expanded="${chartCustomRangeOpen}"` : ""}>${option.label}</button>`).join("")}
             </nav>
           </div>
         </div>
@@ -510,8 +526,11 @@ function renderActiveTime(activity) {
     return '<div class="chart-empty">Active-time data is unavailable.</div>';
   }
   const days = activity.days || [];
-  const maxSeconds = Math.max(1, ...days.map((day) => Number(day.active_seconds || 0)));
-  const ticks = [1, 0.75, 0.5, 0.25, 0].map((ratio) => Math.round(maxSeconds * ratio));
+  const dailyScale = activity.granularity === "day";
+  const maxSeconds = dailyScale ? 24 * 60 * 60 : Math.max(1, ...days.map((day) => Number(day.active_seconds || 0)));
+  const ticks = dailyScale
+    ? [24, 18, 12, 6, 0].map((hours) => hours * 60 * 60)
+    : [1, 0.75, 0.5, 0.25, 0].map((ratio) => Math.round(maxSeconds * ratio));
   const labelEvery = Math.max(1, Math.ceil(days.length / 10));
   const { barGap, barFill, barMax } = chartBarSizing(activity.granularity, days.length);
   const activitySummary = `${full(activity.focus_blocks)} sessions`;
@@ -525,7 +544,7 @@ function renderActiveTime(activity) {
     ${days.length ? `
       <div class="chart-shell activity-chart-shell">
         <div class="chart-y-axis">
-          ${ticks.map((tick) => `<span>${formatDuration(tick)}</span>`).join("")}
+          ${ticks.map((tick) => `<span>${dailyScale && tick === 0 ? "" : formatDuration(tick)}</span>`).join("")}
         </div>
         <div class="chart-scroll">
           <div class="bar-chart" style="--bar-count: ${days.length}; --bar-gap: ${barGap}px; --bar-fill: ${barFill}%; --bar-max: ${barMax}px">
@@ -1294,6 +1313,7 @@ async function loadRequestChildren(data, bucket, childPage) {
 function settingsIsDirty() {
   if (!settingsData || !settingsDraft) return false;
   const original = {
+    merge_models_across_providers: settingsData.merge_models_across_providers,
     sources: Object.values(settingsData.sources).flat().map(({ source_id, enabled }) => ({ source_id, enabled })),
     models: Object.values(settingsData.models).flat().map(({ model, enabled }) => ({ model, enabled }))
   };
@@ -1302,6 +1322,7 @@ function settingsIsDirty() {
 
 function settingsDraftFromData(payload) {
   return {
+    merge_models_across_providers: payload.merge_models_across_providers,
     sources: Object.values(payload.sources).flat().map(({ source_id, enabled }) => ({ source_id, enabled })),
     models: Object.values(payload.models).flat().map(({ model, enabled }) => ({ model, enabled }))
   };
@@ -1383,6 +1404,10 @@ function renderSettingsDialog() {
         </div>
         <div class="settings-tab-panel" role="tabpanel">
           ${settingsActiveTab === "general" ? `
+            <section class="settings-section">
+              <h3>Preferences</h3>
+              <label class="settings-preference"><input id="settings-merge-models" type="checkbox" ${settingsDraft.merge_models_across_providers ? "checked" : ""} ${settingsLocked ? "disabled" : ""}><span><strong>Merge matching models in "All" mode</strong><small>Combines the same model name across Codex, Claude, and OpenCode in charts and model usage tables.</small></span></label>
+            </section>
             <section class="settings-section">
               <div class="settings-section-heading"><div><h3>Sources</h3><p>Original live sources are always enabled. Optional sources remain registered when unchecked.</p></div></div>
               <div class="settings-source-groups">${["codex", "claude", "opencode"].map((provider) => renderSourceGroup(provider, settingsData.sources[provider] || [])).join("")}</div>
@@ -1947,6 +1972,11 @@ function render(data) {
         settingsActiveTab = button.dataset.settingsTab;
         renderSettingsUpdate();
       });
+    });
+    settingsDialog.querySelector("#settings-merge-models")?.addEventListener("change", (event) => {
+      settingsApplied = false;
+      settingsDraft.merge_models_across_providers = event.target.checked;
+      syncDirtyControls();
     });
     settingsDialog.querySelectorAll("[data-settings-source]").forEach((input) => {
       input.addEventListener("change", () => {
